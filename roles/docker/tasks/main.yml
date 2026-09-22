@@ -1,0 +1,88 @@
+---
+- name: Remove packages that conflict with Docker Engine
+  ansible.builtin.apt:
+    name:
+      - docker.io
+      - docker-compose
+      - docker-compose-v2
+      - docker-doc
+      - docker-buildx
+      - podman-docker
+      - containerd
+      - runc
+    state: absent
+
+- name: Create the APT keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install Docker's official repository signing key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure Docker's official Ubuntu repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/docker.sources
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      Types: deb
+      URIs: https://download.docker.com/linux/ubuntu
+      Suites: {{ ansible_distribution_release }}
+      Components: stable
+      Architectures: {{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}
+      Signed-By: /etc/apt/keyrings/docker.asc
+  register: docker_repository
+
+- name: Refresh package metadata after repository changes
+  ansible.builtin.apt:
+    update_cache: true
+  when: docker_repository.changed
+
+- name: Install Docker Engine, Buildx, and Compose
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+
+- name: Configure bounded Docker logs
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "{{ docker_log_max_size }}",
+          "max-file": "{{ docker_log_max_files }}"
+        }
+      }
+  notify: Restart Docker
+
+- name: Add the administrator to the Docker group
+  ansible.builtin.user:
+    name: "{{ datacenter_admin_user }}"
+    groups: docker
+    append: true
+
+- name: Enable and start Docker
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
