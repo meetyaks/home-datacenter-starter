@@ -1,0 +1,44 @@
+---
+- name: Refresh Ubuntu package metadata
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install operating and diagnostic packages
+  ansible.builtin.apt:
+    name:
+      - acl
+      - ca-certificates
+      - curl
+      - git
+      - gnupg
+      - htop
+      - jq
+      - nvme-cli
+      - smartmontools
+      - unattended-upgrades
+    state: present
+
+- name: Set server timezone
+  community.general.timezone:
+    name: "{{ datacenter_timezone }}"
+
+- name: Enable periodic package-list refresh and unattended upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+
+- name: Create datacenter service directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ datacenter_directories }}"
+
