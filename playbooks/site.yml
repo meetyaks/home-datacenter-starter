@@ -1,0 +1,11 @@
+---
+- name: Configure primary home datacenter server
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: storage
+    - role: common
+    - role: docker
+
