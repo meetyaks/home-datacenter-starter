@@ -1,0 +1,16 @@
+---
+datacenter_timezone: Etc/UTC
+datacenter_admin_user: labadmin
+
+datacenter_directories:
+  - /srv/datacenter
+  - /srv/datacenter/compose
+  - /srv/datacenter/config
+  - /srv/data/postgres
+  - /srv/data/redis
+  - /srv/data/minio
+  - /srv/data/applications
+
+docker_log_max_size: 10m
+docker_log_max_files: "5"
+
