@@ -1,0 +1,29 @@
+---
+- name: Find the dedicated data mount
+  ansible.builtin.set_fact:
+    datacenter_data_mount: >-
+      {{ ansible_mounts
+         | selectattr('mount', 'equalto', '/srv/data')
+         | list }}
+
+- name: Require a separate mounted filesystem at /srv/data
+  ansible.builtin.assert:
+    that:
+      - datacenter_data_mount | length == 1
+      - datacenter_data_mount[0].fstype == 'ext4'
+      - datacenter_data_mount[0].size_total > 1000000000000
+    fail_msg: >-
+      /srv/data is not the expected dedicated ext4 filesystem of at least 1 TB.
+      Stop here and verify findmnt, df, and /etc/fstab before continuing.
+    success_msg: /srv/data is mounted as the expected dedicated filesystem.
+
+- name: Report the data filesystem
+  ansible.builtin.command:
+    cmd: findmnt -n -o SOURCE,FSTYPE,SIZE,AVAIL /srv/data
+  register: datacenter_findmnt
+  changed_when: false
+
+- name: Show the data filesystem
+  ansible.builtin.debug:
+    var: datacenter_findmnt.stdout
+
