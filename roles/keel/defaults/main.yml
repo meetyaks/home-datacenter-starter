@@ -74,6 +74,24 @@ keel_compose_file: "{{ keel_root }}/compose.lab.yml"
 keel_owner: root
 keel_group: root
 
+# ── WHAT THE COMMIT MUST CONTAIN ────────────────────────────────────────────
+#
+# Checked against the commit's own git TREE during preflight, so `--check` can
+# prove the named commit is deployable before a real run spends a build finding
+# out. Trees count as objects, which is how the two directories are checked
+# without enumerating them.
+#
+# `packs/` and `profiles/` are here because the gateway image bakes them in and
+# the runtime resolves `<cwd>/packs`: a commit predating that change builds an
+# image with NO packs, and the only symptom is a gateway that serves an empty
+# catalogue. Better to refuse the commit than to ship that.
+keel_required_commit_paths:
+  - infra/lab/compose.lab.yml
+  - packages/gateway/Dockerfile
+  - apps/web/Dockerfile
+  - packs
+  - profiles
+
 # Data subdirectories, each a bind target in compose.lab.yml.
 keel_data_dirs:
   - "{{ keel_data_root }}/postgres"

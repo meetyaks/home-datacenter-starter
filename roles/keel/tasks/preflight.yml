@@ -1,0 +1,191 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# PREFLIGHT — everything that can be checked WITHOUT changing anything.
+#
+# This file runs identically in both modes, and in check mode it is very nearly
+# the whole run. That is the design: `--check` here is a PREFLIGHT, not a
+# simulated deployment. It answers "would this deploy be able to start, and is
+# the commit it names actually deployable" — and it answers that from the
+# controller's git objects and the target's real state, not from predictions.
+#
+# ⚠️ WHAT IT DELIBERATELY DOES NOT DO: create an archive, transfer anything,
+# build an image, start a container, or touch Caddy. Nor does it require any of
+# those to already exist. A previous version let the archive task report
+# `changed` in check mode without executing, and the unpack that followed failed
+# on a file that was never created — a dry run inventing work it had not done.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── The target ──────────────────────────────────────────────────────────────
+
+- name: Confirm the target is the expected architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_architecture == 'x86_64'
+    fail_msg: >-
+      Keel images for this lab are built natively as linux/amd64 on the target.
+      This host reports {{ ansible_architecture }}.
+    success_msg: "Target architecture is {{ ansible_architecture }}."
+
+- name: Require the dedicated data filesystem
+  ansible.builtin.assert:
+    that:
+      - ansible_mounts | selectattr('mount', 'equalto', '/srv/data') | list | length == 1
+    fail_msg: >-
+      /srv/data is not a separate mounted filesystem. Persistent state must not
+      land on the root volume. Run the `storage` role first.
+    success_msg: /srv/data is a dedicated filesystem.
+
+- name: Confirm Docker is usable by this connection
+  # Read-only and runs in every mode. A deploy that discovers at BUILD time that
+  # it cannot talk to the daemon has already spent the archive and the transfer;
+  # asking here costs nothing and is exactly what a preflight is for.
+  ansible.builtin.command:
+    cmd: docker version --format '{{ '{{' }}.Server.Version{{ '}}' }}'
+  register: keel_docker_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require Docker access
+  ansible.builtin.assert:
+    that:
+      - (keel_docker_version.rc | default(1)) == 0
+      - (keel_docker_version.stdout | default('')) | length > 0
+    fail_msg: >-
+      Cannot reach the Docker daemon on {{ inventory_hostname }}:
+      {{ keel_docker_version.stderr | default('no output') }}. The account this
+      play connects as must be able to run `docker` — check group membership and
+      that the service is running.
+    success_msg: "Docker server {{ keel_docker_version.stdout | default('?') | trim }} is reachable."
+
+- name: Confirm Compose v2 is available
+  ansible.builtin.command:
+    cmd: docker compose version --short
+  register: keel_compose_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require Compose v2
+  ansible.builtin.assert:
+    that:
+      - (keel_compose_version.rc | default(1)) == 0
+    fail_msg: >-
+      `docker compose` is not available on {{ inventory_hostname }}. This stack
+      uses Compose v2 syntax; the standalone `docker-compose` v1 binary is not a
+      substitute.
+    success_msg: "Compose {{ keel_compose_version.stdout | default('?') | trim }} is available."
+
+# ── The intended paths ──────────────────────────────────────────────────────
+
+- name: Validate the paths this deployment will use
+  # Cheap, and it catches the class of error that is most annoying to debug
+  # later: a variable that renders empty and turns a path into "/" or "//data".
+  ansible.builtin.assert:
+    that:
+      - keel_root is defined and keel_root.startswith('/srv/data/')
+      - keel_data_root.startswith(keel_root)
+      - keel_build_dir.startswith(keel_build_root)
+      - keel_secrets_dir.startswith(keel_root)
+      - keel_env_file.startswith(keel_env_dir)
+      - keel_compose_file.startswith(keel_root)
+      - keel_controller_tmp_archive.startswith('/tmp/')
+      - keel_image_tag == 'sha-' ~ keel_commit_short
+    fail_msg: >-
+      One or more paths are not where they must be. Persistent state lives under
+      /srv/data/services/keel, the staging archive under /tmp on the controller,
+      and the image tag is derived from the commit. Check keel_root and the
+      values derived from it.
+    success_msg: Paths and image tag are well-formed.
+    quiet: true
+
+# ── The commit, read from the controller's git objects ──────────────────────
+#
+# These read OBJECTS, not a working tree, so they are true of the commit itself
+# regardless of what is checked out or dirty on the control node. Nothing is
+# written and nothing is transferred: this is the check that makes `--check`
+# meaningful, because it proves the named commit is actually deployable before a
+# real run spends a build on finding out.
+
+- name: Confirm the control node has the source repository
+  ansible.builtin.stat:
+    path: "{{ keel_source_repo }}/.git"
+  register: keel_repo_stat
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  check_mode: false
+
+- name: Fail when the source repository is absent
+  ansible.builtin.assert:
+    that:
+      - keel_repo_stat.stat.exists | default(false)
+    fail_msg: >-
+      No git repository at {{ keel_source_repo }} on the control node. Set
+      keel_source_repo to the Keel checkout, or clone it there first.
+
+- name: Confirm the commit exists and is a commit
+  ansible.builtin.command:
+    cmd: git cat-file -t {{ keel_commit }}
+    chdir: "{{ keel_source_repo }}"
+  register: keel_commit_type
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require the object to be a commit
+  ansible.builtin.assert:
+    that:
+      - (keel_commit_type.rc | default(1)) == 0
+      - (keel_commit_type.stdout | default('') | trim) == 'commit'
+    fail_msg: >-
+      {{ keel_commit }} is not a commit in {{ keel_source_repo }}
+      (git says "{{ keel_commit_type.stdout | default(keel_commit_type.stderr | default('nothing')) | trim }}").
+      Fetch it, or correct keel_commit.
+    success_msg: "{{ keel_commit }} is a commit."
+
+- name: Confirm the commit contains everything this deployment needs
+  # `git cat-file -e <sha>:<path>` exits non-zero when the path is absent from
+  # THAT COMMIT'S TREE. Directories work too — a tree is an object like any
+  # other — which is how packs/ and profiles/ are checked without listing them.
+  ansible.builtin.command:
+    cmd: git cat-file -e {{ keel_commit }}:{{ item }}
+    chdir: "{{ keel_source_repo }}"
+  register: keel_tree_paths
+  loop: "{{ keel_required_commit_paths }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require every path to be present in the commit
+  ansible.builtin.assert:
+    that:
+      - (item.rc | default(1)) == 0
+    fail_msg: >-
+      Commit {{ keel_commit }} does not contain {{ item.item }}. This deployment
+      builds from that commit alone, so a missing path here would only surface
+      as a build or boot failure later. Deploy a commit that carries it — for
+      packs/ and profiles/ that means one including the image-baking change.
+    quiet: true
+  loop: "{{ keel_tree_paths.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Report the verified commit contents
+  ansible.builtin.debug:
+    msg: >-
+      Commit {{ keel_commit_short }} carries all
+      {{ keel_required_commit_paths | length }} required paths:
+      {{ keel_required_commit_paths | join(', ') }}

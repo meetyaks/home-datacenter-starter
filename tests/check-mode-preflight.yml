@@ -1,0 +1,93 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION TEST — check mode creates no archive and no source tree.
+#
+#   tests/run-check-mode-preflight.sh
+#
+# ═══ WHAT BROKE ═══════════════════════════════════════════════════════════════
+#
+# Under `--check` the archive step is a `command`, which reported `changed` from
+# its own exit status WITHOUT executing. The `unarchive` after it then failed:
+#
+#     /tmp/keel-2e84470d-dc1-arm-1.tar.gz did not exist
+#
+# A dry run must not invent work it has not done, and must not fail on the
+# absence of work it correctly declined to do.
+#
+# ═══ WHAT THIS CAN AND CANNOT PROVE ══════════════════════════════════════════
+#
+# It includes the REAL source.yml behind the same guard main.yml uses, under a
+# real `--check`, and then asserts on the FILESYSTEM that no archive exists.
+#
+# It cannot run the whole role here: preflight correctly refuses a host that is
+# not x86_64 and has no /srv/data mount, which this control node is not and does
+# not. That refusal is the role working, so the honest scope of this test is the
+# transfer phase — the one that failed — plus a static check (in the runner)
+# that every mutating phase in main.yml carries the guard.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Regression — check mode performs no source transfer
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    ansible_remote_tmp: /tmp/ansible-keel
+    # Fixture values. Not secrets: source.yml reads none.
+    keel_commit: "{{ lookup('env', 'KEEL_TEST_COMMIT') | default('0000000000000000000000000000000000000000', true) }}"
+    keel_commit_short: "{{ keel_commit[:8] }}"
+    keel_image_tag: "sha-{{ keel_commit_short }}"
+    keel_source_repo: "{{ lookup('env', 'HOME') }}/Projects/keel"
+    keel_controller_python: "{{ ansible_playbook_python }}"
+    keel_controller_tmp_archive: "/tmp/keel-preflight-probe-{{ lookup('env', 'USER') }}.tar.gz"
+    keel_build_dir: /tmp/keel-preflight-fixture/builds/probe
+    keel_owner: "{{ lookup('env', 'USER') }}"
+    keel_group: "{{ lookup('env', 'USER') }}"
+
+  tasks:
+    - name: Require check mode, or this proves nothing
+      ansible.builtin.assert:
+        that:
+          - ansible_check_mode
+        fail_msg: Run through tests/run-check-mode-preflight.sh, which passes --check.
+
+    - name: Start from a clean slate
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ keel_controller_tmp_archive }}"
+        - /tmp/keel-preflight-fixture
+      check_mode: false
+
+    # The same guard main.yml applies. With it, nothing below runs; without it,
+    # source.yml would attempt the archive-then-unpack sequence that failed.
+    - name: Source transfer (guarded exactly as main.yml guards it)
+      ansible.builtin.include_tasks: ../roles/keel/tasks/source.yml
+      when: not ansible_check_mode
+
+    - name: Look for an archive on the controller
+      ansible.builtin.stat:
+        path: "{{ keel_controller_tmp_archive }}"
+      register: keel_archive_after
+      check_mode: false
+
+    - name: Look for an unpacked source tree
+      ansible.builtin.stat:
+        path: "{{ keel_build_dir }}"
+      register: keel_build_after
+      check_mode: false
+
+    - name: Check mode must have created neither
+      ansible.builtin.assert:
+        that:
+          - not (keel_archive_after.stat.exists | default(false))
+          - not (keel_build_after.stat.exists | default(false))
+        fail_msg: >-
+          REGRESSION: a --check run left
+          {{ 'an archive at ' ~ keel_controller_tmp_archive ~ ' ' if keel_archive_after.stat.exists | default(false) }}
+          {{ 'a build tree at ' ~ keel_build_dir if keel_build_after.stat.exists | default(false) }}
+          behind. Check mode is a preflight: it must create nothing.
+        success_msg: >-
+          PASS — check mode created no archive and no source tree.

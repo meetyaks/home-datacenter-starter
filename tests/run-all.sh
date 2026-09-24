@@ -16,4 +16,8 @@ echo "══ fresh-host check mode ═══════════════
 ansible-playbook tests/check-mode-fresh-host.yml --check
 
 echo
+echo "══ check-mode preflight (no archive, no source tree) ═══════════════"
+tests/run-check-mode-preflight.sh
+
+echo
 echo "All regression suites passed."

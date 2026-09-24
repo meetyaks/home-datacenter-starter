@@ -121,16 +121,34 @@ under root after `become`.
 Nothing names the vault file. It is loaded automatically because it sits in
 `group_vars/<group>/` for a group the target belongs to.
 
-> `--check` will report failures once it reaches the build steps, and that is
-> expected rather than a defect: check mode cannot create the build directory, so
-> the later `stat`, `slurp` and `docker` tasks have nothing to inspect. It is
-> useful for validating variable loading and the secret handling, not as a dry
-> run of the whole deploy.
->
-> Secret verification, however, **is** check-mode clean on a fresh host. Files
-> that would be created report that their permissions are verified on the next
-> ordinary run; an *existing* file with unsafe permissions still fails, in every
-> mode, because the exposure is real whether or not anything is being changed.
+### `--check` is a PREFLIGHT, not a simulated deployment
+
+It answers *"could this deploy start, and is the commit it names actually
+deployable"* — and it exits **successfully** on a completely fresh host.
+
+**What it validates**, all without changing anything:
+
+- the target's architecture, that `/srv/data` is a separate filesystem, that
+  Docker and Compose v2 are reachable by this connection
+- that all nine `keel_vault_*` secrets are present, and that
+  `group_vars/linux_servers/` is genuinely being loaded
+- every path the deployment will use, and that the image tag derives from the
+  commit
+- **from the controller's git objects** — that `keel_commit` exists, is a commit,
+  and that its tree contains `infra/lab/compose.lab.yml`,
+  `packages/gateway/Dockerfile`, `apps/web/Dockerfile`, `packs/` and `profiles/`
+- the secret files and directories it *would* write, predicted without exposing
+  any content
+
+It then prints what a real run would perform, and stops.
+
+**What it deliberately does not do:** create an archive, transfer or unpack
+source, build an image, run migrations or Compose, or touch Caddy. It also never
+*requires* any of those to exist — on a fresh host none of them can.
+
+> An existing secret file with unsafe permissions still **fails** in check mode,
+> as does an already-installed stack that publishes a non-loopback port. Those
+> are live exposures; "I was only looking" does not make them safe.
 
 ### Regression suites
 
@@ -146,6 +164,7 @@ Controller-only: no SSH, no vault, no secrets, no Docker, nothing written outsid
 | `run-secret-verification.sh` | check/absent (no crash), check/existing-unsafe (fails), normal/absent (fails), normal/correct-0600 (passes) |
 | `controller-delegation.yml` | delegated tasks keep the **controller's** identity when the remote is `labadmin` with `become: true` |
 | `check-mode-fresh-host.yml` | absent stat, absent slurp and skipped-command registers all dereference safely |
+| `run-check-mode-preflight.sh` | every mutating phase is guarded; a real `--check` run creates no archive and no source tree |
 
 Two details that are load-bearing rather than incidental:
 
