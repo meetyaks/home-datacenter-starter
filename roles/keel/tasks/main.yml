@@ -18,6 +18,35 @@
       it, and an abbreviation can become ambiguous as the repository grows.
     success_msg: "Deploying Keel commit {{ keel_commit }}"
 
+- name: Prove the group_vars directory for this host is actually loaded
+  # ⚠️ ASKED FIRST, AND ASKED SEPARATELY FROM THE SECRETS, because the two
+  # failures look identical from the outside and have completely different fixes.
+  #
+  # An undefined `keel_vault_*` can mean "you forgot to write the vault file" or
+  # it can mean "Ansible never loaded the file you did write" — and the second
+  # is what happened when the vault lived at `group_vars/vault.yml`, which binds
+  # to a group named `vault` that does not exist. `--ask-vault-pass` decrypted it
+  # happily and the variables were still undefined.
+  #
+  # This canary is a committed, non-secret file sitting in the same directory as
+  # the encrypted vault. If it is visible, that directory is being loaded for
+  # this host, so a missing secret below is genuinely a missing secret.
+  ansible.builtin.assert:
+    that:
+      - keel_group_vars_source is defined
+      - keel_group_vars_source == 'inventory/group_vars/linux_servers'
+    fail_msg: >-
+      inventory/group_vars/linux_servers/ is not being loaded for
+      {{ inventory_hostname }}. Variables placed there — including the encrypted
+      vault file — are invisible to this play, so nothing below can work.
+      Confirm {{ inventory_hostname }} is in the `linux_servers` group in
+      inventory/hosts.yml, and that the directory name matches that group
+      exactly. `--ask-vault-pass` succeeding proves only that a file DECRYPTED,
+      never that it was LOADED.
+    success_msg: >-
+      group_vars/linux_servers is loaded for {{ inventory_hostname }}.
+    quiet: true
+
 - name: Require every secret to be present before anything is written
   ansible.builtin.assert:
     that:
@@ -31,10 +60,13 @@
       - keel_vault_jwt_private_key is defined and keel_vault_jwt_private_key | length > 0
       - keel_vault_jwt_public_key is defined and keel_vault_jwt_public_key | length > 0
     fail_msg: >-
-      One or more keel_vault_* variables are missing. Create
-      inventory/group_vars/vault.yml with ansible-vault and define every name
-      listed in roles/keel/README.md. Nothing is written until all are present —
-      a half-rendered environment file would start a stack on a blank credential.
+      One or more keel_vault_* variables are missing. The canary above passed, so
+      inventory/group_vars/linux_servers/ IS being loaded — this is a genuinely
+      absent or misnamed variable, not a loading problem. Create
+      inventory/group_vars/linux_servers/vault.yml with ansible-vault and define
+      every name listed in roles/keel/README.md. Nothing is written until all are
+      present — a half-rendered environment file would start a stack on a blank
+      credential.
     success_msg: All required secrets are present.
     quiet: true
 

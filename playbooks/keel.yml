@@ -2,11 +2,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Keel lab deployment.
 #
-#   check    ansible-playbook playbooks/keel.yml --check --diff
-#   deploy   ansible-playbook playbooks/keel.yml
-#   backup   ansible-playbook playbooks/keel.yml --tags backup
-#   restore  ansible-playbook playbooks/keel.yml --tags restore -e keel_restore_archive=…
-#   rollback ansible-playbook playbooks/keel.yml --tags rollback
+#   check    ansible-playbook playbooks/keel.yml --check --diff --ask-vault-pass --ask-become-pass
+#   deploy   ansible-playbook playbooks/keel.yml --ask-vault-pass --ask-become-pass
+#   backup   ansible-playbook playbooks/keel.yml --tags backup --ask-vault-pass --ask-become-pass
+#   restore  ansible-playbook playbooks/keel.yml --tags restore --ask-vault-pass --ask-become-pass -e keel_restore_archive=…
+#   rollback ansible-playbook playbooks/keel.yml --tags rollback --ask-vault-pass --ask-become-pass
+#
+# The vault file is loaded AUTOMATICALLY from inventory/group_vars/linux_servers/
+# because dc1-x86 is in that group — `--ask-vault-pass` supplies the passphrase
+# and nothing names the file. There is deliberately no `vars_files`: a path there
+# would be absolute or user-specific, and would work on exactly one machine.
 #
 # ⚠️ BACKUP, RESTORE AND ROLLBACK ARE `never`-TAGGED. Each one stops the stack or
 # replaces live data, so none may run as a side effect of an ordinary deploy —

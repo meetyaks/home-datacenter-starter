@@ -4,7 +4,7 @@
 #
 # ⚠️ NO SECRET VALUE APPEARS IN THIS FILE OR ANYWHERE ELSE IN THIS REPOSITORY.
 # Every credential is read from `keel_vault_*` variables that live only in
-# inventory/group_vars/vault.yml, which .gitignore already excludes. The role
+# inventory/group_vars/linux_servers/vault.yml, which .gitignore excludes. The role
 # asserts each one is defined before it writes anything, so a missing secret
 # stops the run instead of rendering an empty password into a live stack.
 # ─────────────────────────────────────────────────────────────────────────────

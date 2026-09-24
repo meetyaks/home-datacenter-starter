@@ -11,12 +11,37 @@ drift is silent until a deploy behaves unlike the tree it claims to be.
 
 ## The vault file you must create
 
-`inventory/group_vars/vault.yml` — already covered by `.gitignore`, and it must
-stay that way. It is not in this repository and never will be.
+**`inventory/group_vars/linux_servers/vault.yml`** — gitignored, and it must stay
+that way. It is not in this repository and never will be.
 
 ```bash
-ansible-vault create inventory/group_vars/vault.yml
+ansible-vault create inventory/group_vars/linux_servers/vault.yml
 ```
+
+⚠️ **The directory name is the group name, and that is the whole point.** Ansible
+loads `group_vars/<group>/` for every host in `<group>`; `dc1-x86` is in
+`linux_servers`, so everything in that directory — including the encrypted vault —
+is loaded for it automatically. No `vars_files`, no `-e @…`, no path on the
+command line.
+
+An earlier version of these instructions said `inventory/group_vars/vault.yml`.
+That binds to a group named `vault`, which does not exist, so the file was
+**decrypted and then never loaded** — `--ask-vault-pass` succeeded and every
+`keel_vault_*` variable was undefined. If you created a vault at the old path,
+move it:
+
+```bash
+git mv 2>/dev/null; mkdir -p inventory/group_vars/linux_servers
+mv inventory/group_vars/vault.yml inventory/group_vars/linux_servers/vault.yml
+```
+
+The old path stays in `.gitignore` until everyone has moved, so a stale file of
+real credentials cannot become committable in the meantime.
+
+The role proves the loading path on every run: a committed, non-secret canary
+(`loading-canary.yml`) sits beside the vault and is asserted **before** the
+secrets are checked, so "you forgot the vault" and "Ansible never loaded it" stop
+looking like the same failure.
 
 Define exactly these nine names. The role asserts all nine are present **before it
 writes anything**, so a missing one stops the run rather than rendering a blank
@@ -55,6 +80,37 @@ copy is the one that does not exist.
 
 Rotating `keel_vault_master_key` or `keel_vault_mfa_master_key` invalidates
 everything they protect. Neither is a routine change.
+
+## Commands
+
+Run from `~/Projects/home-datacenter-starter` on dc1-arm-1:
+
+```bash
+# check
+ansible-playbook playbooks/keel.yml --check --diff --ask-vault-pass --ask-become-pass
+
+# deploy
+ansible-playbook playbooks/keel.yml --ask-vault-pass --ask-become-pass
+```
+
+Nothing names the vault file. It is loaded automatically because it sits in
+`group_vars/<group>/` for a group the target belongs to.
+
+> `--check` will report failures after the first few tasks, and that is expected
+> rather than a defect: check mode cannot create the build directory, so the
+> later `stat`, `slurp` and `docker` steps have nothing to inspect. It is useful
+> for validating variable loading and the secret assertions, not as a dry run of
+> the whole deploy.
+
+### Verifying the loading path without deploying
+
+```bash
+ansible-inventory --host dc1-x86 --ask-vault-pass
+```
+
+`keel_group_vars_source: inventory/group_vars/linux_servers` in the output means
+the directory is loaded for that host; any variable you placed beside the canary,
+encrypted or not, is loaded with it.
 
 ## What it does
 
@@ -114,7 +170,7 @@ most likely way this stack would accidentally become reachable.
 ## Rollback
 
 ```bash
-ansible-playbook playbooks/keel.yml --tags rollback
+ansible-playbook playbooks/keel.yml --tags rollback --ask-vault-pass --ask-become-pass
 ```
 
 ⚠️ Moves the **code**, not the **schema**. Migrations are forward-only, so if the
