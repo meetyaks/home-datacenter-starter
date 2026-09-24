@@ -96,11 +96,33 @@ ansible-playbook playbooks/keel.yml --ask-vault-pass --ask-become-pass
 Nothing names the vault file. It is loaded automatically because it sits in
 `group_vars/<group>/` for a group the target belongs to.
 
-> `--check` will report failures after the first few tasks, and that is expected
-> rather than a defect: check mode cannot create the build directory, so the
-> later `stat`, `slurp` and `docker` steps have nothing to inspect. It is useful
-> for validating variable loading and the secret assertions, not as a dry run of
-> the whole deploy.
+> `--check` will report failures once it reaches the build steps, and that is
+> expected rather than a defect: check mode cannot create the build directory, so
+> the later `stat`, `slurp` and `docker` tasks have nothing to inspect. It is
+> useful for validating variable loading and the secret handling, not as a dry
+> run of the whole deploy.
+>
+> Secret verification, however, **is** check-mode clean on a fresh host. Files
+> that would be created report that their permissions are verified on the next
+> ordinary run; an *existing* file with unsafe permissions still fails, in every
+> mode, because the exposure is real whether or not anything is being changed.
+
+### Regression suite
+
+```bash
+tests/run-secret-verification.sh
+```
+
+Covers `roles/keel/tasks/verify-secret-files.yml` in four cases — check/absent
+(no crash), check/existing-unsafe (fails), normal/absent (fails),
+normal/correct-0600 (passes). Localhost only: no SSH, no vault, no secrets, no
+Docker, and nothing touched outside its own tempdir.
+
+It runs the playbook **twice**, with and without `--check`, because
+`ansible_check_mode` is true only when the *play* was started with `--check` — a
+task- or block-level `check_mode: true` behaves as a dry run without flipping
+that fact, so a single invocation would exercise a different path from the one
+`--check` takes and prove nothing.
 
 ### Verifying the loading path without deploying
 
