@@ -25,7 +25,22 @@ tests/run-check-mode-handlers.sh
 
 echo
 echo "══ platform version gate ═══════════════════════════════════════════"
-ansible-playbook tests/platform-version.yml -e keel_test_commit=2e84470d208bdcf213baba850659e5d5ded006ab
+# ⚠️ READ THE PIN, DO NOT RESTATE IT. This used to carry its own copy of the
+# 40-character SHA, which meant the deployment pin lived in two hand-maintained
+# places — and the copy here is the one nobody remembers to change. A suite that
+# derives the version from a DIFFERENT commit than the role deploys is worse
+# than no suite: it passes while proving something about the wrong tree.
+# roles/keel/defaults/main.yml is the single authority; this reads it.
+KEEL_TEST_COMMIT=$(awk '/^keel_commit:/{print $2; exit}' roles/keel/defaults/main.yml)
+
+if ! printf '%s' "$KEEL_TEST_COMMIT" | grep -qE '^[0-9a-f]{40}$'; then
+  echo "FAILED: could not read a 40-character commit SHA from roles/keel/defaults/main.yml" >&2
+  echo "        got: '${KEEL_TEST_COMMIT}'" >&2
+  exit 1
+fi
+echo "   deployment pin: ${KEEL_TEST_COMMIT}"
+
+ansible-playbook tests/platform-version.yml -e keel_test_commit="$KEEL_TEST_COMMIT"
 
 echo
 echo "All regression suites passed."
