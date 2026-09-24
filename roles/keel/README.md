@@ -107,22 +107,42 @@ Nothing names the vault file. It is loaded automatically because it sits in
 > ordinary run; an *existing* file with unsafe permissions still fails, in every
 > mode, because the exposure is real whether or not anything is being changed.
 
-### Regression suite
+### Regression suites
 
 ```bash
-tests/run-secret-verification.sh
+tests/run-all.sh
 ```
 
-Covers `roles/keel/tasks/verify-secret-files.yml` in four cases — check/absent
-(no crash), check/existing-unsafe (fails), normal/absent (fails),
-normal/correct-0600 (passes). Localhost only: no SSH, no vault, no secrets, no
-Docker, and nothing touched outside its own tempdir.
+Controller-only: no SSH, no vault, no secrets, no Docker, nothing written outside
+`/tmp` fixtures.
 
-It runs the playbook **twice**, with and without `--check`, because
-`ansible_check_mode` is true only when the *play* was started with `--check` — a
-task- or block-level `check_mode: true` behaves as a dry run without flipping
-that fact, so a single invocation would exercise a different path from the one
-`--check` takes and prove nothing.
+| suite | covers |
+|---|---|
+| `run-secret-verification.sh` | check/absent (no crash), check/existing-unsafe (fails), normal/absent (fails), normal/correct-0600 (passes) |
+| `controller-delegation.yml` | delegated tasks keep the **controller's** identity when the remote is `labadmin` with `become: true` |
+| `check-mode-fresh-host.yml` | absent stat, absent slurp and skipped-command registers all dereference safely |
+
+Two details that are load-bearing rather than incidental:
+
+- The secret suite runs **twice**, with and without `--check`, because
+  `ansible_check_mode` is true only when the *play* was started with `--check`. A
+  task- or block-level `check_mode: true` behaves as a dry run *without flipping
+  that fact*, so a single invocation exercises a different path from the one
+  `--check` takes and proves nothing.
+- The delegation fixture points at `192.0.2.1` (RFC 5737, never routable) with
+  `ansible_user: labadmin`. Every task is delegated, so nothing is ever sent
+  there — the host exists only to supply the remote identity that used to leak.
+  The suite asserts the controller account *differs* from `labadmin`, so it
+  cannot pass vacuously.
+
+### How check mode behaves, by design
+
+| | |
+|---|---|
+| read-only validation | runs in **every** mode (`check_mode: false`) — source repo, commit existence, Caddy directory, existing image inspection |
+| predicted-but-absent | skipped with an explicit note (`when: not ansible_check_mode`) |
+| existing unsafe state | **fails in every mode** — an installed stack publishing a LAN port, or an existing secret at 0644 |
+| normal-mode verification | unchanged and strict |
 
 ### Verifying the loading path without deploying
 

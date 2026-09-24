@@ -1,107 +1,132 @@
 ---
 # ─────────────────────────────────────────────────────────────────────────────
-# Verification. Every check is bounded — a deployment that hangs is one nobody
-# can diagnose — and every check reads what the system DID, not what Compose
-# reported it intended to do.
+# Post-deployment verification. Every check is bounded — a deployment that hangs
+# is one nobody can diagnose — and every check reads what the system DID, not
+# what Compose reported it intended to do.
+#
+# ⚠️ THE WHOLE FILE IS NORMAL-MODE ONLY, and that is not a softening.
+#
+# Nothing here verifies configuration; every task interrogates a RUNNING
+# container. In check mode no image was built and no container was started, so
+# these would not be lenient checks against a fresh host — they would be
+# assertions about things that were never created, failing on their own
+# correctly-predicted absence.
+#
+# Skipping them in check mode removes no coverage from a real deployment: an
+# ordinary run executes every one, and the play fails if any does not hold.
+# (enforced: tests/check-mode-fresh-host.yml)
 # ─────────────────────────────────────────────────────────────────────────────
 
-- name: Wait for the gateway to report healthy
-  ansible.builtin.uri:
-    url: "http://127.0.0.1:{{ keel_gateway_loopback_port }}/healthz"
-    status_code: 200
-  register: keel_healthz
-  retries: "{{ keel_health_retries }}"
-  delay: "{{ keel_health_delay_seconds }}"
-  until: keel_healthz.status is defined and keel_healthz.status == 200
-  changed_when: false
-
-- name: Wait for the gateway to report ready
-  # /readyz is the one that means dependencies are reachable; /healthz only
-  # means the process is answering. A stack whose gateway is live but not ready
-  # is a stack that will fail its first real request.
-  ansible.builtin.uri:
-    url: "http://127.0.0.1:{{ keel_gateway_loopback_port }}/readyz"
-    status_code: 200
-  register: keel_readyz
-  retries: "{{ keel_health_retries }}"
-  delay: "{{ keel_health_delay_seconds }}"
-  until: keel_readyz.status is defined and keel_readyz.status == 200
-  changed_when: false
-
-- name: Confirm the web console answers on loopback
-  ansible.builtin.uri:
-    url: "http://127.0.0.1:{{ keel_web_loopback_port }}/"
-    status_code: 200
-  register: keel_web_check
-  retries: "{{ keel_health_retries }}"
-  delay: "{{ keel_health_delay_seconds }}"
-  until: keel_web_check.status is defined and keel_web_check.status == 200
-  changed_when: false
-
-- name: Collect the container state
-  ansible.builtin.command:
-    cmd: >-
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
-      ps --format '{{ '{{' }}.Name{{ '}}' }}\t{{ '{{' }}.State{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}'
-    chdir: "{{ keel_root }}"
-  register: keel_ps
-  changed_when: false
-
-- name: Show the container state
+- name: Note that runtime verification is deferred
   ansible.builtin.debug:
-    var: keel_ps.stdout_lines
+    msg: >-
+      CHECK MODE: no container is running, so gateway health, readiness, the web
+      console, container state and the baked pack catalogue are not verified
+      here. All five are checked on the next ordinary run, and that run fails if
+      any of them does not hold.
+  when: ansible_check_mode
 
-- name: Confirm no long-running service is unhealthy or exited
-  # `migrate` and `minio-bucket` are one-shots and are SUPPOSED to be exited;
-  # every other container must be running. Asserting on the wrong set here would
-  # either fail every healthy deploy or pass a broken one.
-  ansible.builtin.shell:
-    cmd: >-
-      set -o pipefail &&
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
-      ps --format '{{ '{{' }}.Service{{ '}}' }} {{ '{{' }}.State{{ '}}' }}'
-      | grep -vE '^(migrate|minio-bucket) ' | grep -vc ' running'
-    executable: /bin/bash
-    chdir: "{{ keel_root }}"
-  register: keel_not_running
-  changed_when: false
-  failed_when: false
+- name: Run the post-deployment checks
+  when: not ansible_check_mode
+  block:
+    - name: Wait for the gateway to report healthy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ keel_gateway_loopback_port }}/healthz"
+        status_code: 200
+      register: keel_healthz
+      retries: "{{ keel_health_retries }}"
+      delay: "{{ keel_health_delay_seconds }}"
+      until: (keel_healthz.status | default(0)) == 200
+      changed_when: false
 
-- name: Fail when a long-running service is not running
-  ansible.builtin.assert:
-    that:
-      - keel_not_running.stdout | trim | int == 0
-    fail_msg: >-
-      {{ keel_not_running.stdout | trim }} long-running service(s) are not in the
-      running state. See the container state above.
-    success_msg: Every long-running service is up.
+    - name: Wait for the gateway to report ready
+      # /readyz is the one that means dependencies are reachable; /healthz only
+      # means the process is answering. A stack whose gateway is live but not
+      # ready is a stack that will fail its first real request.
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ keel_gateway_loopback_port }}/readyz"
+        status_code: 200
+      register: keel_readyz
+      retries: "{{ keel_health_retries }}"
+      delay: "{{ keel_health_delay_seconds }}"
+      until: (keel_readyz.status | default(0)) == 200
+      changed_when: false
 
-- name: Verify the deployed commit from inside the running gateway
-  # The strongest available check that what is RUNNING is what was DEPLOYED:
-  # read the baked pack catalogue out of the live container rather than trusting
-  # the tag on the image.
-  ansible.builtin.command:
-    cmd: docker exec keel-lab-gateway sh -c 'ls packs | wc -l'
-  register: keel_packs_in_image
-  changed_when: false
+    - name: Confirm the web console answers on loopback
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ keel_web_loopback_port }}/"
+        status_code: 200
+      register: keel_web_check
+      retries: "{{ keel_health_retries }}"
+      delay: "{{ keel_health_delay_seconds }}"
+      until: (keel_web_check.status | default(0)) == 200
+      changed_when: false
 
-- name: Confirm the packs were baked into the running image
-  ansible.builtin.assert:
-    that:
-      - keel_packs_in_image.stdout | trim | int > 0
-    fail_msg: >-
-      The running gateway has no packs. The image was built without
-      packages/gateway/Dockerfile's pack COPY, which means this host is running
-      a build that predates that fix.
-    success_msg: "{{ keel_packs_in_image.stdout | trim }} packs present in the running image."
+    - name: Collect the container state
+      ansible.builtin.command:
+        cmd: >-
+          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          ps --format '{{ '{{' }}.Name{{ '}}' }}\t{{ '{{' }}.State{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}'
+        chdir: "{{ keel_root }}"
+      register: keel_ps
+      changed_when: false
 
-- name: Summarise the deployment
-  ansible.builtin.debug:
-    msg:
-      - "commit        {{ keel_commit }}"
-      - "images        {{ keel_gateway_image }}, {{ keel_web_image }}"
-      - "gateway       127.0.0.1:{{ keel_gateway_loopback_port }} (healthz + readyz 200)"
-      - "web           127.0.0.1:{{ keel_web_loopback_port }}"
-      - "ingress       https://{{ keel_hostname }} via Caddy only"
-      - "data root     {{ keel_data_root }}"
-      - "digests       {{ keel_build_dir }}/IMAGE_DIGESTS"
+    - name: Show the container state
+      ansible.builtin.debug:
+        var: keel_ps.stdout_lines
+
+    - name: Confirm no long-running service is unhealthy or exited
+      # `migrate` and `minio-bucket` are one-shots and are SUPPOSED to be exited;
+      # every other container must be running. Asserting on the wrong set here
+      # would either fail every healthy deploy or pass a broken one.
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          ps --format '{{ '{{' }}.Service{{ '}}' }} {{ '{{' }}.State{{ '}}' }}'
+          | grep -vE '^(migrate|minio-bucket) ' | grep -vc ' running'
+        executable: /bin/bash
+        chdir: "{{ keel_root }}"
+      register: keel_not_running
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when a long-running service is not running
+      ansible.builtin.assert:
+        that:
+          - (keel_not_running.stdout | default('1') | trim | int) == 0
+        fail_msg: >-
+          {{ keel_not_running.stdout | default('?') | trim }} long-running
+          service(s) are not in the running state. See the container state above.
+        success_msg: Every long-running service is up.
+
+    - name: Verify the deployed commit from inside the running gateway
+      # The strongest available check that what is RUNNING is what was DEPLOYED:
+      # read the baked pack catalogue out of the live container rather than
+      # trusting the tag on the image.
+      ansible.builtin.command:
+        cmd: docker exec keel-lab-gateway sh -c 'ls packs | wc -l'
+      register: keel_packs_in_image
+      changed_when: false
+
+    - name: Confirm the packs were baked into the running image
+      ansible.builtin.assert:
+        that:
+          - (keel_packs_in_image.stdout | default('0') | trim | int) > 0
+        fail_msg: >-
+          The running gateway has no packs. The image was built without
+          packages/gateway/Dockerfile's pack COPY, which means this host is
+          running a build that predates that fix.
+        success_msg: >-
+          {{ keel_packs_in_image.stdout | trim }} packs present in the running image.
+
+    - name: Summarise the deployment
+      ansible.builtin.debug:
+        msg:
+          - "commit        {{ keel_commit }}"
+          - "images        {{ keel_gateway_image }}, {{ keel_web_image }}"
+          - "gateway       127.0.0.1:{{ keel_gateway_loopback_port }} (healthz + readyz 200)"
+          - "web           127.0.0.1:{{ keel_web_loopback_port }}"
+          - "ingress       https://{{ keel_hostname }} via Caddy only"
+          - "data root     {{ keel_data_root }}"
+          - "digests       {{ keel_build_dir }}/IMAGE_DIGESTS"

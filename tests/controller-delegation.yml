@@ -1,0 +1,157 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION TEST — controller-side tasks must use the CONTROLLER'S identity.
+#
+#   ansible-playbook tests/controller-delegation.yml
+#
+# ═══ THE DEFECT ═══════════════════════════════════════════════════════════════
+#
+# `delegate_to: localhost` changes WHERE a task runs. It does NOT reset the
+# connection variables the play resolved for the TARGET. So a play running as
+# `ansible_user: labadmin` with `become: true` handed that identity to the
+# controller, which tried to create `/Users/labadmin/.ansible/tmp`, found no such
+# account, and reported the CONTROLLER ITSELF as UNREACHABLE:
+#
+#     fatal: [dc1-x86 -> localhost]: UNREACHABLE
+#     Attempted controller temp directory: /Users/labadmin/.ansible/tmp
+#
+# ═══ HOW THIS REPRODUCES IT WITHOUT A REMOTE HOST ════════════════════════════
+#
+# The play targets a host whose `ansible_user` is `labadmin` and whose
+# `ansible_host` is unroutable — exactly the shape that broke. Every task is
+# delegated to the controller, so NOTHING is ever sent to that host and no SSH is
+# attempted. If delegation leaks the remote identity, the delegated task fails
+# the same way it failed on dc1-arm-1. If it does not, the tasks run as whoever
+# is actually running ansible-playbook.
+#
+# The test asserts the controller user is NOT labadmin, so it is only meaningful
+# on a machine where those differ — which is every real control node, and is
+# checked rather than assumed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Regression — controller delegation keeps the controller's identity
+  hosts: keel_delegation_fixture
+  gather_facts: false
+  become: true          # the remote become context that used to leak
+  vars:
+    keel_controller_user: "{{ lookup('env', 'USER') }}"
+    keel_controller_python: "{{ ansible_playbook_python }}"
+    keel_source_repo: "{{ lookup('env', 'HOME') }}"
+
+  tasks:
+    - name: Establish controller facts (delegated, as the controller)
+      ansible.builtin.setup:
+        gather_subset: ['!all', '!min', 'user']
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_connection: local
+        ansible_user: "{{ keel_controller_user }}"
+        ansible_python_interpreter: "{{ keel_controller_python }}"
+      register: keel_controller_facts
+
+    - name: The fixture must differ from the controller account, or this proves nothing
+      ansible.builtin.assert:
+        that:
+          - hostvars[inventory_hostname]['ansible_user'] == 'labadmin'
+          - keel_controller_user != 'labadmin'
+        fail_msg: >-
+          This test needs the remote ansible_user (labadmin) to DIFFER from the
+          controller account (currently {{ keel_controller_user }}). On a machine
+          where the controller user is itself labadmin the defect is invisible,
+          so the test would pass without testing anything.
+        success_msg: >-
+          remote ansible_user=labadmin, controller user={{ keel_controller_user }} — distinct.
+
+    - name: The delegated task ran as the CONTROLLER user, not the remote one
+      ansible.builtin.assert:
+        that:
+          - keel_controller_facts.ansible_facts.ansible_user_id == keel_controller_user
+          - keel_controller_facts.ansible_facts.ansible_user_id != 'labadmin'
+        fail_msg: >-
+          REGRESSION: the delegated task ran as
+          {{ keel_controller_facts.ansible_facts.ansible_user_id | default('(unknown)') }},
+          not {{ keel_controller_user }}. The remote identity has leaked into
+          controller-side work again.
+        success_msg: >-
+          Delegated task ran as {{ keel_controller_facts.ansible_facts.ansible_user_id }}.
+
+    - name: No controller path under the remote account was attempted
+      ansible.builtin.assert:
+        that:
+          - "'/labadmin/' not in (keel_controller_facts.ansible_facts.ansible_user_dir | default(''))"
+          - keel_controller_facts.ansible_facts.ansible_user_dir | default('') == lookup('env', 'HOME')
+        fail_msg: >-
+          REGRESSION: the controller resolved HOME to
+          {{ keel_controller_facts.ansible_facts.ansible_user_dir | default('(unset)') }}.
+          It must be the controller account's own home — a remote-account path
+          there is what produced "/Users/labadmin/.ansible/tmp".
+        success_msg: >-
+          Controller HOME is its own ({{ keel_controller_facts.ansible_facts.ansible_user_dir }}).
+
+    # ── The two real controller operations from source.yml ──────────────────
+    - name: Controller source validation succeeds
+      ansible.builtin.stat:
+        path: "{{ keel_source_repo }}"
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_connection: local
+        ansible_user: "{{ keel_controller_user }}"
+        ansible_python_interpreter: "{{ keel_controller_python }}"
+      register: keel_repo_stat
+      check_mode: false
+
+    - name: Source validation reached the controller filesystem
+      ansible.builtin.assert:
+        that:
+          - keel_repo_stat.stat.exists | default(false)
+        fail_msg: >-
+          REGRESSION: the delegated stat could not read {{ keel_source_repo }} on
+          the controller.
+
+    - name: git archive runs on the controller
+      # The same command shape source.yml uses, against a throwaway repository so
+      # the test needs no checkout of its own.
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          d=$(mktemp -d)
+          cd "$d"
+          git init -q .
+          git config user.email t@example.invalid
+          git config user.name test
+          echo x > f.txt
+          git add f.txt
+          git -c commit.gpgsign=false commit -qm fixture
+          sha=$(git rev-parse HEAD)
+          git archive --format=tar.gz --prefix=fixture/ -o "$d/out.tar.gz" "$sha"
+          test -s "$d/out.tar.gz" && echo "ARCHIVE_OK $sha"
+          rm -rf "$d"
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_connection: local
+        ansible_user: "{{ keel_controller_user }}"
+        ansible_python_interpreter: "{{ keel_controller_python }}"
+      register: keel_archive_probe
+      changed_when: false
+      check_mode: false
+
+    - name: git archive succeeded on the controller
+      ansible.builtin.assert:
+        that:
+          - "'ARCHIVE_OK' in (keel_archive_probe.stdout | default(''))"
+        fail_msg: >-
+          REGRESSION: git archive did not run on the controller.
+          stdout={{ keel_archive_probe.stdout | default('(none)') }}
+          stderr={{ keel_archive_probe.stderr | default('(none)') }}
+        success_msg: Controller-side git archive succeeded.
+
+    - name: All delegation checks passed
+      ansible.builtin.debug:
+        msg: >-
+          PASS — remote ansible_user=labadmin, controller={{ keel_controller_user }};
+          delegated tasks ran as the controller, HOME was the controller's own, no
+          /Users/labadmin path was attempted, and git archive succeeded.

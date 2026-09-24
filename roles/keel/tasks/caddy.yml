@@ -11,12 +11,15 @@
   ansible.builtin.stat:
     path: "{{ keel_caddy_sites_dir }}"
   register: keel_caddy_dir
+  # Read-only precondition: it runs in check mode, because "is Caddy even here"
+  # is answerable without changing anything and is exactly what a dry run is for.
+  check_mode: false
 
 - name: Fail when Caddy is not present as expected
   ansible.builtin.assert:
     that:
-      - keel_caddy_dir.stat.exists
-      - keel_caddy_dir.stat.isdir
+      - keel_caddy_dir.stat.exists | default(false)
+      - keel_caddy_dir.stat.isdir | default(false)
     fail_msg: >-
       {{ keel_caddy_sites_dir }} does not exist. Caddy is managed separately and
       is expected to import that directory. Set keel_caddy_enabled=false to

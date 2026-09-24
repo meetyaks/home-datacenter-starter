@@ -21,11 +21,14 @@
   register: keel_existing_images
   changed_when: false
   failed_when: false
+  # A read-only inspection: it must run in check mode too, or the build decision
+  # below is made from skipped results and reports nonsense.
+  check_mode: false
 
 - name: Record which images are already present
   ansible.builtin.set_fact:
-    keel_gateway_present: "{{ keel_existing_images.results[0].rc == 0 }}"
-    keel_web_present: "{{ keel_existing_images.results[1].rc == 0 }}"
+    keel_gateway_present: "{{ (keel_existing_images.results[0].rc | default(1)) == 0 }}"
+    keel_web_present: "{{ (keel_existing_images.results[1].rc | default(1)) == 0 }}"
 
 - name: Report the build decision
   ansible.builtin.debug:
@@ -42,6 +45,7 @@
     src: "{{ keel_env_file }}"
   register: keel_live_env
   failed_when: false
+  check_mode: false
 
 - name: Record the previous images for rollback
   ansible.builtin.copy:
@@ -101,21 +105,44 @@
     - "{{ keel_web_image }}"
   register: keel_image_ids
   changed_when: false
+  # Read-only, so it runs in check mode — but on a fresh host nothing was built,
+  # so a non-zero rc is the CORRECT answer there and must not fail the run.
+  # `| default('')` below turns that into an empty identity rather than a crash.
+  failed_when: false
+  check_mode: false
 
 - name: Record the image identities
   ansible.builtin.copy:
     content: |
       # Image identities for {{ keel_commit }}. Written by roles/keel.
       # No registry: these content digests are local to this host's daemon.
-      {{ keel_gateway_image }} {{ keel_image_ids.results[0].stdout }}
-      {{ keel_web_image }} {{ keel_image_ids.results[1].stdout }}
+      {{ keel_gateway_image }} {{ keel_image_ids.results[0].stdout | default('') }}
+      {{ keel_web_image }} {{ keel_image_ids.results[1].stdout | default('') }}
     dest: "{{ keel_build_dir }}/IMAGE_DIGESTS"
     owner: "{{ keel_owner }}"
     group: "{{ keel_group }}"
     mode: "0644"
+  # Nothing to record when nothing was built; the build directory does not exist
+  # in check mode on a fresh host either.
+  when: not ansible_check_mode
+
+- name: Require both images to exist after a real build
+  # NORMAL MODE IS STRICT. `failed_when: false` above exists for check mode, so
+  # without this a genuinely failed build would slip through with an empty digest
+  # and the deploy would proceed to reference an image that is not there.
+  ansible.builtin.assert:
+    that:
+      - (keel_image_ids.results[0].stdout | default('')) | length > 0
+      - (keel_image_ids.results[1].stdout | default('')) | length > 0
+    fail_msg: >-
+      One or both images are absent after the build step:
+      {{ keel_gateway_image }}={{ keel_image_ids.results[0].stdout | default('(missing)') }},
+      {{ keel_web_image }}={{ keel_image_ids.results[1].stdout | default('(missing)') }}.
+    quiet: true
+  when: not ansible_check_mode
 
 - name: Show the image identities
   ansible.builtin.debug:
     msg: >-
-      {{ keel_gateway_image }} = {{ keel_image_ids.results[0].stdout }} |
-      {{ keel_web_image }} = {{ keel_image_ids.results[1].stdout }}
+      {{ keel_gateway_image }} = {{ keel_image_ids.results[0].stdout | default('(not built)') }} |
+      {{ keel_web_image }} = {{ keel_image_ids.results[1].stdout | default('(not built)') }}
