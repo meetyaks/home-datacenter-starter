@@ -165,6 +165,7 @@ Controller-only: no SSH, no vault, no secrets, no Docker, nothing written outsid
 | `controller-delegation.yml` | delegated tasks keep the **controller's** identity when the remote is `labadmin` with `become: true` |
 | `check-mode-fresh-host.yml` | absent stat, absent slurp and skipped-command registers all dereference safely |
 | `run-check-mode-preflight.sh` | every mutating phase is guarded; a real `--check` run creates no archive and no source tree |
+| `run-check-mode-handlers.sh` | all three mutating handlers are notified and SKIPPED under `--check`, and create nothing |
 
 Two details that are load-bearing rather than incidental:
 

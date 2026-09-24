@@ -1,0 +1,93 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION TEST — mutating handlers must not execute under --check.
+#
+#   tests/run-check-mode-handlers.sh
+#
+# ═══ WHAT BROKE ═══════════════════════════════════════════════════════════════
+#
+# A handler fires because a task NOTIFIED it, and in check mode a task notifies
+# on a PREDICTED change — one it did not make. `secrets.yml` runs in both modes
+# by design, so under --check it notified a stack restart in a directory the same
+# run had correctly declined to create:
+#
+#     RUNNING HANDLER [keel : Restart Keel stack]
+#     Unable to change directory before execution:
+#     No such file or directory: /srv/data/services/keel
+#
+# ═══ WHAT THIS PROVES ════════════════════════════════════════════════════════
+#
+# It uses the ROLE'S OWN handlers, notified the same way the role notifies them,
+# against a root that does not exist — exactly the fresh-host shape. If a handler
+# executes, `chdir` into the absent root fails the play and this test fails with
+# it. It then asserts on the filesystem that nothing was created.
+#
+# The notify is deliberately NOT suppressed: notifying is harmless and the guard
+# belongs on the handler, so this checks the guard rather than the notifier.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Regression — handlers do not mutate under check mode
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    ansible_remote_tmp: /tmp/ansible-keel
+    # A root that must not exist. The handlers chdir here; if one runs, it fails.
+    keel_root: /tmp/keel-handler-fixture-absent
+    keel_env_file: "{{ keel_root }}/env/keel.env"
+    keel_compose_file: "{{ keel_root }}/compose.lab.yml"
+    keel_health_retries: 1
+    keel_health_delay_seconds: 1
+
+  handlers:
+    # Copied by REFERENCE, not by value: the role's handler file is imported so
+    # this test exercises the real guards. A local re-implementation would pass
+    # while the role stayed broken.
+    - name: Import the role's handlers
+      ansible.builtin.import_tasks: ../roles/keel/handlers/main.yml
+
+  tasks:
+    - name: Require check mode
+      ansible.builtin.assert:
+        that:
+          - ansible_check_mode
+        fail_msg: Run through tests/run-check-mode-handlers.sh, which passes --check.
+
+    - name: Ensure the fixture root is absent
+      ansible.builtin.file:
+        path: "{{ keel_root }}"
+        state: absent
+      check_mode: false
+
+    - name: Notify every mutating handler, exactly as the role does
+      # `changed_when: true` forces the notify without writing anything — the
+      # same position secrets.yml is in when it predicts a template change.
+      ansible.builtin.debug:
+        msg: notifying
+      changed_when: true
+      notify:
+        - Restart Keel stack
+        - Restart Keel gateway
+        - Reload Caddy
+
+    - name: Run the handlers now, while this play can still assert on them
+      ansible.builtin.meta: flush_handlers
+
+    - name: Confirm the handlers created nothing
+      ansible.builtin.stat:
+        path: "{{ keel_root }}"
+      register: keel_root_after
+      check_mode: false
+
+    - name: The deployment root must still be absent
+      ansible.builtin.assert:
+        that:
+          - not (keel_root_after.stat.exists | default(false))
+        fail_msg: >-
+          REGRESSION: a handler created {{ keel_root }} under --check. Check mode
+          must leave the filesystem untouched.
+        success_msg: >-
+          PASS — all three handlers were notified and none executed;
+          {{ keel_root }} does not exist.

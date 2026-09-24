@@ -20,4 +20,8 @@ echo "══ check-mode preflight (no archive, no source tree) ═════�
 tests/run-check-mode-preflight.sh
 
 echo
+echo "══ check-mode handlers (notified, never executed) ══════════════════"
+tests/run-check-mode-handlers.sh
+
+echo
 echo "All regression suites passed."

@@ -1,4 +1,30 @@
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ EVERY HANDLER HERE MUTATES, SO EVERY ONE IS GUARDED.
+#
+# A handler fires because a task NOTIFIED it, and in check mode a task notifies
+# on a PREDICTED change — one it did not actually make. `secrets.yml` runs in
+# both modes by design (predicting the environment file and the PEM keys is part
+# of preflight), so under `--check` it notified a restart of a stack that does
+# not exist yet, in a directory the same run had correctly declined to create:
+#
+#     RUNNING HANDLER [keel : Restart Keel stack]
+#     Unable to change directory before execution:
+#     No such file or directory: /srv/data/services/keel
+#
+# The guard is on the HANDLER rather than on the notifying tasks. A notify is
+# cheap and harmless; it is the execution that must not happen. Guarding here
+# means a future task that notifies one of these cannot reintroduce the failure,
+# and the skip is visible in the recap instead of being silently absent.
+#
+# ⚠️ NORMAL MODE IS UNCHANGED AND STILL STRICT. There is no `failed_when: false`
+# and no `ignore_errors` below: in a real run the directory and compose file are
+# created before anything can notify, so their absence is a genuine fault and
+# `chdir` failing is the correct outcome. A handler that swallowed that would
+# report a successful deployment that never restarted anything.
+# (enforced: tests/check-mode-handlers.yml)
+# ─────────────────────────────────────────────────────────────────────────────
+
 - name: Restart Keel stack
   ansible.builtin.command:
     cmd: >-
@@ -7,6 +33,7 @@
       --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
     chdir: "{{ keel_root }}"
   changed_when: true
+  when: not ansible_check_mode
 
 - name: Restart Keel gateway
   # Narrower than the stack handler: a rotated JWT keypair needs the gateway to
@@ -17,6 +44,7 @@
       up -d --force-recreate --no-deps gateway
     chdir: "{{ keel_root }}"
   changed_when: true
+  when: not ansible_check_mode
 
 - name: Reload Caddy
   # Reload, never restart: Caddy is shared infrastructure and a restart would
@@ -24,3 +52,4 @@
   ansible.builtin.systemd:
     name: caddy
     state: reloaded
+  when: not ansible_check_mode

@@ -55,16 +55,25 @@
       ansible.builtin.include_role:
         name: keel
         tasks_from: backup
+      # ⚠️ `--check` MUST NOT reach these. They stop the stack or replace live data,
+      # and a dry run of `docker compose down` is not a dry run of anything.
+      when: not ansible_check_mode
       tags: [backup, never]
 
     - name: Restore persistent state
       ansible.builtin.include_role:
         name: keel
         tasks_from: restore
+      # ⚠️ `--check` MUST NOT reach these. They stop the stack or replace live data,
+      # and a dry run of `docker compose down` is not a dry run of anything.
+      when: not ansible_check_mode
       tags: [restore, never]
 
     - name: Roll back to the previous images
       ansible.builtin.include_role:
         name: keel
         tasks_from: rollback
+      # ⚠️ `--check` MUST NOT reach these. They stop the stack or replace live data,
+      # and a dry run of `docker compose down` is not a dry run of anything.
+      when: not ansible_check_mode
       tags: [rollback, never]
