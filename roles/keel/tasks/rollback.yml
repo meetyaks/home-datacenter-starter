@@ -1,0 +1,92 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Rollback to the previously deployed images.
+#   ansible-playbook playbooks/keel.yml --tags rollback
+#
+# ⚠️ THIS MOVES THE CODE, NOT THE SCHEMA. Migrations are forward-only. If the
+# rolled-forward deploy applied one, the older image meets a newer database, and
+# a code-only rollback is NOT enough — restore the matching data backup instead.
+# The task reports which migrations ran so that decision is made on evidence.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Read the retained previous images
+  ansible.builtin.slurp:
+    src: "{{ keel_root }}/ROLLBACK_PREVIOUS"
+  register: keel_previous
+
+- name: Fail when no previous deployment was recorded
+  ansible.builtin.assert:
+    that:
+      - keel_previous.content is defined
+      - "'KEEL_IMAGE=' in (keel_previous.content | b64decode)"
+    fail_msg: >-
+      {{ keel_root }}/ROLLBACK_PREVIOUS records no prior images — this host has
+      only ever run one deployment, so there is nothing to roll back to.
+
+- name: Show what will be rolled back to
+  ansible.builtin.debug:
+    msg: "{{ (keel_previous.content | b64decode).split('\n') | select('match', '^KEEL_') | list }}"
+
+- name: Confirm those images still exist on this host
+  # No registry: if the image was pruned, the tag in the file is a promise this
+  # host can no longer keep, and it is better to say so than to fail mid-recreate.
+  ansible.builtin.command:
+    cmd: docker image inspect {{ item.split('=')[1] }}
+  loop: "{{ (keel_previous.content | b64decode).split('\n') | select('match', '^KEEL_(WEB_)?IMAGE=') | list }}"
+  register: keel_previous_present
+  changed_when: false
+  failed_when: false
+
+- name: Fail when a previous image has been pruned
+  ansible.builtin.assert:
+    that:
+      - keel_previous_present.results | selectattr('rc', 'ne', 0) | list | length == 0
+    fail_msg: >-
+      A previously deployed image is no longer in this host's daemon. There is no
+      registry to re-pull it from, so rollback must instead redeploy that commit
+      from source: set keel_commit to it and re-run the playbook.
+
+- name: Report the migrations applied by the current deployment
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      logs --no-color migrate
+    chdir: "{{ keel_root }}"
+  register: keel_rollback_migrations
+  changed_when: false
+  failed_when: false
+
+- name: Show what the schema did on the way forward
+  ansible.builtin.debug:
+    msg: >-
+      {{ keel_rollback_migrations.stdout_lines | select('search', 'applied') | list
+         | default(['no migration log available'], true) }}
+
+- name: Point the environment file back at the previous images
+  ansible.builtin.lineinfile:
+    path: "{{ keel_env_file }}"
+    regexp: "^{{ item.split('=')[0] }}="
+    line: "{{ item }}"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0600"
+  loop: "{{ (keel_previous.content | b64decode).split('\n') | select('match', '^KEEL_(WEB_)?IMAGE=') | list }}"
+  no_log: true
+
+- name: Recreate the stack on the previous images
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      up -d --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
+    chdir: "{{ keel_root }}"
+  changed_when: true
+
+- name: Confirm the gateway is healthy after rollback
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ keel_gateway_loopback_port }}/readyz"
+    status_code: 200
+  register: keel_rollback_ready
+  retries: "{{ keel_health_retries }}"
+  delay: "{{ keel_health_delay_seconds }}"
+  until: keel_rollback_ready.status is defined and keel_rollback_ready.status == 200
+  changed_when: false

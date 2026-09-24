@@ -1,0 +1,35 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Caddy route. Caddy is SEPARATELY MANAGED shared infrastructure: this role
+# writes one drop-in file and asks Caddy to reload it. It does not install
+# Caddy, does not touch the main Caddyfile, and does not own the service — a
+# role that reconfigured shared ingress would make every other site on this host
+# a hostage to a Keel deployment.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Confirm Caddy's drop-in directory exists
+  ansible.builtin.stat:
+    path: "{{ keel_caddy_sites_dir }}"
+  register: keel_caddy_dir
+
+- name: Fail when Caddy is not present as expected
+  ansible.builtin.assert:
+    that:
+      - keel_caddy_dir.stat.exists
+      - keel_caddy_dir.stat.isdir
+    fail_msg: >-
+      {{ keel_caddy_sites_dir }} does not exist. Caddy is managed separately and
+      is expected to import that directory. Set keel_caddy_enabled=false to
+      deploy without touching ingress, then wire the route by hand.
+
+- name: Install the Keel site file
+  ansible.builtin.template:
+    src: keel.caddy.j2
+    dest: "{{ keel_caddy_site_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    # Refuse to install a file Caddy cannot parse. Without this a syntax error
+    # takes down every OTHER site on this host at the next reload.
+    validate: caddy validate --adapter caddyfile --config %s
+  notify: Reload Caddy

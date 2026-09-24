@@ -1,0 +1,61 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Backup. Run explicitly:
+#   ansible-playbook playbooks/keel.yml --tags backup
+#
+# ⚠️ THE STACK IS STOPPED FIRST, AND THAT IS NOT OPTIONAL. A tar of a running
+# PGDATA is a copy of a database mid-write: it will often restore, and it will
+# sometimes restore corrupt. A backup you cannot trust is worse than none,
+# because it is the one you reach for under pressure.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Create the backup directory
+  ansible.builtin.file:
+    path: "{{ keel_backup_dir | default(keel_root + '/backups') }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0700"
+
+- name: Stop the stack
+  ansible.builtin.command:
+    cmd: docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }} down
+    chdir: "{{ keel_root }}"
+  changed_when: true
+
+- name: Archive the persistent state
+  ansible.builtin.command:
+    cmd: >-
+      tar -C {{ keel_root }}
+      -czf {{ keel_backup_dir | default(keel_root + '/backups') }}/keel-data-{{ ansible_date_time.date }}.tgz
+      data
+  register: keel_backup
+  changed_when: keel_backup.rc == 0
+
+- name: Record which commit produced this data
+  # Restoring data under the wrong image runs migrations the dump never saw.
+  # The tag beside the archive is what makes a restore checkable.
+  ansible.builtin.copy:
+    content: |
+      archive=keel-data-{{ ansible_date_time.date }}.tgz
+      keel_commit={{ keel_commit }}
+      keel_image_tag={{ keel_image_tag }}
+      taken_at={{ ansible_date_time.iso8601 }}
+    dest: "{{ keel_backup_dir | default(keel_root + '/backups') }}/keel-data-{{ ansible_date_time.date }}.manifest"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0600"
+
+- name: Start the stack again
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      up -d --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
+    chdir: "{{ keel_root }}"
+  changed_when: true
+
+- name: Report the backup
+  ansible.builtin.debug:
+    msg: >-
+      {{ keel_backup_dir | default(keel_root + '/backups') }}/keel-data-{{ ansible_date_time.date }}.tgz
+      taken at commit {{ keel_commit }}

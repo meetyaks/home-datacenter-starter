@@ -1,0 +1,97 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Compose deployment. The stack definition comes from the COMMIT, not from this
+# repository — two hand-maintained copies of one stack drift, and the drift is
+# silent until a deploy behaves unlike the tree it claims to be.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Install the stack definition from the built commit
+  ansible.builtin.copy:
+    src: "{{ keel_build_dir }}/infra/lab/compose.lab.yml"
+    dest: "{{ keel_compose_file }}"
+    remote_src: true
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  notify: Restart Keel stack
+
+- name: Refuse to continue if the stack would publish a LAN port
+  # The whole ingress rule in one check, made from the RENDERED config rather
+  # than the template: only 127.0.0.1 publishes are allowed, because Caddy is the
+  # single way in. A `3000:3000` slipping in here would put the gateway on every
+  # interface, which is the most likely way this stack becomes reachable by
+  # accident.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }} config
+      | grep -E '^\s+host_ip:' | grep -v '127\.0\.0\.1' | wc -l
+    executable: /bin/bash
+    chdir: "{{ keel_root }}"
+  register: keel_lan_publishes
+  changed_when: false
+
+- name: Fail when any publish is not loopback
+  ansible.builtin.assert:
+    that:
+      - keel_lan_publishes.stdout | trim | int == 0
+    fail_msg: >-
+      The rendered stack publishes {{ keel_lan_publishes.stdout | trim }} port(s)
+      on a non-loopback address. Caddy is the only permitted LAN ingress.
+    success_msg: Every published port is bound to 127.0.0.1.
+
+- name: Pull the pinned dependency images
+  # Only the upstream dependencies; the two Keel images are local builds and have
+  # no registry to pull from, so `--ignore-pull-failures` would hide a real
+  # problem. Naming the services instead is explicit about which are external.
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      pull postgres nats temporal minio minio-bucket
+    chdir: "{{ keel_root }}"
+  register: keel_pull
+  changed_when: "'Pulled' in keel_pull.stderr or 'Downloaded' in keel_pull.stderr"
+
+- name: Start the stack
+  # `up -d` runs `migrate` to completion first: the gateway declares
+  # `service_completed_successfully` on it, so a failed migration stops the
+  # deploy here rather than leaving a gateway serving a half-migrated schema.
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      up -d --remove-orphans --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
+    chdir: "{{ keel_root }}"
+  register: keel_up
+  changed_when: true
+
+- name: Report the migration result
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      logs --no-color --tail 40 migrate
+    chdir: "{{ keel_root }}"
+  register: keel_migrate_logs
+  changed_when: false
+
+- name: Show the migration output
+  ansible.builtin.debug:
+    var: keel_migrate_logs.stdout_lines
+
+- name: Confirm the migration exited cleanly
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      docker inspect --format '{{ '{{' }}.State.ExitCode{{ '}}' }}' keel-lab-migrate
+    executable: /bin/bash
+  register: keel_migrate_exit
+  changed_when: false
+
+- name: Fail on a non-zero migration exit
+  ansible.builtin.assert:
+    that:
+      - keel_migrate_exit.stdout | trim | int == 0
+    fail_msg: >-
+      The one-shot migration exited {{ keel_migrate_exit.stdout | trim }}. The
+      stack is up but the schema is not what this commit expects; do not treat
+      this deployment as complete.
+    success_msg: Migration completed successfully.

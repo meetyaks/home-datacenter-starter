@@ -1,0 +1,43 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Keel lab deployment.
+#
+#   check    ansible-playbook playbooks/keel.yml --check --diff
+#   deploy   ansible-playbook playbooks/keel.yml
+#   backup   ansible-playbook playbooks/keel.yml --tags backup
+#   restore  ansible-playbook playbooks/keel.yml --tags restore -e keel_restore_archive=…
+#   rollback ansible-playbook playbooks/keel.yml --tags rollback
+#
+# ⚠️ BACKUP, RESTORE AND ROLLBACK ARE `never`-TAGGED. Each one stops the stack or
+# replaces live data, so none may run as a side effect of an ordinary deploy —
+# they execute only when named explicitly on the command line.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Deploy Keel to the lab host
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Deploy
+      ansible.builtin.include_role:
+        name: keel
+      tags: [deploy]
+
+    - name: Back up persistent state
+      ansible.builtin.include_role:
+        name: keel
+        tasks_from: backup
+      tags: [backup, never]
+
+    - name: Restore persistent state
+      ansible.builtin.include_role:
+        name: keel
+        tasks_from: restore
+      tags: [restore, never]
+
+    - name: Roll back to the previous images
+      ansible.builtin.include_role:
+        name: keel
+        tasks_from: rollback
+      tags: [rollback, never]

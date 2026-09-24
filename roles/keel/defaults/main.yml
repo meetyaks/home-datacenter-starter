@@ -1,0 +1,87 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Keel lab deployment — defaults.
+#
+# ⚠️ NO SECRET VALUE APPEARS IN THIS FILE OR ANYWHERE ELSE IN THIS REPOSITORY.
+# Every credential is read from `keel_vault_*` variables that live only in
+# inventory/group_vars/vault.yml, which .gitignore already excludes. The role
+# asserts each one is defined before it writes anything, so a missing secret
+# stops the run instead of rendering an empty password into a live stack.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── WHICH COMMIT IS BEING DEPLOYED ──────────────────────────────────────────
+#
+# The full 40-character SHA, never a branch and never a tag. It is the only
+# version identity this deployment has: the image tag, the build directory and
+# the manifest all derive from it, and the role refuses to build if the archive
+# it received does not carry this exact value.
+keel_commit: 2e84470d208bdcf213baba850659e5d5ded006ab
+
+# Derived. `sha-2e84470d` — short enough to read, long enough to be unambiguous.
+keel_commit_short: "{{ keel_commit[:8] }}"
+keel_image_tag: "sha-{{ keel_commit_short }}"
+keel_gateway_image: "keel-gateway:{{ keel_image_tag }}"
+keel_web_image: "keel-web:{{ keel_image_tag }}"
+
+# ── WHERE THE SOURCE COMES FROM ─────────────────────────────────────────────
+#
+# A git checkout on the CONTROL node (dc1-arm-1). The role runs `git archive` on
+# that exact SHA, so what reaches the host is the commit's tree and nothing else:
+# no .git, no node_modules, no working-tree edits, no build output, no secrets.
+keel_source_repo: "{{ lookup('env', 'HOME') }}/Projects/keel"
+
+# ── FILESYSTEM ──────────────────────────────────────────────────────────────
+#
+# Build inputs and runtime state are separated on purpose: deleting a build
+# directory must never be able to reach data.
+keel_root: /srv/data/services/keel
+keel_build_root: "{{ keel_root }}/builds"
+keel_build_dir: "{{ keel_build_root }}/{{ keel_commit_short }}"
+keel_data_root: "{{ keel_root }}/data"
+keel_secrets_dir: "{{ keel_root }}/secrets"
+keel_env_dir: "{{ keel_root }}/env"
+keel_env_file: "{{ keel_env_dir }}/keel.env"
+keel_compose_file: "{{ keel_root }}/compose.lab.yml"
+
+keel_owner: root
+keel_group: root
+
+# Data subdirectories, each a bind target in compose.lab.yml.
+keel_data_dirs:
+  - "{{ keel_data_root }}/postgres"
+  - "{{ keel_data_root }}/nats"
+  - "{{ keel_data_root }}/minio"
+
+# ── NON-SECRET CONFIGURATION ────────────────────────────────────────────────
+keel_blob_bucket: keel-lab
+keel_hostname: keel.dc1.lan
+keel_jwt_issuer: "https://{{ keel_hostname }}/"
+keel_jwt_audience: keel-api
+keel_cors_origins: "https://{{ keel_hostname }}"
+keel_oidc_issuer: "https://{{ keel_hostname }}/oidc/"
+keel_oidc_client_id: keel-lab
+
+# Loopback publishes the stack makes; Caddy is the only LAN ingress.
+keel_gateway_loopback_port: 3000
+keel_web_loopback_port: 8080
+
+# ── CADDY ───────────────────────────────────────────────────────────────────
+#
+# Caddy is separately managed shared infrastructure. This role writes ONE file
+# into its drop-in directory and reloads it; it never installs or reconfigures
+# Caddy itself.
+keel_caddy_enabled: true
+keel_caddy_sites_dir: /etc/caddy/conf.d
+keel_caddy_site_file: "{{ keel_caddy_sites_dir }}/keel.caddy"
+
+# ── BEHAVIOUR ───────────────────────────────────────────────────────────────
+#
+# Rebuild even when the expected tag already resolves to an image. Off by
+# default: a tag derived from an immutable commit cannot legitimately mean two
+# different images, so a present tag is a finished build.
+keel_force_rebuild: false
+
+# Bounded waits. A deployment that hangs is a deployment nobody can diagnose.
+keel_build_timeout_seconds: 3600
+keel_health_retries: 30
+keel_health_delay_seconds: 10

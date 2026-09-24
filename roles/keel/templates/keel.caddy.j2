@@ -1,0 +1,38 @@
+# Rendered by roles/keel. Caddy is separately managed; this is a drop-in only.
+#
+# The ONLY LAN ingress to Keel. Everything the stack runs binds to 127.0.0.1 or
+# to nothing at all, so removing this file removes external access entirely.
+
+{{ keel_hostname }} {
+	encode zstd gzip
+
+	# The gateway's own API surface. Ordered first: these paths must never be
+	# served by the SPA, which would answer 200-with-HTML to an API client and
+	# turn an auth failure into a parse error three layers away.
+	@api path /auth/* /records/* /queries/* /tasks/* /platform/* /healthz /readyz /a/*
+	handle @api {
+		reverse_proxy 127.0.0.1:{{ keel_gateway_loopback_port }} {
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	# Everything else is the console. The SPA image proxies its own gateway calls
+	# internally over the compose network.
+	handle {
+		reverse_proxy 127.0.0.1:{{ keel_web_loopback_port }}
+	}
+
+	log {
+		output file /var/log/caddy/{{ keel_hostname }}.log
+		# Keep credentials out of the ingress log: Authorization and Cookie are
+		# the two headers most likely to carry one.
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+			}
+		}
+	}
+}

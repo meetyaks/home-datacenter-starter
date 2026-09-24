@@ -1,0 +1,26 @@
+---
+- name: Restart Keel stack
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      up -d --remove-orphans --wait
+      --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
+    chdir: "{{ keel_root }}"
+  changed_when: true
+
+- name: Restart Keel gateway
+  # Narrower than the stack handler: a rotated JWT keypair needs the gateway to
+  # re-read /secrets, and nothing else in the stack holds those files.
+  ansible.builtin.command:
+    cmd: >-
+      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      up -d --force-recreate --no-deps gateway
+    chdir: "{{ keel_root }}"
+  changed_when: true
+
+- name: Reload Caddy
+  # Reload, never restart: Caddy is shared infrastructure and a restart would
+  # drop every other site on this host along with Keel's.
+  ansible.builtin.systemd:
+    name: caddy
+    state: reloaded

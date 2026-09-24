@@ -1,0 +1,102 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Keel lab deployment — one host, one commit, images built natively on that host.
+#
+# The whole role is idempotent. A second run against an unchanged commit creates
+# no directory, transfers no archive, builds no image and recreates no container;
+# it verifies and reports. That is what makes it safe to re-run after a partial
+# failure, which is the state a deployment is most often actually in.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Verify the deployment candidate is a full commit SHA
+  ansible.builtin.assert:
+    that:
+      - keel_commit is match('^[0-9a-f]{40}$')
+    fail_msg: >-
+      keel_commit must be the full 40-character SHA, not a branch, tag or
+      abbreviation. The image tag, build directory and manifest all derive from
+      it, and an abbreviation can become ambiguous as the repository grows.
+    success_msg: "Deploying Keel commit {{ keel_commit }}"
+
+- name: Require every secret to be present before anything is written
+  ansible.builtin.assert:
+    that:
+      - keel_vault_admin_db_password is defined and keel_vault_admin_db_password | length > 0
+      - keel_vault_app_db_password is defined and keel_vault_app_db_password | length > 0
+      - keel_vault_blob_access_key is defined and keel_vault_blob_access_key | length > 0
+      - keel_vault_blob_secret_key is defined and keel_vault_blob_secret_key | length > 0
+      - keel_vault_oidc_client_secret is defined and keel_vault_oidc_client_secret | length > 0
+      - keel_vault_master_key is defined and keel_vault_master_key | length > 0
+      - keel_vault_mfa_master_key is defined and keel_vault_mfa_master_key | length > 0
+      - keel_vault_jwt_private_key is defined and keel_vault_jwt_private_key | length > 0
+      - keel_vault_jwt_public_key is defined and keel_vault_jwt_public_key | length > 0
+    fail_msg: >-
+      One or more keel_vault_* variables are missing. Create
+      inventory/group_vars/vault.yml with ansible-vault and define every name
+      listed in roles/keel/README.md. Nothing is written until all are present —
+      a half-rendered environment file would start a stack on a blank credential.
+    success_msg: All required secrets are present.
+    quiet: true
+
+- name: Confirm the target is the expected architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_architecture == 'x86_64'
+    fail_msg: >-
+      Keel images for this lab are built natively as linux/amd64 on the target.
+      This host reports {{ ansible_architecture }}.
+    success_msg: "Target architecture is {{ ansible_architecture }}."
+
+- name: Require the dedicated data filesystem
+  ansible.builtin.assert:
+    that:
+      - ansible_mounts | selectattr('mount', 'equalto', '/srv/data') | list | length == 1
+    fail_msg: >-
+      /srv/data is not a separate mounted filesystem. Persistent state must not
+      land on the root volume. Run the `storage` role first.
+    success_msg: /srv/data is a dedicated filesystem.
+
+- name: Create the persistent directory tree
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ keel_root }}", mode: "0755" }
+    - { path: "{{ keel_build_root }}", mode: "0755" }
+    - { path: "{{ keel_data_root }}", mode: "0755" }
+    # 0700: only root reads the rendered environment file and the PEM keys.
+    - { path: "{{ keel_secrets_dir }}", mode: "0700" }
+    - { path: "{{ keel_env_dir }}", mode: "0700" }
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Create the data subdirectories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0755"
+  loop: "{{ keel_data_dirs }}"
+
+- name: Install the secret material and rendered environment
+  ansible.builtin.include_tasks: secrets.yml
+
+- name: Transfer and verify the source for this exact commit
+  ansible.builtin.include_tasks: source.yml
+
+- name: Build the images natively on this host
+  ansible.builtin.include_tasks: build.yml
+
+- name: Deploy the Compose stack
+  ansible.builtin.include_tasks: deploy.yml
+
+- name: Configure the Caddy route
+  ansible.builtin.include_tasks: caddy.yml
+  when: keel_caddy_enabled | bool
+
+- name: Verify the deployment is healthy
+  ansible.builtin.include_tasks: verify.yml
