@@ -85,12 +85,22 @@ keel_group: root
 # the runtime resolves `<cwd>/packs`: a commit predating that change builds an
 # image with NO packs, and the only symptom is a gateway that serves an empty
 # catalogue. Better to refuse the commit than to ship that.
+
+# Where the canonical platform version is DECLARED, and the only place it is
+# read from. `COMPILED_PLATFORM_VERSION` in this file is the repository's own
+# build-time truth; preflight reads it out of the COMMIT'S BLOB so the stamp on
+# the image is the version that commit states, not whatever the control node
+# happens to have checked out.
+keel_platform_version_file: packages/core/src/platform-version/version.ts
+
 keel_required_commit_paths:
   - infra/lab/compose.lab.yml
   - packages/gateway/Dockerfile
   - apps/web/Dockerfile
   - packs
   - profiles
+  # The version blob preflight reads; a commit without it cannot be stamped.
+  - "{{ keel_platform_version_file }}"
 
 # Data subdirectories, each a bind target in compose.lab.yml.
 keel_data_dirs:

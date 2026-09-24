@@ -63,13 +63,29 @@
     - keel_live_env.content is defined
     - keel_image_tag not in (keel_live_env.content | b64decode)
 
+- name: Refuse to build without a platform version
+  # ⚠️ A SECOND GATE, IMMEDIATELY BEFORE THE BUILD. Preflight already derived and
+  # validated this, but preflight is a long way from here and `set_fact` can be
+  # overridden by an extra-var. The stamp is baked into the image and cannot be
+  # corrected afterwards, so the check is repeated where the value is spent.
+  ansible.builtin.assert:
+    that:
+      - keel_platform_version is defined
+      - keel_platform_version | length > 0
+      - keel_platform_version is match('^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$')
+    fail_msg: >-
+      keel_platform_version is "{{ keel_platform_version | default('(undefined)') }}".
+      Refusing to build: the gateway stamps this at build time and refuses to
+      boot on an unparseable value, so an image built now could not start.
+    success_msg: "Stamping {{ keel_gateway_image }} with platform version {{ keel_platform_version }}."
+
 - name: Build the gateway image
   ansible.builtin.command:
     cmd: >-
       docker build
       --file packages/gateway/Dockerfile
       --tag {{ keel_gateway_image }}
-      --build-arg KEEL_PLATFORM_VERSION=
+      --build-arg KEEL_PLATFORM_VERSION={{ keel_platform_version }}
       .
     chdir: "{{ keel_build_dir }}"
   register: keel_gateway_build

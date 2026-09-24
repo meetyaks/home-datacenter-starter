@@ -166,6 +166,7 @@ Controller-only: no SSH, no vault, no secrets, no Docker, nothing written outsid
 | `check-mode-fresh-host.yml` | absent stat, absent slurp and skipped-command registers all dereference safely |
 | `run-check-mode-preflight.sh` | every mutating phase is guarded; a real `--check` run creates no archive and no source tree |
 | `run-check-mode-handlers.sh` | all three mutating handlers are notified and SKIPPED under `--check`, and create nothing |
+| `platform-version.yml` | empty, malformed and undefined versions are refused; a valid one is accepted; the commit-blob derivation yields an accepted value |
 
 Two details that are load-bearing rather than incidental:
 

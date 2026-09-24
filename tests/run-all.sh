@@ -24,4 +24,8 @@ echo "══ check-mode handlers (notified, never executed) ══════�
 tests/run-check-mode-handlers.sh
 
 echo
+echo "══ platform version gate ═══════════════════════════════════════════"
+ansible-playbook tests/platform-version.yml -e keel_test_commit=2e84470d208bdcf213baba850659e5d5ded006ab
+
+echo
 echo "All regression suites passed."

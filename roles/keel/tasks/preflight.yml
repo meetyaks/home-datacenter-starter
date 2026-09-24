@@ -189,3 +189,62 @@
       Commit {{ keel_commit_short }} carries all
       {{ keel_required_commit_paths | length }} required paths:
       {{ keel_required_commit_paths | join(', ') }}
+
+# ── The platform version, read from the commit being deployed ───────────────
+#
+# ⚠️ FROM THE COMMIT'S OWN BLOB, NOT THE CONTROLLER'S WORKING TREE. `git show
+# <sha>:<path>` reads the object, so the version is the one THAT COMMIT declares
+# — regardless of which branch is checked out on the control node, or whether it
+# is dirty. Deriving it from the worktree would let a deployment stamp an image
+# with a version from a different commit entirely, and the stamp is the
+# instance's release identity: every compatibility decision it makes depends on
+# it being right.
+
+- name: Read the platform version declared by this commit
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      git show {{ keel_commit }}:{{ keel_platform_version_file }}
+      | grep -E "^export const COMPILED_PLATFORM_VERSION"
+      | sed -E "s/.*'([^']+)'.*/\1/"
+    executable: /bin/bash
+    chdir: "{{ keel_source_repo }}"
+  register: keel_version_probe
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Record the platform version for this deployment
+  ansible.builtin.set_fact:
+    keel_platform_version: "{{ keel_version_probe.stdout | default('') | trim }}"
+
+- name: Require a well-formed platform version before anything is built
+  # ⚠️ FAIL FAST, AND IN BOTH MODES. This is the one value that cannot be
+  # corrected after the fact: it is baked into the image at build time, and
+  # `resolvePlatformVersion` is fail-closed — a stamped-but-unparseable value
+  # makes the gateway REFUSE TO BOOT rather than answer compat questions wrongly.
+  # Catching it here costs nothing; catching it after a build costs the build.
+  #
+  # The pattern is the repository's own SEMVER_RE from
+  # packages/core/src/platform-version/version.ts, not a looser one invented
+  # here — a version this role accepted and the platform then rejected would be
+  # the worst of both.
+  ansible.builtin.assert:
+    that:
+      - keel_platform_version is defined
+      - keel_platform_version | length > 0
+      - keel_platform_version is match('^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$')
+    fail_msg: >-
+      Could not derive a valid platform version from commit {{ keel_commit_short }}.
+      Read "{{ keel_platform_version | default('(nothing)') }}" from
+      {{ keel_platform_version_file }}. Expected a semver such as 0.1.2. The
+      image stamps this at build time and the gateway refuses to boot on an
+      unparseable value, so the build is not attempted.
+    success_msg: >-
+      Platform version {{ keel_platform_version }} derived from commit
+      {{ keel_commit_short }}.
