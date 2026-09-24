@@ -11,7 +11,7 @@
 # The manifest then closes the loop at the far end: the host verifies the SHA it
 # was told to deploy against the SHA the archive actually carries.
 #
-# ═══ CONTROLLER TASKS CARRY THEIR OWN IDENTITY, EVERY ONE OF THEM ═════════════
+# ═══ CONTROLLER TASKS, AND THE TEMP DIRECTORY THAT IS NOT FIXED HERE ══════════
 #
 # `delegate_to` changes WHERE a task runs. It does not reset the connection
 # variables the play resolved for the TARGET — so a play running as
@@ -19,11 +19,25 @@
 # controller, which tried `/Users/labadmin/.ansible/tmp`, found no such account,
 # and declared the controller UNREACHABLE.
 #
-# So every delegated task below carries the same four lines: `become: false` and
-# the three `ansible_*` overrides from defaults/main.yml. They are repeated
-# rather than factored into a block, because a block would hide from the reader
-# the one fact that matters here — that each of these runs somewhere else, as
-# someone else. (enforced: tests/controller-delegation.yml)
+# ⚠️ THE TEMP DIRECTORY IS FIXED AT PLAY SCOPE, IN playbooks/keel.yml, NOT HERE.
+# Ansible needs somewhere to stage a module BEFORE it runs the task, so anything
+# in a task's own `vars:` is resolved too late to influence it. An earlier
+# version of this file set `ansible_user` per task and claimed to solve exactly
+# that; it did not, and the same `/Users/labadmin/.ansible/tmp` came back on the
+# next run. `ansible_remote_tmp: /tmp/ansible-keel` on the play is what actually
+# removes the expansion, because an absolute path is never expanded against a
+# user's home at all.
+#
+# What each task below still needs, and what these two lines genuinely do:
+#   ansible_connection: local           run here, do not ssh to self
+#   ansible_python_interpreter          the interpreter ansible-playbook itself
+#                                       is using, never one inherited from the
+#                                       remote host
+# plus `become: false`, so controller work is not attempted under the remote
+# privilege-escalation context.
+#
+# They are repeated per task rather than wrapped in a block, because a block
+# would hide the one fact a reader needs: each of these runs somewhere else.
 # ─────────────────────────────────────────────────────────────────────────────
 
 - name: Confirm the control node has the source repository
@@ -34,7 +48,6 @@
   become: false
   vars:
     ansible_connection: local
-    ansible_user: "{{ keel_controller_user }}"
     ansible_python_interpreter: "{{ keel_controller_python }}"
   # A read-only validation: it runs in check mode too, because "is the source
   # even here" is answerable without changing anything and is the first thing a
@@ -58,7 +71,6 @@
   become: false
   vars:
     ansible_connection: local
-    ansible_user: "{{ keel_controller_user }}"
     ansible_python_interpreter: "{{ keel_controller_python }}"
   changed_when: false
   check_mode: false
@@ -90,7 +102,6 @@
   become: false
   vars:
     ansible_connection: local
-    ansible_user: "{{ keel_controller_user }}"
     ansible_python_interpreter: "{{ keel_controller_python }}"
   changed_when: true
   when: not keel_source_present
@@ -121,7 +132,6 @@
   become: false
   vars:
     ansible_connection: local
-    ansible_user: "{{ keel_controller_user }}"
     ansible_python_interpreter: "{{ keel_controller_python }}"
   when: not keel_source_present
 

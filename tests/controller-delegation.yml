@@ -34,11 +34,35 @@
   gather_facts: false
   become: true          # the remote become context that used to leak
   vars:
+    # ⚠️ THE SAME PLAY-SCOPE SETTING playbooks/keel.yml USES, and the reason this
+    # test is worth anything now. An earlier version of this file omitted it and
+    # asserted only on `ansible_user_id` — which passes whether or not the temp
+    # directory is resolvable, so it went green while the real deployment kept
+    # failing on `/Users/labadmin/.ansible/tmp`. Asserting the identity of a task
+    # that already ran cannot detect a failure that happens BEFORE the task runs.
+    ansible_remote_tmp: /tmp/ansible-keel
     keel_controller_user: "{{ lookup('env', 'USER') }}"
     keel_controller_python: "{{ ansible_playbook_python }}"
     keel_source_repo: "{{ lookup('env', 'HOME') }}"
 
   tasks:
+    - name: The play must set an ABSOLUTE remote_tmp
+      # The actual fix, asserted directly. A relative or `~`-prefixed value is
+      # expanded against the connection user's home, which is where the remote
+      # account name got in; an absolute path is never expanded.
+      ansible.builtin.assert:
+        that:
+          - ansible_remote_tmp is defined
+          - ansible_remote_tmp.startswith('/')
+          - "'~' not in ansible_remote_tmp"
+          - "'/Users/' not in ansible_remote_tmp"
+        fail_msg: >-
+          REGRESSION: ansible_remote_tmp is
+          {{ ansible_remote_tmp | default('(unset)') }}. It must be an absolute
+          path with no home expansion, or a delegated task resolves it against
+          the REMOTE account and fails before it can run.
+        success_msg: "remote_tmp is absolute: {{ ansible_remote_tmp }}"
+
     - name: Establish controller facts (delegated, as the controller)
       ansible.builtin.setup:
         gather_subset: ['!all', '!min', 'user']
@@ -46,7 +70,6 @@
       become: false
       vars:
         ansible_connection: local
-        ansible_user: "{{ keel_controller_user }}"
         ansible_python_interpreter: "{{ keel_controller_python }}"
       register: keel_controller_facts
 
@@ -97,7 +120,6 @@
       become: false
       vars:
         ansible_connection: local
-        ansible_user: "{{ keel_controller_user }}"
         ansible_python_interpreter: "{{ keel_controller_python }}"
       register: keel_repo_stat
       check_mode: false
@@ -133,7 +155,6 @@
       become: false
       vars:
         ansible_connection: local
-        ansible_user: "{{ keel_controller_user }}"
         ansible_python_interpreter: "{{ keel_controller_python }}"
       register: keel_archive_probe
       changed_when: false

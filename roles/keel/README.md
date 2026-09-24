@@ -86,12 +86,37 @@ everything they protect. Neither is a routine change.
 Run from `~/Projects/home-datacenter-starter` on dc1-arm-1:
 
 ```bash
-# check
+# check (read-only)
 ansible-playbook playbooks/keel.yml --check --diff --ask-vault-pass --ask-become-pass
 
 # deploy
 ansible-playbook playbooks/keel.yml --ask-vault-pass --ask-become-pass
 ```
+
+No `ANSIBLE_REMOTE_TMP=` prefix is needed. The play sets
+`ansible_remote_tmp: /tmp/ansible-keel` itself, which is what the environment
+variable was working around.
+
+<details>
+<summary>Why that setting exists, and why it is on the <em>play</em></summary>
+
+Ansible stages a module in a temporary directory **before** it executes a task,
+so anything set in a task's own `vars:` is resolved too late to influence it. The
+default `~/.ansible/tmp` is expanded against the *connection* user — and for a
+task delegated to the controller, that user was still the **remote** one:
+
+```
+fatal: [dc1-x86 -> localhost]: UNREACHABLE
+Attempted controller temp directory: /Users/labadmin/.ansible/tmp
+```
+
+A per-task `ansible_user` override looks like it should fix this. It does not,
+and was removed. An absolute path is never expanded against anyone's home, which
+is what actually settles it — and `/tmp` is valid on both ends: the controller
+under whatever account runs `ansible-playbook`, and dc1-x86 under `labadmin` and
+under root after `become`.
+
+</details>
 
 Nothing names the vault file. It is loaded automatically because it sits in
 `group_vars/<group>/` for a group the target belongs to.

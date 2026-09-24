@@ -34,22 +34,22 @@ keel_web_image: "keel-web:{{ keel_image_tag }}"
 # written down anywhere: this works for any operator on any control node.
 keel_source_repo: "{{ lookup('env', 'HOME') }}/Projects/keel"
 
-# ── THE CONTROLLER'S OWN IDENTITY ───────────────────────────────────────────
+# ── THE CONTROLLER'S OWN CONTEXT ────────────────────────────────────────────
 #
-# ⚠️ EVERY `delegate_to: localhost` TASK MUST APPLY THESE, and `become: false`
-# beside them. Delegation changes WHERE a task runs; it does NOT reset the
-# connection variables the play resolved for the TARGET. So a play running as
-# `ansible_user: labadmin` with `become: true` delegated that identity to the
-# controller, which then tried to use `/Users/labadmin/.ansible/tmp` — an account
-# that does not exist there — and reported the controller itself UNREACHABLE.
+# ⚠️ THE TEMP-DIRECTORY FIX IS NOT HERE. It is `ansible_remote_tmp` at PLAY scope
+# in playbooks/keel.yml, because Ansible needs a staging directory before it runs
+# a task and anything set per task is resolved too late to matter. A previous
+# version of this file offered `keel_controller_user` as an `ansible_user`
+# override for exactly that purpose; it was ineffective and has been removed from
+# the tasks. It survives below only for MESSAGES and for the archive filename,
+# where it is read long after any connection has been made.
 #
-#   ansible_connection          `local`, never ssh-to-self
-#   ansible_user                whoever is actually running ansible-playbook
-#   ansible_python_interpreter  the interpreter ansible-playbook is running under,
-#                               so the controller never inherits a remote path
+# `keel_controller_python` is genuine and still applied per delegated task: it
+# keeps the controller from inheriting an interpreter path resolved for the
+# remote host.
 #
-# Nothing here names a host, an account or an absolute path; all three are read
-# from the running process.
+# Nothing here names a host, an account or a /Users path; both are read from the
+# running process.
 keel_controller_user: "{{ lookup('env', 'USER') }}"
 keel_controller_python: "{{ ansible_playbook_python }}"
 

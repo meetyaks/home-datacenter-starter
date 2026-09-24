@@ -23,6 +23,28 @@
   become: true
   gather_facts: true
 
+  vars:
+    # ═══ WHY THIS IS AT PLAY SCOPE AND NOT ON THE TASKS ═══════════════════════
+    #
+    # Ansible needs a temporary directory BEFORE it executes a task — the module
+    # is staged there. Anything set in a task's own `vars:` is resolved too late
+    # to influence that, which is why a task-level `ansible_user` override looked
+    # correct and changed nothing:
+    #
+    #     fatal: [dc1-x86 -> localhost]: UNREACHABLE
+    #     Attempted controller temp directory: /Users/labadmin/.ansible/tmp
+    #
+    # The default `~/.ansible/tmp` is expanded against the connection user, and
+    # for a delegated task that user was still the REMOTE one. An absolute path
+    # is never expanded, so naming one removes the question entirely.
+    #
+    # ⚠️ IT MUST BE VALID ON BOTH ENDS, and /tmp is the only thing that is:
+    #   · the controller, under whatever Mac account is running ansible-playbook
+    #   · dc1-x86, under labadmin, and under root after become
+    # No account name and no /Users path appears, so this works for any operator
+    # on any control node.
+    ansible_remote_tmp: /tmp/ansible-keel
+
   tasks:
     - name: Deploy
       ansible.builtin.include_role:
