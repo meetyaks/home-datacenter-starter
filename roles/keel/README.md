@@ -178,6 +178,24 @@ deployable"* — and it exits **successfully** on a completely fresh host.
 
 It then prints what a real run would perform, and stops.
 
+**On an existing secret, `--check` distinguishes two things** that an exact-mode
+comparison alone would conflate:
+
+| state | check mode | why |
+|---|---|---|
+| reachable by `other`, or group-readable by an *unexpected* group | **fails** | a real exposure, and it is real whether or not this run changes anything |
+| merely not yet converged — too narrow, or the right bits under the wrong owner | **reports** | that is the state this play exists to correct; failing on it would stop the dry run before it could tell you what else is wrong |
+
+A normal run asserts the exact mode and ownership in full, as it always did.
+
+> **The runtime group is applied by GID, not by name.** Under `--check` the
+> `group` module correctly creates nothing, so `keel-runtime` does not resolve
+> for the rest of the play. A dry run against dc1-x86 died on exactly that —
+> `chgrp failed: failed to look up group keel-runtime` — collapsing on a group
+> it had itself declined to create. The GID is also the identifier that matters:
+> a bind mount matches numbers, and the name exists so `ls -l` reads sensibly.
+> (enforced: `tests/check-mode-runtime-group.yml`)
+
 **What it deliberately does not do:** create an archive, transfer or unpack
 source, build an image, run migrations or Compose, or touch Caddy. It also never
 *requires* any of those to exist — on a fresh host none of them can.

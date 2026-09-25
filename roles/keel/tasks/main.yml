@@ -117,6 +117,29 @@
     system: true
     state: present
 
+- name: Note that the runtime group would be created
+  # ⚠️ IN CHECK MODE THE GROUP ABOVE IS NOT CREATED, and that is correct — a dry
+  # run must not add an account database entry. But it means the NAME does not
+  # resolve for the rest of this play, so every later task must address the
+  # group by its NUMBER. See the directory and PEM tasks: they pass
+  # `keel_runtime_gid`, not `keel_runtime_group`.
+  #
+  # Getting this wrong failed a real `--check` against dc1-x86:
+  #
+  #     [WARNING]: failed to look up group keel-runtime.
+  #     chgrp failed: failed to look up group keel-runtime
+  #
+  # — the dry run collapsing on a group it had itself correctly declined to
+  # create. The number is also the more honest identifier: a bind mount matches
+  # the GID, and the name exists only so a human reading `ls -l` sees something
+  # meaningful.
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: group {{ keel_runtime_group }} (GID {{ keel_runtime_gid }})
+      would be created. Nothing below depends on that name resolving — the
+      secrets directory and the PEMs are chgrp'd by GID.
+  when: ansible_check_mode
+
 - name: Read back the runtime group
   # `group:` will happily reuse an EXISTING group of that name on a DIFFERENT
   # GID. That would leave the PEMs group-owned by a GID nothing in the container
@@ -159,9 +182,13 @@
     # to TRAVERSE this directory to reach the PEMs: a 0700 directory denies uid
     # 10001 before the files' own 0440 mode is ever consulted. `other` still
     # gets nothing.
+    # Group by NUMBER, not name: in check mode the group above was deliberately
+    # not created, so the name does not resolve and `chgrp` would fail on a dry
+    # run. The GID is also what the container actually matches through the bind
+    # mount. (enforced: tests/check-mode-runtime-group.yml)
     - path: "{{ keel_secrets_dir }}"
       mode: "{{ keel_secrets_dir_mode }}"
-      group: "{{ keel_runtime_group }}"
+      group: "{{ keel_runtime_gid }}"
     # Stays 0700 root:root. Compose reads the env file HOST-SIDE as root; no
     # container ever opens it, so there is nothing to grant.
     - { path: "{{ keel_env_dir }}", mode: "0700" }

@@ -24,6 +24,10 @@ echo "══ check-mode handlers (notified, never executed) ══════�
 tests/run-check-mode-handlers.sh
 
 echo
+echo "══ check-mode runtime group (chgrp by GID, not name) ═══════════════"
+tests/run-check-mode-runtime-group.sh
+
+echo
 echo "══ platform version gate ═══════════════════════════════════════════"
 # ⚠️ READ THE PIN, DO NOT RESTATE IT. This used to carry its own copy of the
 # 40-character SHA, which meant the deployment pin lived in two hand-maintained
