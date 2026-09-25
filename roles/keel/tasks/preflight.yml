@@ -78,6 +78,56 @@
 
 # ── The intended paths ──────────────────────────────────────────────────────
 
+# ── Installation identity ───────────────────────────────────────────────────
+#
+# Validated in PREFLIGHT, so `--check` proves it before a real run spends
+# anything, and so a malformed value stops the play before the environment file
+# is rendered or a container starts.
+#
+# ⚠️ THIS VALUE IS PERMANENT. `bootstrap.js` seeds the initial tenant at it and
+# every row that tenant owns is keyed to it. Get it wrong once and the fix is not
+# a redeploy: the data is still in the database but is no longer reachable as
+# that tenant, and a dump taken under one value restores as an empty tenant under
+# another. So the shape is checked here rather than discovered later.
+#
+# `no_log` on the whole task: the value is not secret, but printing an
+# installation's permanent identity into a deployment log is gratuitous, and the
+# failure messages below say what is wrong without quoting it.
+- name: Validate the installation's permanent tenant identity
+  ansible.builtin.assert:
+    that:
+      - keel_vault_default_tenant_id is defined
+      - (keel_vault_default_tenant_id | default('') | trim) | length > 0
+      # Canonical lowercase UUID. Uppercase is a different string to Postgres
+      # comparisons made on the rendered text, and a value that round-trips
+      # differently is a value that will eventually not match.
+      - (keel_vault_default_tenant_id | default('') | trim) is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+      # Sentinels. Any of these means the value was never actually chosen, and
+      # every installation that copied it would share one tenant identity.
+      - (keel_vault_default_tenant_id | default('') | trim) != '00000000-0000-0000-0000-000000000000'
+      # EIGHT CONSECUTIVE ZEROS, anywhere. A randomly generated UUID essentially
+      # never has a run that long; every sentinel and rendering dummy in these
+      # two repositories does. An earlier version of this rule enumerated an
+      # exact all-zero SHAPE and missed `00000000-0000-4000-8000-000000000001`
+      # — the very dummy the compose-check scripts export — because the last
+      # group ends in a 1. Matching the run rather than the shape is what makes
+      # this catch values nobody has thought of yet.
+      # (enforced: tests/installation-identity.yml "zero-run sentinel")
+      - not ((keel_vault_default_tenant_id | default('') | trim) is search('0{8}'))
+      - not ((keel_vault_default_tenant_id | default('') | trim) is search('^(11111111|12345678|deadbeef|abcdefab)-'))
+    fail_msg: >-
+      keel_vault_default_tenant_id is missing, malformed, or a placeholder. It
+      must be a canonical lowercase UUID, generated once per installation on the
+      OPERATOR'S machine (`uuidgen | tr 'A-Z' 'a-z'`) and stored in
+      inventory/group_vars/linux_servers/vault.yml. It is never generated here,
+      never defaulted, and never regenerated on a rerun: it is the permanent id
+      of this installation's initial tenant, and changing it orphans that
+      tenant's data. The value is not shown; check the vault entry.
+    success_msg: >-
+      Installation tenant identity is present and well-formed (value not shown).
+    quiet: true
+  no_log: true
+
 - name: Validate the paths this deployment will use
   # Cheap, and it catches the class of error that is most annoying to debug
   # later: a variable that renders empty and turns a path into "/" or "//data".

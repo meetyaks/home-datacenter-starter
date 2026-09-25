@@ -80,6 +80,11 @@
       - keel_vault_mfa_master_key is defined and keel_vault_mfa_master_key | length > 0
       - keel_vault_jwt_private_key is defined and keel_vault_jwt_private_key | length > 0
       - keel_vault_jwt_public_key is defined and keel_vault_jwt_public_key | length > 0
+      # Not a credential, but required in exactly the same way and for a harder
+      # reason: it is PERMANENT installation identity. There is no default for it
+      # anywhere, so an absent value must stop the run here rather than let the
+      # stack start having invented its own.
+      - keel_vault_default_tenant_id is defined and keel_vault_default_tenant_id | length > 0
     fail_msg: >-
       One or more keel_vault_* variables are missing. The canary above passed, so
       inventory/group_vars/linux_servers/ IS being loaded — this is a genuinely

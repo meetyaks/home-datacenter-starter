@@ -43,4 +43,8 @@ echo "   deployment pin: ${KEEL_TEST_COMMIT}"
 ansible-playbook tests/platform-version.yml -e keel_test_commit="$KEEL_TEST_COMMIT"
 
 echo
+echo "══ installation identity (7 cases + no committed value) ════════════"
+ansible-playbook tests/installation-identity.yml
+
+echo
 echo "All regression suites passed."

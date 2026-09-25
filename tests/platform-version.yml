@@ -39,6 +39,16 @@
     keel_version_pattern: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
   tasks:
+    # ⚠️ HOW A NEGATIVE CASE REPORTS FAILURE. Not with a `fail` inside the
+    # `block` — the rescue catches that too, prints "PASS", and the case becomes
+    # incapable of failing. All three negatives below were written that way and
+    # were silently inert. A case that WRONGLY PASSES now records itself with
+    # `set_fact` (which does not raise, so the rescue is not entered) and one
+    # assertion at the end fails on a non-empty list.
+    - name: Start with no recorded leaks
+      ansible.builtin.set_fact:
+        version_leaks: []
+
     - name: Case — an EMPTY version is refused
       block:
         - name: Gate with an empty version
@@ -47,14 +57,12 @@
               - keel_platform_version is defined
               - keel_platform_version | length > 0
               - keel_platform_version is match(keel_version_pattern)
+            quiet: true
           vars:
             keel_platform_version: ""
-
-        - name: Case FAILED
-          ansible.builtin.fail:
-            msg: >-
-              REGRESSION: an EMPTY platform version passed the gate. That is the
-              exact value the role used to hand to docker build.
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            version_leaks: "{{ version_leaks + ['empty — the exact value the role used to hand to docker build'] }}"
       rescue:
         - name: Case passed
           ansible.builtin.debug:
@@ -71,12 +79,9 @@
           vars:
             keel_platform_version: "v0.1.2"     # leading v — the platform rejects it
 
-        - name: Case FAILED
-          ansible.builtin.fail:
-            msg: >-
-              REGRESSION: "v0.1.2" passed the gate. The platform's SEMVER_RE has
-              no leading v, and `resolvePlatformVersion` is fail-closed — the
-              gateway would refuse to boot on an image stamped with it.
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            version_leaks: "{{ version_leaks + ['malformed v0.1.2 — SEMVER_RE has no leading v, and the gateway is fail-closed on it'] }}"
       rescue:
         - name: Case passed
           ansible.builtin.debug:
@@ -91,11 +96,9 @@
               - keel_platform_version | length > 0
               - keel_platform_version is match(keel_version_pattern)
 
-        - name: Case FAILED
-          ansible.builtin.fail:
-            msg: >-
-              REGRESSION: an UNDEFINED platform version passed the gate. A probe
-              that returned nothing must stop the build, not fall through.
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            version_leaks: "{{ version_leaks + ['undefined — a probe that returned nothing must stop the build, not fall through'] }}"
       rescue:
         - name: Case passed
           ansible.builtin.debug:
@@ -122,6 +125,19 @@
               REGRESSION: "0.1.2" was REJECTED. Without this control a gate that
               refused everything would pass the three negative cases and look
               correct.
+
+    - name: No invalid version may have been accepted
+      # The single place a negative case can fail this play.
+      ansible.builtin.assert:
+        that:
+          - (version_leaks | default([])) | length == 0
+        fail_msg: >-
+          REGRESSION: {{ (version_leaks | default([])) | length }} invalid
+          version(s) were ACCEPTED by the gate —
+          {{ (version_leaks | default([])) | join('; ') }}. The stamp is baked
+          into the image and cannot be corrected afterwards.
+        success_msg: Every invalid version was refused.
+        quiet: true
 
     # ── And the derivation itself, against the real repository ──────────────
     - name: Derive the version from the deployment commit, as preflight does

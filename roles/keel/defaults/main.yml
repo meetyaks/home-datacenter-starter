@@ -15,9 +15,9 @@
 # version identity this deployment has: the image tag, the build directory and
 # the manifest all derive from it, and the role refuses to build if the archive
 # it received does not carry this exact value.
-keel_commit: b6642092b5ea6a973f1a571f1458874bb38d095e
+keel_commit: 010fbd598bf32135209498da5dd42a2d56e87604
 
-# Derived. `sha-b6642092` — short enough to read, long enough to be unambiguous.
+# Derived. `sha-010fbd59` — short enough to read, long enough to be unambiguous.
 keel_commit_short: "{{ keel_commit[:8] }}"
 keel_image_tag: "sha-{{ keel_commit_short }}"
 keel_gateway_image: "keel-gateway:{{ keel_image_tag }}"

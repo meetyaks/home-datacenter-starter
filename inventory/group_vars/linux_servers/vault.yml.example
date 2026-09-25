@@ -1,9 +1,17 @@
 ---
 # TEMPLATE ONLY — names, never values.
 #
-# Create the real file with:  ansible-vault create inventory/group_vars/vault.yml
-# That path is already in .gitignore and must stay there. This example is the only
-# vault-shaped file that may ever be committed.
+# Create the real file with:
+#
+#     ansible-vault create inventory/group_vars/linux_servers/vault.yml
+#
+# ⚠️ THE DIRECTORY IS PART OF THE PATH. `inventory/group_vars/vault.yml` binds to
+# a group named `vault`, which does not exist, so the file decrypts and is never
+# LOADED — `--ask-vault-pass` succeeding proves only the first of those. It must
+# live under `linux_servers/`, matching the group the host is actually in.
+#
+# That path is already in .gitignore and must stay there. This example is the
+# only vault-shaped file that may ever be committed.
 
 keel_vault_admin_db_password: ""
 keel_vault_app_db_password: ""
@@ -23,3 +31,28 @@ keel_vault_jwt_private_key: |
 keel_vault_jwt_public_key: |
   -----BEGIN PUBLIC KEY-----
   -----END PUBLIC KEY-----
+
+# ── PERMANENT INSTALLATION IDENTITY ─────────────────────────────────────────
+#
+# Not a credential, but it lives here because it must survive exactly as long as
+# these do and be restored alongside them.
+#
+# The id the initial tenant is seeded at. Every row that tenant ever owns is
+# keyed to it, so it is IMMUTABLE for the life of the installation:
+#
+#   - upgrades REUSE it; a rerun must never regenerate it
+#   - a rebuilt machine RESTORES it from here
+#   - a database restore must use the value that produced the dump, or the data
+#     is present but unreachable as that tenant — no error, just an empty tenant
+#
+# Generate ONE per installation, ON THE OPERATOR'S OWN MACHINE — never on the
+# managed server, and never by the playbook:
+#
+#     uuidgen | tr 'A-Z' 'a-z'
+#
+# Canonical lowercase UUID. No usable sample is given here on purpose: a value
+# copied out of an example would be shared by every installation that copied it,
+# and colliding tenant identity across installations is exactly what this
+# variable exists to prevent. The role refuses all-zero and sentinel UUIDs
+# before anything is written or started.
+keel_vault_default_tenant_id: ""

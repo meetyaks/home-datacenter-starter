@@ -43,14 +43,14 @@ The role proves the loading path on every run: a committed, non-secret canary
 secrets are checked, so "you forgot the vault" and "Ansible never loaded it" stop
 looking like the same failure.
 
-Define exactly these nine names. The role asserts all nine are present **before it
+Define exactly these ten names. The role asserts all ten are present **before it
 writes anything**, so a missing one stops the run rather than rendering a blank
-credential into a live stack:
+value into a live stack:
 
 | variable | what it is |
 |---|---|
-| `keel_vault_admin_db_password` | `keel_admin` — owns DDL, used by the one-shot migration only |
-| `keel_vault_app_db_password` | `keel_app_login` — NOBYPASSRLS, the request path |
+| `keel_vault_admin_db_password` | `keel_admin` — owns DDL, used by the one-shot bootstrap only |
+| `keel_vault_app_db_password` | `keel_app_login` — NOBYPASSRLS, the request path. Bootstrap rotates the role onto this value |
 | `keel_vault_blob_access_key` | object-store access key (also MinIO's root user) |
 | `keel_vault_blob_secret_key` | object-store secret key (also MinIO's root password) |
 | `keel_vault_oidc_client_secret` | OIDC client secret |
@@ -58,6 +58,39 @@ credential into a live stack:
 | `keel_vault_mfa_master_key` | MFA secret-encryption master key |
 | `keel_vault_jwt_private_key` | RS256 private key, full PEM including headers |
 | `keel_vault_jwt_public_key` | RS256 public key, full PEM including headers |
+| `keel_vault_default_tenant_id` | **permanent installation identity** — see below. Not a credential |
+
+### `keel_vault_default_tenant_id` is not configuration
+
+Bootstrap seeds this installation's initial tenant at this id, and every row that
+tenant ever owns is keyed to it. That makes it **immutable for the life of the
+installation**:
+
+- **upgrades reuse it**; a rerun must never regenerate it
+- **a rebuilt machine restores it** from the vault — it is recovery material
+- **a database restore must use the value that produced the dump.** Restore a
+  dump into an installation carrying a different id and the data is present but
+  unreachable as that tenant: no error, just an empty-looking tenant
+
+There is **no default for it anywhere** — not in `defaults/main.yml`, not in the
+Compose file, not in `env.example`. A committed constant would be *reusable*, so
+two installations deployed from this repository would collide on one tenant
+identity; and a default of any kind lets a stack start having quietly invented
+its own permanent identity, which is the one decision a deployment must never
+make by omission.
+
+Generate one per installation **on the admin console, never on the managed
+host**, and never by the playbook:
+
+```bash
+uuidgen | tr 'A-Z' 'a-z'
+```
+
+Preflight validates it in both modes — defined, non-empty, canonical lowercase
+UUID, and not an all-zero or sentinel value — and **fails before anything is
+written or started**. It is rendered into `env/keel.env` under `no_log`, so the
+value never reaches a deployment log; the failure messages say what is wrong
+without quoting it.
 
 Generate the keypair (on the admin console, never on the host):
 
@@ -130,8 +163,11 @@ deployable"* — and it exits **successfully** on a completely fresh host.
 
 - the target's architecture, that `/srv/data` is a separate filesystem, that
   Docker and Compose v2 are reachable by this connection
-- that all nine `keel_vault_*` secrets are present, and that
+- that all ten `keel_vault_*` variables are present, and that
   `group_vars/linux_servers/` is genuinely being loaded
+- that `keel_vault_default_tenant_id` is a canonical lowercase UUID and not an
+  all-zero or sentinel value — checked **before** anything is written, because it
+  is permanent installation identity and cannot be corrected by redeploying
 - every path the deployment will use, and that the image tag derives from the
   commit
 - **from the controller's git objects** — that `keel_commit` exists, is a commit,
