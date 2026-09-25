@@ -50,7 +50,7 @@
   ansible.builtin.command:
     cmd: >-
       docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
-      logs --no-color migrate
+      logs --no-color bootstrap
     chdir: "{{ keel_root }}"
   register: keel_rollback_migrations
   changed_when: false

@@ -15,9 +15,9 @@
 # version identity this deployment has: the image tag, the build directory and
 # the manifest all derive from it, and the role refuses to build if the archive
 # it received does not carry this exact value.
-keel_commit: 1c140a5dafe16b58635ad3404fad498bc74f5ba6
+keel_commit: b6642092b5ea6a973f1a571f1458874bb38d095e
 
-# Derived. `sha-1c140a5d` — short enough to read, long enough to be unambiguous.
+# Derived. `sha-b6642092` — short enough to read, long enough to be unambiguous.
 keel_commit_short: "{{ keel_commit[:8] }}"
 keel_image_tag: "sha-{{ keel_commit_short }}"
 keel_gateway_image: "keel-gateway:{{ keel_image_tag }}"
@@ -71,8 +71,77 @@ keel_env_dir: "{{ keel_root }}/env"
 keel_env_file: "{{ keel_env_dir }}/keel.env"
 keel_compose_file: "{{ keel_root }}/compose.lab.yml"
 
+# ── POSTGRES SERVER CONFIGURATION AND TLS MATERIAL ──────────────────────────
+#
+# Mounted read-only at /etc/keel-pg. Holds three files:
+#
+#   server.key    generated on this host, 0600 uid 999 — postgres REFUSES to
+#                 start on a key with looser permissions, and 999 is the
+#                 postgres uid inside pgvector/pgvector:pg16
+#   server.crt    the matching self-signed certificate, world-readable
+#   pg_hba.conf   copied from the deployed COMMIT, not written here: it is part
+#                 of the stack definition, and two hand-maintained copies of an
+#                 auth policy drift silently
+#
+# Deliberately OUTSIDE the data root. `hba_file` points here rather than into
+# PGDATA so auth policy can change on a cluster that already has applied
+# migrations, without editing or re-initialising the data directory.
+keel_pg_conf_dir: "{{ keel_root }}/pg"
+keel_pg_cert_file: "{{ keel_pg_conf_dir }}/server.crt"
+keel_pg_key_file: "{{ keel_pg_conf_dir }}/server.key"
+keel_pg_hba_file: "{{ keel_pg_conf_dir }}/pg_hba.conf"
+
+# postgres inside the image. Numeric, because a bind mount carries numbers.
+keel_pg_uid: 999
+keel_pg_gid: 999
+
+# Self-signed, regenerated only when absent. 825 days is the maximum a modern
+# client will accept for a server certificate.
+keel_pg_cert_days: 825
+keel_pg_cert_cn: postgres
+
 keel_owner: root
 keel_group: root
+
+# ── THE CONTAINER'S RUNTIME IDENTITY, AS A HOST GROUP ───────────────────────
+#
+# `packages/gateway/Dockerfile` ends with `USER keel` — uid/gid 10001 — and that
+# is not negotiable: the gateway must not run as root. But a bind-mounted file
+# is matched against the container's NUMERIC ids, not a name, so 0600 root:root
+# PEMs are unreadable to it. That is exactly what the first native startup hit:
+#
+#     cat: /secrets/jwt_private.pem: Permission denied
+#     production.insecure_config: KEEL_JWT_PRIVATE_KEY missing or empty
+#
+# The `cat` failed, the export produced an EMPTY string, and
+# `assertProductionSafe` refused to boot on it. The validator was right; the
+# provisioning was wrong.
+#
+# So the host gets a DEDICATED system group whose GID is exactly the container's
+# runtime GID, and the PEMs are group-readable to it. A dedicated group, not a
+# pre-existing one that happens to have this GID: joining a credential to some
+# unrelated group's membership would hand it to whoever is already in that
+# group. This group is created by the role and has NO members — nothing on the
+# host needs to be in it. Its only purpose is to name a GID that a container
+# already runs as.
+keel_runtime_gid: 10001
+keel_runtime_group: keel-runtime
+
+# Modes, stated once and asserted after the write. The env file and the PEMs
+# have DIFFERENT policies on purpose:
+#
+#   env file   0600 root:root   Compose reads it HOST-SIDE as root, before any
+#                               container exists. Nothing in a container ever
+#                               opens it, so group access would be pure excess.
+#   JWT PEMs   0440 root:<gid>  Read inside the container as uid 10001. Read-only
+#                               even for root: nothing should ever write them
+#                               except this role, which sets the content itself.
+keel_env_file_mode: "0600"
+keel_jwt_file_mode: "0440"
+# 0750, not 0755: the container's group may traverse in, everyone else may not.
+# A 0700 directory (the previous value) blocks uid 10001 no matter what the
+# files inside are set to — the mode on the directory is checked first.
+keel_secrets_dir_mode: "0750"
 
 # ── WHAT THE COMMIT MUST CONTAIN ────────────────────────────────────────────
 #
@@ -95,6 +164,10 @@ keel_platform_version_file: packages/core/src/platform-version/version.ts
 
 keel_required_commit_paths:
   - infra/lab/compose.lab.yml
+  # The postgres auth policy travels with the stack definition. A commit without
+  # it would deploy a compose file whose `hba_file` points at a path this role
+  # never populated, and postgres would refuse to start.
+  - infra/lab/pg_hba.conf
   - packages/gateway/Dockerfile
   - apps/web/Dockerfile
   - packs
@@ -109,6 +182,13 @@ keel_data_dirs:
   - "{{ keel_data_root }}/minio"
 
 # ── NON-SECRET CONFIGURATION ────────────────────────────────────────────────
+#
+# The optional initial platform_admin. Left empty the instance comes up with NO
+# admin, which is the safe default: `bootstrap.js` sets no password for it —
+# production auth is OIDC and the row is linked on first login — so a guessed
+# default here would create an account nobody asked for.
+keel_bootstrap_admin_email: ""
+
 keel_blob_bucket: keel-lab
 keel_hostname: keel.dc1.lan
 keel_jwt_issuer: "https://{{ keel_hostname }}/"
@@ -141,3 +221,8 @@ keel_force_rebuild: false
 keel_build_timeout_seconds: 3600
 keel_health_retries: 30
 keel_health_delay_seconds: 10
+
+# How much of each service's log the failure diagnostics print. `--wait` reports
+# a timeout, never a reason; the reason is in these lines. 80 is enough to carry
+# a stack trace or a config-validator listing without burying the run.
+keel_diagnostic_log_lines: 80

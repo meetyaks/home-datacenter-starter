@@ -76,7 +76,7 @@
         var: keel_ps.stdout_lines
 
     - name: Confirm no long-running service is unhealthy or exited
-      # `migrate` and `minio-bucket` are one-shots and are SUPPOSED to be exited;
+      # `bootstrap` and `minio-bucket` are one-shots and are SUPPOSED to be exited;
       # every other container must be running. Asserting on the wrong set here
       # would either fail every healthy deploy or pass a broken one.
       ansible.builtin.shell:
@@ -84,7 +84,7 @@
           set -o pipefail &&
           docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
           ps --format '{{ '{{' }}.Service{{ '}}' }} {{ '{{' }}.State{{ '}}' }}'
-          | grep -vE '^(migrate|minio-bucket) ' | grep -vc ' running'
+          | grep -vE '^(bootstrap|minio-bucket) ' | grep -vc ' running'
         executable: /bin/bash
         chdir: "{{ keel_root }}"
       register: keel_not_running
@@ -119,6 +119,88 @@
           running a build that predates that fix.
         success_msg: >-
           {{ keel_packs_in_image.stdout | trim }} packs present in the running image.
+
+    # ── The two things that broke the first native startup ──────────────────
+    #
+    # Both are verified from INSIDE the running containers, against the real
+    # identities, because that is where the failures were. Checking the host's
+    # file modes alone would have said everything was fine: 0600 root:root is a
+    # perfectly correct-looking secret, and it is exactly what the gateway
+    # could not read.
+
+    - name: Prove the gateway's own user can read the mounted JWT keys
+      # As uid 10001, through the same bind mount the entrypoint uses. The
+      # contents are never printed — only whether the read succeeded and the
+      # byte count, which is enough to tell "readable" from the empty string a
+      # failed `cat` silently produces.
+      ansible.builtin.command:
+        cmd: >-
+          docker exec --user {{ keel_runtime_gid }}:{{ keel_runtime_gid }} keel-lab-gateway
+          sh -c 'for f in /secrets/jwt_private.pem /secrets/jwt_public.pem; do
+                   if [ -r "$f" ] && [ -s "$f" ]; then echo "READABLE $f"; else echo "UNREADABLE $f"; fi;
+                 done'
+      register: keel_jwt_readable
+      changed_when: false
+
+    - name: Confirm both PEMs are readable as the container's runtime user
+      ansible.builtin.assert:
+        that:
+          - (keel_jwt_readable.stdout | default('')) is search('READABLE /secrets/jwt_private.pem')
+          - (keel_jwt_readable.stdout | default('')) is search('READABLE /secrets/jwt_public.pem')
+          - (keel_jwt_readable.stdout | default('')) is not search('UNREADABLE')
+        fail_msg: >-
+          uid {{ keel_runtime_gid }} cannot read the mounted JWT keys:
+          {{ keel_jwt_readable.stdout | default('(no output)') | regex_replace('\s+', ' ') }}.
+          The entrypoint's `cat` would export an EMPTY string and
+          assertProductionSafe would refuse to boot with "KEEL_JWT_PRIVATE_KEY
+          missing or empty" — the original crash loop. Check {{ keel_secrets_dir }}
+          (0750) and the PEMs inside it (0440), both group
+          {{ keel_runtime_group }} / GID {{ keel_runtime_gid }}.
+        success_msg: >-
+          Both JWT PEMs are readable as uid {{ keel_runtime_gid }}, the identity
+          the gateway actually runs as.
+
+    - name: Ask PostgreSQL whether TLS is actually on
+      ansible.builtin.command:
+        cmd: docker exec keel-lab-postgres psql -U keel_admin -d keel -tAc "SHOW ssl"
+      register: keel_pg_ssl
+      changed_when: false
+
+    - name: Confirm PostgreSQL is serving TLS
+      ansible.builtin.assert:
+        that:
+          - (keel_pg_ssl.stdout | default('') | trim) == 'on'
+        fail_msg: >-
+          PostgreSQL reports ssl={{ keel_pg_ssl.stdout | default('(nothing)') | trim }}.
+          The connection strings carry `sslmode=require`, so with TLS off on the
+          server they cannot connect at all — and the production validator
+          refuses to boot without that sslmode. Both halves have to be true
+          together; a client flag on its own proves nothing.
+        success_msg: PostgreSQL reports ssl=on.
+
+    - name: Confirm the application's own connections are encrypted
+      # `SHOW ssl` proves the server OFFERS TLS. This proves the connections the
+      # application actually holds are using it — a different claim, and the one
+      # that matters.
+      ansible.builtin.command:
+        cmd: >-
+          docker exec keel-lab-postgres psql -U keel_admin -d keel -tAc
+          "select count(*) from pg_stat_ssl s join pg_stat_activity a using (pid)
+           where s.ssl and a.datname = 'keel'"
+      register: keel_pg_ssl_conns
+      changed_when: false
+
+    - name: Require at least one encrypted connection to the keel database
+      ansible.builtin.assert:
+        that:
+          - (keel_pg_ssl_conns.stdout | default('0') | trim | int) > 0
+        fail_msg: >-
+          No encrypted connection to the `keel` database is open, although the
+          gateway and worker are running. Either they are not connected to it,
+          or they reached it unencrypted — which pg_hba is supposed to reject.
+        success_msg: >-
+          {{ keel_pg_ssl_conns.stdout | trim }} encrypted connection(s) open to
+          the keel database.
 
     - name: Summarise the deployment
       ansible.builtin.debug:

@@ -18,6 +18,24 @@
   # nothing to copy and `remote_src` would fail on a missing file.
   when: not ansible_check_mode
 
+- name: Install the PostgreSQL auth policy from the built commit
+  # ALSO FROM THE COMMIT, for the same reason as the compose file above: the
+  # auth policy is part of the stack definition, and a copy maintained here
+  # would drift from the compose file that names it.
+  #
+  # It lands beside the generated TLS material because the compose file mounts
+  # ONE directory at /etc/keel-pg and `hba_file` points inside it. 0644: this is
+  # policy, not a credential — the private key next to it carries its own 0600.
+  ansible.builtin.copy:
+    src: "{{ keel_build_dir }}/infra/lab/pg_hba.conf"
+    dest: "{{ keel_pg_hba_file }}"
+    remote_src: true
+    owner: "{{ keel_pg_uid }}"
+    group: "{{ keel_pg_gid }}"
+    mode: "0644"
+  notify: Restart Keel stack
+  when: not ansible_check_mode
+
 - name: Look for an already-installed stack definition
   # Read-only, and it runs in EVERY mode — because the ingress assertion below
   # must still fire against a stack that is already on disk. An existing file
@@ -84,61 +102,128 @@
   changed_when: "'Pulled' in (keel_pull.stderr | default('')) or 'Downloaded' in (keel_pull.stderr | default(''))"
   when: not ansible_check_mode
 
-- name: Start the stack
-  # `up -d` runs `migrate` to completion first: the gateway declares
-  # `service_completed_successfully` on it, so a failed migration stops the
-  # deploy here rather than leaving a gateway serving a half-migrated schema.
-  ansible.builtin.command:
-    cmd: >-
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
-      up -d --remove-orphans --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
-    chdir: "{{ keel_root }}"
-  register: keel_up
-  changed_when: true
-  # Nothing to start in check mode, and the images do not exist there either.
+# ── Starting the stack, with the diagnostics attached ───────────────────────
+#
+# `--wait` fails on a service that never becomes healthy, and what it prints is
+# a timeout — not the reason. The first native startup failed exactly here, and
+# every fact that explained it (a `Permission denied` in the gateway log, a
+# config validator listing four findings) had to be fetched by hand afterwards
+# over SSH. Those facts exist at the moment of failure; the deploy should hand
+# them over rather than make the next operator go looking.
+#
+# ⚠️ THIS RESCUE DOES NOT SWALLOW THE FAILURE. `ignore_errors` and
+# `failed_when: false` would turn a broken deploy into a green one; the rescue
+# ends with an explicit `fail`, so the play still stops exactly as it would
+# have. The only difference is what is on the screen when it does.
+- name: Start the stack, reporting the state of everything if it fails
   when: not ansible_check_mode
+  block:
+    - name: Start the stack
+      # `up -d` runs `bootstrap` to completion first: the gateway declares
+      # `service_completed_successfully` on it, so a failed migration stops the
+      # deploy here rather than leaving a gateway serving a half-migrated schema.
+      ansible.builtin.command:
+        cmd: >-
+          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          up -d --remove-orphans --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
+        chdir: "{{ keel_root }}"
+      register: keel_up
+      changed_when: true
 
-- name: Report the migration result
+  rescue:
+    - name: Capture what compose reports about every container
+      ansible.builtin.command:
+        cmd: >-
+          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          ps -a
+        chdir: "{{ keel_root }}"
+      register: keel_diag_ps
+      changed_when: false
+      failed_when: false
+
+    - name: Capture the logs of the services that explain a failed start
+      # Each separately, so one absent container cannot suppress the others —
+      # and `bootstrap` in particular exits, so it is gone from a plain `logs`
+      # follow but still holds the reason the gateway never started.
+      ansible.builtin.command:
+        cmd: >-
+          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          logs --no-color --tail {{ keel_diagnostic_log_lines }} {{ item }}
+        chdir: "{{ keel_root }}"
+      register: keel_diag_logs
+      changed_when: false
+      failed_when: false
+      loop:
+        - gateway
+        - bootstrap
+        - runtime-worker
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Report the container states
+      ansible.builtin.debug:
+        msg: "{{ (keel_diag_ps.stdout | default('(docker compose ps produced nothing)')).split('\n') }}"
+
+    - name: Report each service's log
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['══ ' ~ item.item ~ ' ══'] +
+             (item.stdout | default('(no output)')).split('\n') }}
+      loop: "{{ keel_diag_logs.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Fail with the original error, now with context above it
+      # The deploy failed and still fails. Everything above is context, not a
+      # recovery — nothing here has fixed anything.
+      ansible.builtin.fail:
+        msg: >-
+          The stack did not come up. `docker compose ps -a` and the gateway,
+          bootstrap and runtime-worker logs are printed above. compose said:
+          {{ (keel_up.stderr | default(keel_up.stdout | default('no output')))
+             | regex_replace('\s+', ' ') | truncate(400) }}
+
+- name: Report the bootstrap result
   ansible.builtin.command:
     cmd: >-
       docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
-      logs --no-color --tail 40 migrate
+      logs --no-color --tail 40 bootstrap
     chdir: "{{ keel_root }}"
-  register: keel_migrate_logs
+  register: keel_bootstrap_logs
   changed_when: false
   # Post-deployment verification. In check mode nothing was started, so there is
-  # no migrate container to read — and a `docker compose logs` against an absent
+  # no bootstrap container to read — and a `docker compose logs` against an absent
   # project would fail on its own predicted state.
   when: not ansible_check_mode
 
-- name: Show the migration output
+- name: Show the bootstrap output
   ansible.builtin.debug:
-    var: keel_migrate_logs.stdout_lines
+    var: keel_bootstrap_logs.stdout_lines
   when: not ansible_check_mode
 
-- name: Confirm the migration exited cleanly
+- name: Confirm the bootstrap exited cleanly
   ansible.builtin.shell:
     cmd: >-
       set -o pipefail &&
-      docker inspect --format '{{ '{{' }}.State.ExitCode{{ '}}' }}' keel-lab-migrate
+      docker inspect --format '{{ '{{' }}.State.ExitCode{{ '}}' }}' keel-lab-bootstrap
     executable: /bin/bash
-  register: keel_migrate_exit
+  register: keel_bootstrap_exit
   changed_when: false
   when: not ansible_check_mode
 
-- name: Fail on a non-zero migration exit
+- name: Fail on a non-zero bootstrap exit
   # STRICT IN NORMAL MODE, unchanged: the deployment is not complete unless the
-  # one-shot migration exited 0. `| default('')` protects only the check-mode
+  # one-shot bootstrap exited 0. `| default('')` protects only the check-mode
   # path where this task is skipped entirely.
   ansible.builtin.assert:
     that:
-      - (keel_migrate_exit.stdout | default('') | trim | int) == 0
+      - (keel_bootstrap_exit.stdout | default('') | trim | int) == 0
     fail_msg: >-
-      The one-shot migration exited
-      {{ keel_migrate_exit.stdout | default('(unknown)') | trim }}. The stack is
+      The one-shot bootstrap exited
+      {{ keel_bootstrap_exit.stdout | default('(unknown)') | trim }}. The stack is
       up but the schema is not what this commit expects; do not treat this
       deployment as complete.
-    success_msg: Migration completed successfully.
+    success_msg: Bootstrap completed successfully (migrations applied, seal rotated, tenant seeded).
   when: not ansible_check_mode
 
 - name: Note that the stack was not started

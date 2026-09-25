@@ -99,20 +99,71 @@
 #    `template` modules report what they would do and write nothing, which is
 #    the behaviour a preflight wants. Secret CONTENT is never shown, because
 #    every task touching one is `no_log`.
+# ── The container's runtime GID, as a host group ────────────────────────────
+#
+# Created BEFORE the secrets, because the PEM files are chowned to it. A
+# dedicated system group with NO MEMBERS: nothing on this host is meant to be in
+# it, and adding anyone would hand them the JWT signing key. It exists only so
+# that a numeric GID the gateway container already runs as has a name here.
+- name: Create the dedicated runtime group for the container's GID
+  ansible.builtin.group:
+    name: "{{ keel_runtime_group }}"
+    gid: "{{ keel_runtime_gid }}"
+    system: true
+    state: present
+
+- name: Read back the runtime group
+  # `group:` will happily reuse an EXISTING group of that name on a DIFFERENT
+  # GID. That would leave the PEMs group-owned by a GID nothing in the container
+  # belongs to — the gateway would crash-loop exactly as before, and nothing
+  # would say why. So the GID is read back and asserted rather than assumed.
+  ansible.builtin.getent:
+    database: group
+    key: "{{ keel_runtime_group }}"
+  register: keel_runtime_group_ent
+  check_mode: false
+  failed_when: false
+
+- name: Require the runtime group's GID to match the container's
+  ansible.builtin.assert:
+    that:
+      - (getent_group[keel_runtime_group][1] | default('')) | string == (keel_runtime_gid | string)
+    fail_msg: >-
+      Host group {{ keel_runtime_group }} has GID
+      {{ getent_group[keel_runtime_group][1] | default('(absent)') }}, but the
+      gateway container runs as GID {{ keel_runtime_gid }}. The JWT PEMs would be
+      unreadable inside the container, which is the defect this provisioning
+      exists to prevent.
+    success_msg: >-
+      {{ keel_runtime_group }} is GID {{ keel_runtime_gid }}, matching the
+      gateway container's runtime group.
+  when: not ansible_check_mode
+
 - name: Create the persistent directory tree
   ansible.builtin.file:
     path: "{{ item.path }}"
     state: directory
     owner: "{{ keel_owner }}"
-    group: "{{ keel_group }}"
+    group: "{{ item.group | default(keel_group) }}"
     mode: "{{ item.mode }}"
   loop:
     - { path: "{{ keel_root }}", mode: "0755" }
     - { path: "{{ keel_build_root }}", mode: "0755" }
     - { path: "{{ keel_data_root }}", mode: "0755" }
-    # 0700: only root reads the rendered environment file and the PEM keys.
-    - { path: "{{ keel_secrets_dir }}", mode: "0700" }
+    # ⚠️ 0750 root:<runtime group>, NOT 0700. The container's group must be able
+    # to TRAVERSE this directory to reach the PEMs: a 0700 directory denies uid
+    # 10001 before the files' own 0440 mode is ever consulted. `other` still
+    # gets nothing.
+    - path: "{{ keel_secrets_dir }}"
+      mode: "{{ keel_secrets_dir_mode }}"
+      group: "{{ keel_runtime_group }}"
+    # Stays 0700 root:root. Compose reads the env file HOST-SIDE as root; no
+    # container ever opens it, so there is nothing to grant.
     - { path: "{{ keel_env_dir }}", mode: "0700" }
+    # Postgres server config and TLS material. 0755 is fine: the certificate is
+    # public, and the private key beside it is protected by its own 0600
+    # uid-999 ownership rather than by the directory.
+    - { path: "{{ keel_pg_conf_dir }}", mode: "0755" }
   loop_control:
     label: "{{ item.path }}"
 

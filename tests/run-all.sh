@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "══ secret verification (4 cases, both modes) ═══════════════════════"
+echo "══ secret verification (7 cases, both modes) ══════════════════════"
 tests/run-secret-verification.sh
 
 echo
