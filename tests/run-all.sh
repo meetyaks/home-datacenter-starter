@@ -46,6 +46,13 @@ echo "══ ingress ownership (25 static checks) ══════════
 tests/run-ingress-ownership.sh
 
 echo
+echo "══ caddy check mode & real install (34 checks, disposable host) ══"
+# The defect: `--check` on a fresh host ran `caddy version` against a binary
+# the apt task above had only PREDICTED. Plus the handover to roles/keel, where
+# a predicted /etc/caddy/conf.d used to abort the dry run.
+tests/run-caddy-check-mode.sh
+
+echo
 echo "══ caddy role (16 checks, on a disposable systemd host) ═══════════"
 # Installing a package, enabling a unit and reloading a service need root on a
 # throwaway Linux machine. Skips loudly when Docker is absent.

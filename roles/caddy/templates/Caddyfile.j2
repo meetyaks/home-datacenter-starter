@@ -21,6 +21,24 @@
 	# so exposing it on the LAN would hand ingress control to anything that can
 	# reach this host.
 	admin {{ caddy_admin_listen }}
+
+	# ⚠️ DECLARED SO THE ROOT CA EXISTS AFTER THIS ROLE RUNS, not whenever some
+	# application later happens to ask for a certificate.
+	#
+	# Caddy creates the local CA lazily, on the first site that needs one. With
+	# no `pki` block, a host with no sites yet has no root certificate — so this
+	# role's "publish the root to a stable path" step found nothing on a first
+	# deploy, and the file the README tells operators to `scp` did not exist
+	# until some later run. Measured: without this block, no root.crt after a
+	# restart; with it, one is written at load.
+	#
+	# It is the same CA and the same name Caddy would have generated on its own;
+	# declaring it only fixes WHEN.
+	pki {
+		ca local {
+			name "Caddy Local Authority"
+		}
+	}
 {% for opt in caddy_global_options %}
 	{{ opt }}
 {% endfor %}

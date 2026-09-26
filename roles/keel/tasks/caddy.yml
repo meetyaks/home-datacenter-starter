@@ -35,6 +35,52 @@
       reported success in this play. Investigate roles/caddy — it owns that
       directory — rather than working around it here.
     quiet: true
+  # ⚠️ NOT IN CHECK MODE ON A HOST WITHOUT CADDY. Under `--check`, roles/caddy
+  # REPORTED this directory and created nothing, so asserting on it here would
+  # abort the dry run over an artifact that was only predicted — the same
+  # defect that had the caddy role run `caddy version` against a binary apt had
+  # merely promised. `caddy_artifacts_real` is roles/caddy stating which it is,
+  # rather than this role guessing from `ansible_check_mode`: in check mode
+  # against a host that ALREADY has Caddy the directory is real, and the
+  # assertion should still hold. (enforced: tests/run-caddy-check-mode.sh)
+  when: caddy_artifacts_real | default(true) | bool
+
+- name: Note that the route is deferred until Caddy exists
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: roles/caddy reported that it would install Caddy, so
+      {{ keel_caddy_sites_dir }} does not exist yet. A real run creates it
+      before this point, and the Keel route is written into it.
+  when: not (caddy_artifacts_real | default(true) | bool)
+
+- name: Create the Keel access log with the service account as owner
+  # ⚠️ THIS MUST COME BEFORE THE ROUTE IS VALIDATED, and it is not a detail.
+  #
+  # `caddy validate` runs as root here and, for a site with a `log` directive,
+  # OPENS the log file to check the writer — creating it 0600 root:root when it
+  # is absent. Caddy itself runs as the service account, so the next reload
+  # fails on a file root made a moment earlier:
+  #
+  #   loading new config: setting up custom log 'log0': opening log writer:
+  #   open /var/log/caddy/keel.dc1.lan.log: permission denied
+  #
+  # `caddy validate` reports "Valid configuration" throughout, because the
+  # composed config IS valid — it is the file ownership that is wrong. Creating
+  # the file as the service account first means root's validate opens an
+  # existing file and leaves its ownership alone.
+  # (enforced: tests/run-caddy-check-mode.sh "the reload succeeds on a first
+  #  deploy, with the site log writable by the service account")
+  ansible.builtin.file:
+    path: "{{ keel_caddy_log_dir }}/{{ keel_hostname }}.log"
+    state: touch
+    owner: "{{ caddy_service_user | default('caddy') }}"
+    group: "{{ caddy_service_group | default('caddy') }}"
+    mode: "0640"
+    # `touch` is otherwise reported changed on every run, which would make the
+    # role never idempotent.
+    modification_time: preserve
+    access_time: preserve
+  when: caddy_artifacts_real | default(true) | bool
 
 - name: Install the Keel route
   # ATOMIC AND VALIDATED: `template` renders to a temporary file, runs
@@ -51,5 +97,9 @@
     owner: root
     group: root
     mode: "0644"
-    validate: caddy validate --adapter caddyfile --config %s
+    # The path roles/caddy published, not a bare `caddy` off PATH and not a
+    # second copy of the constant in this role's defaults. Ansible skips
+    # `validate:` under `--check` (measured), so a fresh-host dry run does not
+    # try to run it.
+    validate: "{{ caddy_binary_path | default('/usr/bin/caddy') }} validate --adapter caddyfile --config %s"
   notify: Reload Caddy

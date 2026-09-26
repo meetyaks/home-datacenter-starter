@@ -47,6 +47,68 @@
     update_cache: true
   when: caddy_repository.changed
 
+# ═══ WHAT IS TRUE, AND WHAT IS ONLY PREDICTED ════════════════════════════════
+#
+# Under `--check` every task above reports what it WOULD do and does none of it.
+# So from here on, nothing may consume an artifact that only a predicted task
+# would have created: not the binary, not the systemd unit, not the CA.
+#
+# This role failed on exactly that. `Record the installed version` carried
+# `check_mode: false`, so it ran during `--check` and called `caddy version` on
+# a host where the apt task above had merely PREDICTED an installation:
+#
+#     "[Errno 2] No such file or directory: b'caddy'", "rc": 2
+#
+# The three facts below are the whole discipline, and all three come from
+# LOOKING AT THE HOST. In particular `caddy_can_be_executed_now` is a `stat` of
+# the binary taken after the install step — never `caddy_apt_install.changed`,
+# which in check mode means "would install", not "did".
+#
+# `check_mode: false` on a task that OBSERVES the host (stat, apt-cache policy,
+# `caddy version`) is correct and is what makes check mode informative. On a
+# task that CONSUMES a prediction it is the defect itself. That is the line.
+
+- name: Look for the Caddy binary before this play could have installed it
+  ansible.builtin.stat:
+    path: "{{ caddy_binary }}"
+  register: caddy_binary_before
+  changed_when: false
+  check_mode: false
+
+- name: Ask apt whether Caddy is available from the configured repositories
+  # Under `--check` the repository file above was NOT written, so on a genuinely
+  # fresh host the package index has never heard of Caddy and `apt` fails with
+  # "No package matching 'caddy' is available" — a check-mode run aborting over
+  # a repository it only predicted. Asking first turns that into a report.
+  ansible.builtin.command:
+    argv: [apt-cache, policy, caddy]
+  register: caddy_apt_policy
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Record what is installed and what is merely available
+  ansible.builtin.set_fact:
+    caddy_present_before_run: "{{ caddy_binary_before.stat.exists | default(false) }}"
+    caddy_package_available: >-
+      {{ (caddy_apt_policy.rc | default(1)) == 0
+         and 'Candidate:' in (caddy_apt_policy.stdout | default(''))
+         and 'Candidate: (none)' not in (caddy_apt_policy.stdout | default('')) }}
+
+- name: Caddy must be installable in a real run
+  # In real mode the repository file and the cache refresh above actually
+  # happened, so an unavailable package is a genuine failure — a wrong URL, a
+  # rejected signing key, an architecture with no build — and must not be
+  # skipped past into a deployment that ends with no ingress.
+  ansible.builtin.assert:
+    that:
+      - caddy_package_available | bool
+    fail_msg: >-
+      Caddy is not available from {{ caddy_apt_repo_url }} on this host, after
+      the repository was configured and the package index refreshed. apt-cache
+      policy said: {{ caddy_apt_policy.stdout | default('(no output)') | trim }}
+  when: not ansible_check_mode
+
 - name: Install Caddy
   # `state: present`, never `latest`: apt installs it once and does not move the
   # version under a running service on later runs. Upgrading is an explicit act
@@ -54,14 +116,93 @@
   ansible.builtin.apt:
     name: "caddy{{ ('=' ~ caddy_version) if caddy_version | length > 0 else '' }}"
     state: "{{ 'latest' if caddy_upgrade | bool else 'present' }}"
+  register: caddy_apt_install
   notify: Restart Caddy
+  when: caddy_package_available | bool
+
+- name: Report what a real run would install
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: Caddy is not installed on this host. A real run would install
+      it from {{ caddy_apt_repo_url }}
+      {{- ' (pinned to ' ~ caddy_version ~ ')' if caddy_version | length > 0
+          else ' (current stable; state: present, never auto-upgraded)' }}.
+      {{ 'The package index does not carry it yet, because under --check the repository file was reported rather than written, so no version can be named here.' if not caddy_package_available | bool else '' }}
+  when:
+    - ansible_check_mode
+    - not caddy_present_before_run | bool
+
+- name: Look for the Caddy binary again, now that the install step has run
+  # THE DECIDING OBSERVATION. Everything below is gated on this, and it is a
+  # `stat` precisely so that a check-mode `changed: true` from apt cannot be
+  # mistaken for an installed binary.
+  ansible.builtin.stat:
+    path: "{{ caddy_binary }}"
+  register: caddy_binary_after
+  changed_when: false
+  check_mode: false
+
+- name: Look for the systemd unit the package provides
+  ansible.builtin.stat:
+    path: "{{ caddy_unit_file }}"
+  register: caddy_unit_stat
+  changed_when: false
+  check_mode: false
+
+- name: Record what can actually be executed now
+  ansible.builtin.set_fact:
+    caddy_will_be_installed: "{{ not (caddy_present_before_run | bool) }}"
+    caddy_can_be_executed_now: "{{ caddy_binary_after.stat.exists | default(false) }}"
+    caddy_unit_present: "{{ caddy_unit_stat.stat.exists | default(false) }}"
+
+- name: The Caddy binary must exist after a real installation
+  # apt can report success while leaving nothing usable behind — a dpkg
+  # configure that failed and was ignored, a diverted path, a partially
+  # unpacked package. Real mode says so here rather than three tasks later,
+  # inside a validation error that reads like a configuration problem.
+  ansible.builtin.assert:
+    that:
+      - caddy_can_be_executed_now | bool
+      - caddy_unit_present | bool
+    fail_msg: >-
+      apt reported Caddy installed, but
+      {{ caddy_binary if not (caddy_can_be_executed_now | bool) else caddy_unit_file }}
+      does not exist. The package did not leave a usable installation behind;
+      nothing further in this role can run.
+  when: not ansible_check_mode
 
 - name: Record the installed version
+  # ABSOLUTE PATH, and gated on the binary having been OBSERVED to exist. Both
+  # halves matter: the path so it cannot resolve to something else on PATH, the
+  # gate so it never runs against a predicted installation.
   ansible.builtin.command:
-    cmd: caddy version
+    argv: ["{{ caddy_binary }}", version]
   register: caddy_installed_version
   changed_when: false
   check_mode: false
+  when: caddy_can_be_executed_now | bool
+
+- name: Record the version string Caddy reports
+  # `caddy version` prints "v2.11.4 h1:XKxkMTg…" — the tag, then the module sum.
+  ansible.builtin.set_fact:
+    caddy_running_version: >-
+      {{ ((caddy_installed_version.stdout_lines | default([]) | first | default(''))
+          | trim | split(' ') | first | default('')) | regex_replace('^v', '') }}
+  when: caddy_can_be_executed_now | bool
+
+- name: The installed version must be the pinned one
+  ansible.builtin.assert:
+    that:
+      - caddy_running_version | default('') == caddy_version
+    fail_msg: >-
+      Caddy is pinned to {{ caddy_version }} but this host is running
+      {{ caddy_running_version | default('(nothing readable)') }}. apt did not
+      install the requested version; a reverse proxy running a version nobody
+      asked for is not a deployment anyone verified.
+    success_msg: "Caddy {{ caddy_running_version | default('') }} matches the pin."
+  when:
+    - caddy_version | length > 0
+    - caddy_can_be_executed_now | bool
 
 - name: Report the installed version
   ansible.builtin.debug:
@@ -71,8 +212,11 @@
     # version`'s second build line along with it. Measured: 1 element vs 2.
     msg: >-
       Caddy {{ (caddy_installed_version.stdout_lines | default(['(unknown)']))[0] }}
-      ({{ 'pinned to ' ~ caddy_version if caddy_version | length > 0
-          else 'version policy: install-once from stable, never auto-upgraded' }})
+      — {{ 'already installed before this run' if caddy_present_before_run | bool
+            else 'installed by this run' }},
+      {{ 'pinned to ' ~ caddy_version if caddy_version | length > 0
+          else 'version policy: install-once from stable, never auto-upgraded' }}
+  when: caddy_can_be_executed_now | bool
 
 # ── Filesystem the role owns ────────────────────────────────────────────────
 
@@ -112,15 +256,37 @@
     owner: root
     group: root
     mode: "0644"
-    validate: caddy validate --adapter caddyfile --config %s
+    # ABSOLUTE PATH — the same binary the version assertion checked, not whatever
+    # `caddy` resolves to on PATH for the connection user.
+    #
+    # Ansible skips `validate:` entirely under `--check` (measured), which is the
+    # right behaviour here: on a fresh host the binary that would run it does not
+    # exist yet. So check mode reports the file it would write and does not claim
+    # the configuration was validated.
+    validate: "{{ caddy_binary }} validate --adapter caddyfile --config %s"
   notify: Reload Caddy
 
 - name: Enable and start Caddy
+  # Gated on the UNIT having been observed, not on the package task's report.
+  # `systemd_service` fails on a unit that does not exist even in check mode —
+  # measured: "Could not find the requested service caddy: host" — so on a
+  # fresh host under --check this task would abort the run on a unit that only
+  # a predicted installation would have provided.
   ansible.builtin.systemd_service:
     name: caddy
     enabled: true
     state: started
     daemon_reload: true
+  when: caddy_unit_present | bool
+
+- name: Report the service actions a real run would take
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: caddy.service does not exist on this host yet. A real run
+      would install the unit with the package, then enable and start it.
+  when:
+    - ansible_check_mode
+    - not (caddy_unit_present | bool)
 
 # ── The internal CA, so private hostnames get a real certificate chain ──────
 
@@ -130,12 +296,18 @@
   ansible.builtin.meta: flush_handlers
 
 - name: Wait for Caddy's internal CA to exist
+  # The CA is generated BY a running Caddy. On a host where the service was
+  # never installed — or was only predicted to be — there is nothing to wait
+  # for, so the mode guard is not enough on its own: waiting 60s for a file
+  # that cannot appear is a minute spent proving nothing.
   ansible.builtin.wait_for:
     path: "{{ caddy_internal_ca_src }}"
     timeout: 60
   register: caddy_ca_wait
   failed_when: false
-  when: not ansible_check_mode
+  when:
+    - not ansible_check_mode
+    - caddy_unit_present | bool
 
 - name: Publish the internal root certificate to a stable path
   # Caddy keeps it under its own data directory, which is 0700 and versioned by
@@ -173,6 +345,17 @@
       - "(Caddy's own copy: {{ caddy_internal_ca_src }})"
       - "Clients on the LAN must trust this certificate to reach https://<name>.lan"
       - "without a warning. See roles/caddy/README.md for the macOS procedure."
+  when: caddy_can_be_executed_now | bool
+
+- name: Report that the internal CA would be created by a real run
+  # Naming a path that does not exist, as though it did, is how a check-mode
+  # report turns into a false receipt. Say which it is.
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: Caddy has not run on this host, so its internal CA does not
+      exist yet. A real run would generate it and publish the root to
+      {{ caddy_internal_ca_dest }} for LAN clients to trust.
+  when: not (caddy_can_be_executed_now | bool)
 
 # ── The fact the Keel role's preflight looks for ────────────────────────────
 #
@@ -183,3 +366,19 @@
   ansible.builtin.set_fact:
     caddy_role_applied: true
     caddy_conf_d_path: "{{ caddy_conf_d }}"
+    # Published because role defaults are not visible outside their role, and
+    # an application role must not carry its own copy of these — two constants
+    # for one path drift, and the drift is silent until a deploy validates
+    # against a different binary than the one this role installed.
+    caddy_binary_path: "{{ caddy_binary }}"
+    caddy_log_dir_path: "{{ caddy_log_dir }}"
+    # The identity the service actually runs as. An application that writes a
+    # site log must create the file as this user, because `caddy validate` runs
+    # as root and creates a missing log file 0600 root:root — after which the
+    # service cannot open it and the reload fails.
+    caddy_service_user: "{{ caddy_user }}"
+    caddy_service_group: "{{ caddy_group }}"
+    # Whether the artifacts an application is about to use are REAL. Under
+    # --check on a fresh host they are not: this role reported a conf.d it did
+    # not create, and an application asserting on it would abort the dry run.
+    caddy_artifacts_real: "{{ caddy_can_be_executed_now | bool }}"

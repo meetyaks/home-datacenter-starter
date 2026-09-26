@@ -38,6 +38,15 @@ caddy_version: ""
 # Upgrading is an explicit act, never a side effect of a deploy.
 caddy_upgrade: false
 
+# ── What the package puts on disk ───────────────────────────────────────────
+#
+# Named, and used as ABSOLUTE PATHS, for two reasons: `caddy` on PATH may be a
+# different binary than the one apt just installed, and a `stat` of these two
+# paths is how the role establishes that Caddy is really here — as opposed to
+# the apt task having reported, under `--check`, that it WOULD be.
+caddy_binary: /usr/bin/caddy
+caddy_unit_file: /lib/systemd/system/caddy.service
+
 # ── Filesystem ──────────────────────────────────────────────────────────────
 caddy_config_file: /etc/caddy/Caddyfile
 caddy_conf_d: /etc/caddy/conf.d
