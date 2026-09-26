@@ -249,6 +249,25 @@ else
       "caddy=${caddy_step:-absent} verify=${verify_step:-absent}"
 fi
 
+# A rerun after a failed deploy changes NO file, so a reload driven only by
+# "did a template change" never happens. The owner must detect that the running
+# configuration is not the one on disk, and notify the canonical handler on
+# that basis alone.
+if [ -f roles/caddy/tasks/detect-drift.yml ] \
+   && grep -q 'notify: Reload Caddy' roles/caddy/tasks/detect-drift.yml; then
+  ok "roles/caddy notifies the reload on disk-versus-active drift, not only on a file change"
+else
+  bad "drift alone can trigger a reload" \
+      "nothing notifies Reload Caddy when the files are unchanged but the process is stale"
+fi
+if grep -q 'adapt' roles/caddy/tasks/detect-drift.yml 2>/dev/null \
+   && grep -q 'caddy_admin_listen' roles/caddy/tasks/detect-drift.yml 2>/dev/null; then
+  ok "drift is decided by comparing the adapted files with the LOADED config"
+else
+  bad "drift compares disk against the running process" \
+      "it does not read both \`caddy adapt\` and the admin API"
+fi
+
 # The active-state claim must come from the running process, not from files.
 if grep -q 'caddy_admin_listen' roles/caddy/tasks/reload-and-verify.yml 2>/dev/null \
    && grep -q 'caddy_active_config_json' roles/keel/tasks/caddy.yml; then

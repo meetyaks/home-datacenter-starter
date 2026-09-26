@@ -54,7 +54,20 @@
     argv: "{{ caddy_validate_argv }}"
   changed_when: false
   check_mode: false
+  # Validation ALWAYS runs, in both modes: invalid on-disk configuration is a
+  # fault a dry run must report, and it is exactly the case where the gate
+  # below (which suppresses active-state checks in check mode) must not apply.
   when: caddy_can_be_executed_now | default(false) | bool
+
+- name: Notice a running configuration that does not match the files
+  # (c2) BETWEEN validation and the flush, because a reload must only ever be
+  # notified for a configuration already known to be valid.
+  #
+  # Without this, the flush below applies only what a CHANGED template
+  # notified — and on a rerun after a failed deploy nothing changed, because
+  # the drop-in was already correct. That is dc1-x86 exactly: right file,
+  # stale process, no notification, nothing to flush.
+  ansible.builtin.include_tasks: detect-drift.yml
 
 - name: Apply the pending ingress change now, not at the end of the play
   # (d) THE FIX. Without this, every check below — and every HTTPS check the
@@ -76,7 +89,7 @@
   changed_when: false
   failed_when: false
   check_mode: false
-  when: caddy_can_be_executed_now | default(false) | bool
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
 
 - name: Caddy must be active
   ansible.builtin.assert:
@@ -90,7 +103,7 @@
       reload. The ingress change was applied to a service that is not running,
       so nothing below can be reaching it. Check `journalctl -u caddy`.
     quiet: true
-  when: caddy_can_be_executed_now | default(false) | bool
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
 
 - name: Read the listeners on the ingress ports
   # (f) `ss -H` so there is no header line to parse around, and the process
@@ -101,14 +114,14 @@
   changed_when: false
   failed_when: false
   check_mode: false
-  when: caddy_can_be_executed_now | default(false) | bool
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
 
 - name: Record who owns ports 80 and 443
   ansible.builtin.set_fact:
     caddy_ingress_lines: >-
       {{ caddy_listeners.stdout_lines | default([])
          | select('search', ':(80|443)\s') | list }}
-  when: caddy_can_be_executed_now | default(false) | bool
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
 
 - name: Ports 80 and 443 must exist and belong to Caddy
   ansible.builtin.assert:
@@ -126,7 +139,7 @@
       — a site that adapts and validates can still bind nothing, which is
       exactly what a stale in-memory configuration looks like from outside.
     quiet: true
-  when: caddy_can_be_executed_now | default(false) | bool
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
 
 - name: Read the configuration Caddy currently has LOADED
   # (5) FROM THE ADMIN API, not from the files. The whole defect was that the
@@ -145,19 +158,34 @@
   register: caddy_loaded_config
   changed_when: false
   check_mode: false
-  when: caddy_can_be_executed_now | default(false) | bool
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
 
 - name: Publish the loaded configuration for the caller to assert on
   # A string, so a caller can look for its own hostname without depending on
   # where in the JSON structure Caddy happens to put it.
   ansible.builtin.set_fact:
     caddy_active_config_json: "{{ caddy_loaded_config.content | default('') | string }}"
-  when: caddy_can_be_executed_now | default(false) | bool
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
 
-- name: Note that ingress activation is deferred
+- name: Note that ingress activation is deferred — no Caddy on this host
   ansible.builtin.debug:
     msg: >-
       CHECK MODE: Caddy is not installed on this host, so there is no running
       configuration to reload or inspect. A real run applies the drop-in and
       proves the route is live before verifying anything over HTTPS.
   when: not (caddy_can_be_executed_now | default(false) | bool)
+
+- name: Note that ingress activation is deferred — the reload was not performed
+  # A different deferral: Caddy IS here, and its running configuration is
+  # stale. A dry run reports that and changes nothing, so the listeners and
+  # routes it could ask about are still the stale ones. Asserting on them would
+  # fail for the one reason a dry run must never fail — that it correctly
+  # declined to act. The on-disk configuration was still validated above.
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: active listener and route verification is deferred to the
+      real run, because the reload that would make them true was reported
+      rather than performed.
+  when:
+    - caddy_can_be_executed_now | default(false) | bool
+    - not (caddy_active_state_verifiable | default(true) | bool)

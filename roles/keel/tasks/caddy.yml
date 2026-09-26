@@ -146,4 +146,4 @@
       started before this drop-in existed and has not re-read it since.
     success_msg: "INGRESS: {{ keel_hostname }} is live in Caddy's loaded configuration."
     quiet: true
-  when: caddy_can_be_executed_now | default(false) | bool
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool

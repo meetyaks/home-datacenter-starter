@@ -331,9 +331,197 @@ case "$fwd" in
     bad "Caddy's defaults supply the forwarded headers" "upstream saw: '${fwd:-nothing}'" ;;
 esac
 
+# ── 8. THE EXACT dc1-x86 RESUME STATE ──────────────────────────────────────
+#
+# Scenario 2 adds a NEW drop-in, which naturally reports `changed` and notifies
+# the handler — so it cannot show what happens on a RERUN, where the drop-in is
+# already correct. That is the state dc1-x86 is actually in:
+#
+#   · conf.d/keel.caddy exists and MATCHES the template
+#   · the composed on-disk configuration validates
+#   · caddy.service is active
+#   · the loaded configuration does NOT contain keel.dc1.lan
+#   · nothing listens on :80 or :443
+#   · no handler notification is pending — the previous play ended
+#
+# So the next template task is `ok`, notifies nothing, and a run driven purely
+# by "did a file change" does nothing at all while the host serves nothing.
+#
+# The state is built the way dc1-x86 built it: by running the OLD code and
+# letting it fail. Nothing is hand-placed, so the precondition cannot drift
+# away from the incident it represents.
+echo
+echo "── 8. rerun from the exact dc1-x86 resume state (nothing changed on disk) ──"
+C=keel-handler-order-c
+boot "$C"
+cx() { docker exec "$C" bash -lc "$1"; }
+
+stage_resume_state() {
+  cx 'python3 -c "
+p=\"/work/roles/keel/tasks/caddy.yml\"; s=open(p).read()
+open(p,\"w\").write(s[:s.index(\"# ═══ APPLY IT NOW.\")].rstrip()+chr(10))
+"' >/dev/null 2>&1
+  cx "cd /work && ansible-playbook -i localhost, -c local $PLAYFILE" > /tmp/ho-8-setup.log 2>&1
+  guard_net /tmp/ho-8-setup.log "scenario 8 setup"
+  # Restore the real role: only the STATE is meant to be historical.
+  cx 'cp /repo/roles/keel/tasks/caddy.yml /work/roles/keel/tasks/caddy.yml'
+}
+stage_resume_state
+
+# Every bullet from the incident, asserted before the rerun.
+cx 'test -f /etc/caddy/conf.d/keel.caddy' \
+  && ok "precondition — keel.caddy is on disk" || bad "precondition — drop-in present" "absent"
+cx '/usr/bin/caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile' >/dev/null 2>&1 \
+  && ok "precondition — the composed on-disk configuration validates" \
+  || bad "precondition — on-disk config validates" "it does not"
+cx 'systemctl is-active caddy | grep -qx active' \
+  && ok "precondition — Caddy is active" || bad "precondition — Caddy active" "$(cx 'systemctl is-active caddy' 2>&1)"
+cx 'curl -fsS http://localhost:2019/config/ 2>/dev/null | grep -q keel.dc1.lan' \
+  && bad "precondition — the LOADED config lacks keel.dc1.lan" "it already contains it" \
+  || ok "precondition — the loaded configuration does NOT contain keel.dc1.lan"
+[ "$(cx "ss -ltnH 'sport = :80 or sport = :443'" 2>/dev/null | grep -c . | tr -d ' \r')" = "0" ] \
+  && ok "precondition — nothing listens on :80 or :443" \
+  || bad "precondition — no listeners" "something is bound"
+
+# THE RERUN.
+cx "cd /work && ansible-playbook -i localhost, -c local $PLAYFILE" > /tmp/ho-8.log 2>&1
+rc8=$?
+guard_net /tmp/ho-8.log "scenario 8"
+
+# The template must be `ok` — otherwise this scenario is secretly scenario 2,
+# and proves nothing about a rerun.
+tmpl_status=$(grep -A1 -F 'TASK [keel : Install the Keel route]' /tmp/ho-8.log | tail -1 | cut -d: -f1)
+if [ "$tmpl_status" = "ok" ]; then
+  ok "the route template reported 'ok' — no file changed, nothing notified by it"
+else
+  bad "the drop-in is genuinely unchanged" "the template reported '$tmpl_status'; this is not a rerun"
+fi
+
+drift_status=$(grep -A1 -F 'TASK [caddy : Compare the on-disk configuration with the one Caddy is running]' /tmp/ho-8.log | tail -1 | cut -d: -f1)
+if [ "$drift_status" = "changed" ]; then
+  ok "roles/caddy detected disk-versus-active drift and reported changed"
+else
+  bad "the owner detects drift" "the drift task reported '$drift_status'"
+fi
+if grep -qF 'RUNNING HANDLER [caddy : Reload Caddy]' /tmp/ho-8.log; then
+  ok "…and that notified the canonical roles/caddy reload handler"
+else
+  bad "the canonical handler runs" "no Reload Caddy handler in the rerun"
+fi
+
+if [ $rc8 -eq 0 ] && [ "$(grep -oE 'failed=[0-9]+' /tmp/ho-8.log | tail -1 | cut -d= -f2)" = "0" ]; then
+  ok "the rerun completes, mid-play verification included"
+else
+  bad "the rerun succeeds from the resume state" "failed=$(grep -oE 'failed=[0-9]+' /tmp/ho-8.log | tail -1 | cut -d= -f2)"
+  grep -A4 'fatal:' /tmp/ho-8.log | head -8 | sed 's/^/           /'
+fi
+grep -qF 'MIDPLAY OK:' /tmp/ho-8.log \
+  && ok "the console answered over verified TLS on the rerun" \
+  || bad "the route is live after the rerun" "no MIDPLAY OK"
+cx 'curl -fsS http://localhost:2019/config/ 2>/dev/null | grep -q keel.dc1.lan' \
+  && ok "keel.dc1.lan is now in the LOADED configuration" \
+  || bad "the stale configuration was replaced" "the admin API still does not mention it"
+owners8=$(cx "ss -ltnpH 'sport = :80 or sport = :443'" 2>/dev/null | grep -oE '"[a-z]+"' | tr -d '"' | sort -u | tr '\n' ' ' | sed 's/ $//')
+[ "$owners8" = "caddy" ] && ok "…and :80/:443 are now held, by caddy only" \
+  || bad "the listeners appeared" "owners: '${owners8:-nothing}'"
+
+# (7) A third run must find no drift at all.
+cx "cd /work && ansible-playbook -i localhost, -c local $PLAYFILE" > /tmp/ho-8b.log 2>&1
+guard_net /tmp/ho-8b.log "scenario 8 idempotence"
+if [ "$(grep -oE 'changed=[0-9]+' /tmp/ho-8b.log | tail -1 | cut -d= -f2)" = "0" ]; then
+  ok "the next run finds no drift and changes nothing (changed=0)"
+else
+  bad "ingress ownership is idempotent once converged" \
+      "changed=$(grep -oE 'changed=[0-9]+' /tmp/ho-8b.log | tail -1 | cut -d= -f2)"
+  awk '/^TASK \[|^RUNNING HANDLER \[/{t=$0} /^changed: \[localhost\]/{print "           "t}' /tmp/ho-8b.log | head -4
+fi
+
+# ── 9. Check mode against the same stale host ──────────────────────────────
+echo
+echo "── 9. --check on a stale host reports the reload without performing it ──"
+D=keel-handler-order-d
+boot "$D"
+dx() { docker exec "$D" bash -lc "$1"; }
+dx 'python3 -c "
+p=\"/work/roles/keel/tasks/caddy.yml\"; s=open(p).read()
+open(p,\"w\").write(s[:s.index(\"# ═══ APPLY IT NOW.\")].rstrip()+chr(10))
+"' >/dev/null 2>&1
+dx "cd /work && ansible-playbook -i localhost, -c local $PLAYFILE" > /tmp/ho-9-setup.log 2>&1
+guard_net /tmp/ho-9-setup.log "scenario 9 setup"
+dx 'cp /repo/roles/keel/tasks/caddy.yml /work/roles/keel/tasks/caddy.yml'
+
+dx "cd /work && ansible-playbook -i localhost, -c local $PLAYFILE --check" > /tmp/ho-9.log 2>&1
+guard_net /tmp/ho-9.log "scenario 9"
+[ "$(grep -oE 'failed=[0-9]+' /tmp/ho-9.log | tail -1 | cut -d= -f2)" = "0" ] \
+  && ok "the dry run does not fail because the active state could not change" \
+  || bad "check mode on a stale host succeeds" "failed=$(grep -oE 'failed=[0-9]+' /tmp/ho-9.log | tail -1 | cut -d= -f2)"
+grep -qF 'would reload Caddy because active configuration is stale' /tmp/ho-9.log \
+  && ok "it reports 'would reload Caddy because active configuration is stale'" \
+  || bad "check mode reports the stale state" "that message is absent"
+grep -qF 'active listener and route verification is deferred to the real run' /tmp/ho-9.log \
+  && ok "it says active listener and route verification is deferred" \
+  || bad "the deferral is stated" "nothing says the active checks were skipped"
+[ "$(dx "ss -ltnH 'sport = :80 or sport = :443'" 2>/dev/null | grep -c . | tr -d ' \r')" = "0" ] \
+  && ok "nothing was reloaded — still no listeners after --check" \
+  || bad "check mode performs no reload" "listeners appeared during a dry run"
+dx 'curl -fsS http://localhost:2019/config/ 2>/dev/null | grep -q keel.dc1.lan' \
+  && bad "check mode changed nothing" "the loaded config gained keel.dc1.lan during --check" \
+  || ok "the loaded configuration is untouched by the dry run"
+# …but an invalid on-disk configuration must still fail a dry run.
+dx 'printf "this is not { valid\n" > /etc/caddy/conf.d/zz-bad.caddy'
+dx "cd /work && ansible-playbook -i localhost, -c local $PLAYFILE --check" > /tmp/ho-9b.log 2>&1
+if grep -qE 'failed=[1-9]' /tmp/ho-9b.log \
+   && grep -A2 'Validate the composed Caddy configuration' /tmp/ho-9b.log | grep -q 'fatal:'; then
+  ok "an invalid on-disk configuration still fails in check mode, at validation"
+else
+  bad "check mode still validates" "a broken drop-in did not fail the dry run"
+fi
+dx 'rm -f /etc/caddy/conf.d/zz-bad.caddy'
+
+# ── 10. Mutation: remove the drift notification ────────────────────────────
+#
+# Without `notify: Reload Caddy` on the drift task, the rerun has nothing to
+# flush — and must land back in the dc1-x86 state. A regression the broken code
+# also passes is not a regression.
+echo
+echo "── 10. removing the drift notification reproduces the dc1-x86 symptom ──"
+E=keel-handler-order-e
+boot "$E"
+ex() { docker exec "$E" bash -lc "$1"; }
+ex 'python3 -c "
+p=\"/work/roles/keel/tasks/caddy.yml\"; s=open(p).read()
+open(p,\"w\").write(s[:s.index(\"# ═══ APPLY IT NOW.\")].rstrip()+chr(10))
+"' >/dev/null 2>&1
+ex "cd /work && ansible-playbook -i localhost, -c local $PLAYFILE" > /tmp/ho-10-setup.log 2>&1
+guard_net /tmp/ho-10-setup.log "scenario 10 setup"
+ex 'cp /repo/roles/keel/tasks/caddy.yml /work/roles/keel/tasks/caddy.yml'
+# The mutation: the drift task still detects, but tells no one.
+ex "sed -i '/^  notify: Reload Caddy\$/d' /work/roles/caddy/tasks/detect-drift.yml"
+if ex 'grep -q "notify: Reload Caddy" /work/roles/caddy/tasks/detect-drift.yml'; then
+  die "could not remove the drift notification; scenario 10 would prove nothing"
+fi
+ok "removed 'notify: Reload Caddy' from the drift task"
+
+ex "cd /work && ansible-playbook -i localhost, -c local $PLAYFILE" > /tmp/ho-10.log 2>&1
+guard_net /tmp/ho-10.log "scenario 10"
+if [ "$(grep -oE 'failed=[0-9]+' /tmp/ho-10.log | tail -1 | cut -d= -f2)" = "0" ]; then
+  bad "the un-notified drift FAILS the rerun" "it passed — scenario 8 does not catch the defect"
+else
+  ok "the rerun fails without the drift notification"
+fi
+[ "$(ex "ss -ltnH 'sport = :80 or sport = :443'" 2>/dev/null | grep -c . | tr -d ' \r')" = "0" ] \
+  && ok "mutation symptom — still nothing on :80 or :443" \
+  || bad "mutation symptom — no listeners" "the route came up anyway"
+ex 'curl -fsS http://localhost:2019/config/ 2>/dev/null | grep -q keel.dc1.lan' \
+  && bad "mutation symptom — route absent from the loaded config" "it is present" \
+  || ok "mutation symptom — keel.dc1.lan still absent from the loaded configuration"
+ex 'test -f /etc/caddy/conf.d/keel.caddy && /usr/bin/caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile' >/dev/null 2>&1 \
+  && ok "mutation symptom — the drop-in is still on disk and still validates" \
+  || bad "mutation symptom — files remain correct" "the files changed, so this is a different failure"
+
 echo
 if [ "$fail" -gt 0 ]; then
   echo "FAILED: $fail of $((pass + fail)) checks." >&2
   exit 1
 fi
-echo "PASS — $pass checks: the reload is applied and PROVED ACTIVE before anything verifies it, the old implementation fails this same play with every symptom from the incident, an invalid drop-in leaves the live route serving on the same process, and the CA is trusted without granting the service sudo."
+echo "PASS — $pass checks: the reload is applied and PROVED ACTIVE before anything verifies it; a RERUN from the exact dc1-x86 resume state reloads on disk-versus-active drift with no file changed, and is idempotent afterwards; the old implementation and the un-notified drift task both fail with the incident's own symptoms; an invalid drop-in leaves the live route serving on the same process; and the CA is trusted without granting the service sudo."

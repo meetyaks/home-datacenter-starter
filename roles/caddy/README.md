@@ -136,11 +136,54 @@ So an application role does not leave its reload pending:
       - my_hostname in (caddy_active_config_json | default(''))
 ```
 
+### A rerun changes no file, and still has to fix the host
+
+Ansible's model of "do I need to act" is *did a file change in this run*. That
+is the wrong question after a failed deploy. dc1-x86 is in the state a failure
+leaves behind:
+
+| | |
+|---|---|
+| `conf.d/keel.caddy` | present, and **matches** the template |
+| composed on-disk config | validates |
+| `caddy.service` | active |
+| loaded config | does **not** contain `keel.dc1.lan` |
+| `:80` / `:443` | nothing listening |
+| pending handler | none — the previous play ended |
+
+So the next run's template task reports `ok`, notifies nothing, and a
+change-driven reload never happens, while the host serves nothing. **No
+file-based check can see this**, because the files are right.
+
+`detect-drift.yml` asks the other question: does the configuration Caddy **has
+loaded** equal what the files **adapt to**? `caddy adapt` produces exactly what
+a reload would install and the admin API returns exactly what is installed —
+measured byte-for-byte identical on a converged host — so an inequality *is*
+drift, whatever caused it. The comparison names no site and no application,
+because "the running process disagrees with `/etc/caddy`" is a property of the
+host.
+
+The drift task is a read-only `caddy adapt` whose **`changed_when` is the drift
+condition**, so detecting staleness is what notifies `Reload Caddy`. An
+application role still writes only its drop-in and still issues no reload.
+
+Under `--check` a stale host stays stale, so the run reports
+
+```
+CHECK MODE: would reload Caddy because active configuration is stale
+```
+
+skips the active listener and route assertions with an explicit deferral note —
+failing those would mean failing a dry run for correctly declining to act — and
+**still fails on invalid on-disk configuration**, which validation catches in
+both modes.
+
 `reload-and-verify` runs, in this order:
 
 | | step | why it is separate |
 |---|---|---|
 | c | validate the **composed** configuration | read-only; fails before the service is touched, with the whole config in the error |
+| c2 | `detect-drift.yml` — compare adapted files with the loaded config | notifies the reload when nothing changed but the process is stale; runs **after** validation, so a reload is only ever notified for a configuration known to be valid |
 | d | `meta: flush_handlers` | the fix — the reload happens **here**, not at end of play |
 | e | assert the service is active | a reload that killed the service is not a reload |
 | f | assert `:80` and `:443` exist and are held **only** by caddy | a site can adapt and validate and still bind nothing |

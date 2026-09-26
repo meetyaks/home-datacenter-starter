@@ -1,0 +1,104 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# IS THE RUNNING CADDY ACTUALLY RUNNING WHAT IS ON DISK?
+#
+# Ansible's whole model of "do I need to act" is *did a file change in this
+# run*. That is the wrong question after a failed run. dc1-x86 is sitting in
+# the state it produces:
+#
+#   · /etc/caddy/conf.d/keel.caddy exists and MATCHES the template
+#   · the composed on-disk configuration validates
+#   · caddy.service is active
+#   · the loaded admin-API configuration does NOT contain keel.dc1.lan
+#   · nothing is listening on :80 or :443
+#   · no handler notification is pending — the previous play ended
+#
+# So the next run's template task reports `ok`, notifies nothing, and every
+# file-based check passes while the host serves nothing. The route is correct,
+# unchanged, and not loaded. No amount of "did the file change" reasoning can
+# see that, because the file is right.
+#
+# The question this file asks instead is the one that matters: does the
+# configuration Caddy HAS LOADED equal the configuration the files ADAPT TO?
+# `caddy adapt` produces exactly what a reload would install, and the admin API
+# returns exactly what is installed now — measured byte-for-byte identical on a
+# converged host — so an inequality IS drift, whatever caused it.
+#
+# It names no site and no application. "The running process disagrees with
+# /etc/caddy" is a property of the host, which is why it belongs to the owner
+# of the host's Caddy and not to whichever role happened to notice.
+# (enforced: tests/run-caddy-handler-order.sh "the exact dc1-x86 resume state")
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Read the configuration Caddy currently has loaded
+  # Loopback admin endpoint, read from the host itself; nothing is exposed.
+  # `failed_when: false` because an unreadable admin API is itself a reason to
+  # reload rather than a reason to abort — handled in the comparison below.
+  ansible.builtin.uri:
+    url: "http://{{ caddy_admin_listen }}/config/"
+    method: GET
+    return_content: true
+    status_code: [200]
+  register: caddy_active_before
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: caddy_can_be_executed_now | default(false) | bool
+
+- name: Compare the on-disk configuration with the one Caddy is running
+  # `adapt`, not `validate`: validate answers "would this load", adapt answers
+  # "what exactly would load" — and the second is the only one comparable with
+  # what IS loaded.
+  #
+  # ⚠️ `changed_when` IS the drift signal. This command changes nothing; it is
+  # marked changed precisely when the running configuration is not the one the
+  # files describe, which is what makes a stale host notify the canonical
+  # reload handler without any template having changed.
+  ansible.builtin.command:
+    argv:
+      - "{{ caddy_binary }}"
+      - adapt
+      - --adapter
+      - caddyfile
+      - --config
+      - "{{ caddy_config_file }}"
+  register: caddy_adapted
+  changed_when: >-
+    (caddy_active_before.status | default(0)) != 200
+    or ((caddy_adapted.stdout | default('{}') | from_json)
+        != (caddy_active_before.content | default('{}') | from_json))
+  check_mode: false
+  notify: Reload Caddy
+  when: caddy_can_be_executed_now | default(false) | bool
+
+- name: Record whether the running configuration is stale
+  ansible.builtin.set_fact:
+    caddy_config_drift: "{{ caddy_adapted.changed | default(false) }}"
+    # Whether asking the running process about listeners and routes can mean
+    # anything yet. Under `--check` a stale host STAYS stale — the reload is
+    # reported, not performed — so asserting on active state there would fail
+    # for the one reason a dry run must never fail: that it correctly declined
+    # to change anything.
+    caddy_active_state_verifiable: >-
+      {{ (caddy_can_be_executed_now | default(false) | bool)
+         and not (ansible_check_mode and (caddy_adapted.changed | default(false))) }}
+  when: caddy_can_be_executed_now | default(false) | bool
+
+- name: Report that a real run would reload Caddy
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: would reload Caddy because active configuration is stale —
+      {{ caddy_config_file }} and its drop-ins adapt to a configuration the
+      running process has not loaded. Nothing was reloaded, so active listener
+      and route verification is deferred to the real run.
+  when:
+    - ansible_check_mode
+    - caddy_config_drift | default(false) | bool
+
+- name: Report that the running configuration already matches the files
+  ansible.builtin.debug:
+    msg: >-
+      Caddy is running exactly the configuration on disk; no reload needed.
+  when:
+    - caddy_can_be_executed_now | default(false) | bool
+    - not (caddy_config_drift | default(false) | bool)
