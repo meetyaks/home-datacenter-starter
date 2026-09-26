@@ -1,0 +1,57 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# ENROLL THE FIRST HUMAN ADMINISTRATOR of the existing Keel tenant.
+#
+#   ansible-playbook playbooks/enroll-admin.yml \
+#     -e keel_admin_email=you@example.com \
+#     --ask-vault-pass --ask-become-pass
+#
+# A ONE-SHOT, and its own playbook rather than a tag on the deploy — because
+# `vars_prompt` is evaluated before task selection, so a prompt living in
+# playbooks/keel.yml would ask for a password on every ordinary deploy, tags or
+# not. Separating it is what keeps the deploy unattended.
+#
+# ═══ WHERE THE PASSWORD GOES, AND WHERE IT DOES NOT ══════════════════════════
+#
+# Typed here, on the CONTROLLER, without echo. It reaches the host exactly once,
+# as the STDIN of one command. It is therefore never:
+#
+#   · an argument         — `/proc/<pid>/cmdline`, `ps`, `docker inspect`
+#   · a file              — none is created, so there is none to secure, none to
+#                            forget, and none to leak if the run dies midway
+#   · an environment var  — `docker exec` env is readable via `docker inspect`
+#   · in shell history    — nothing is typed at a shell
+#   · in Ansible output   — `no_log` on the only task that touches it
+#
+# `keel-enroll-admin` refuses a plaintext `--admin-password` under
+# KEEL_ENV=production for exactly these reasons, so stdin is the supported
+# channel and not a local convention.
+#
+# ⚠️ IT IS NOT STORED ANYWHERE. Choose it with a password manager and save it
+# there before running this. If it is lost, enroll a different address — this
+# command deliberately refuses to change an existing password, because a silent
+# reset is an account takeover with a friendly name.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Enroll the first Keel administrator
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    # The same absolute remote tmp the deploy play uses, for the same reason:
+    # a module is staged before a task runs, so a per-task override is too late,
+    # and the default expands against the wrong user for a delegated task.
+    ansible_remote_tmp: /tmp/ansible-keel
+
+  vars_prompt:
+    - name: keel_admin_password
+      prompt: >-
+        Password for the new administrator (not echoed, not stored anywhere)
+      private: true
+      confirm: true
+
+  tasks:
+    - name: Enroll
+      ansible.builtin.include_role:
+        name: keel
+        tasks_from: enroll-admin

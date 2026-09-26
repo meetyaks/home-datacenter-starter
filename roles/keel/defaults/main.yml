@@ -197,6 +197,22 @@ keel_cors_origins: "https://{{ keel_hostname }}"
 keel_oidc_issuer: "https://{{ keel_hostname }}/oidc/"
 keel_oidc_client_id: keel-lab
 
+# ── Sign-in methods ─────────────────────────────────────────────────────────
+#
+# A CLOSED list: `password`, `oidc`. Declaring password-only is what lets this
+# deployment boot WITHOUT the KEEL_OIDC_* variables — previously the only way
+# past the production check was a self-referential placeholder issuer, which
+# satisfied "non-empty and https" and could never complete a sign-in.
+#
+# To use real SSO: add `oidc`, point keel_oidc_issuer at an ACTUAL provider (not
+# this host), and register the redirect URI with it.
+keel_auth_methods: password
+
+# Unauthenticated self-registration on /auth/register. Closed, and rendered
+# explicitly rather than left to the code default, so the env file states the
+# posture instead of implying it by omission.
+keel_allow_public_registration: false
+
 # Loopback publishes the stack makes; Caddy is the only LAN ingress.
 keel_gateway_loopback_port: 3000
 keel_web_loopback_port: 8080
@@ -221,6 +237,13 @@ keel_caddy_log_dir: /var/log/caddy
 # Where roles/caddy publishes its internal root certificate. Named here so
 # messages and the rendered route can point at one path.
 keel_caddy_internal_ca: /usr/local/share/ca-certificates/caddy-lan-root.crt
+
+# ── First-administrator enrollment (tags: enroll-admin, never) ───────────────
+#
+# The command runs INSIDE the gateway container, because the database
+# credentials live in that container's environment and nowhere else on the host.
+keel_gateway_container: keel-lab-gateway
+
 
 # ── THE BROWSER-FACING GATEWAY BASE ─────────────────────────────────────────
 #

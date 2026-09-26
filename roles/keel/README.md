@@ -379,6 +379,57 @@ on the LAN resolver. Post-deploy verification fails with an explicit
 `INGRESS (DNS)` message when it is missing, rather than leaving it to be found
 from a browser.
 
+## The first human administrator
+
+Bootstrap creates the tenant and its default workspace. It creates **no user**
+unless `KEEL_BOOTSTRAP_ADMIN_EMAIL` is set — and even then a *passwordless* one,
+meant to be linked by an identity provider. So a freshly deployed instance opens
+its sign-in page with no account to sign in with.
+
+```bash
+ansible-playbook playbooks/enroll-admin.yml \
+  -e keel_admin_email=you@example.com --ask-vault-pass --ask-become-pass
+```
+
+The password is prompted for on the controller **without echo**, reaches the host
+once as the **stdin** of one command inside the gateway container, and is written
+nowhere: not an argument (visible in `/proc/<pid>/cmdline`, `ps` and
+`docker inspect`), not a file, not an environment variable, not shell history,
+and not the Ansible log. Choose it in a password manager and save it there first
+— nothing here can recover it, and enrollment deliberately refuses to change an
+existing password.
+
+It grants tenant `admin` and `builder` in the tenant at `KEEL_DEFAULT_TENANT_ID`
+— **not a new tenant**. `keel-provision` would create a second one, leaving the
+administrator outside the tenant every backup and restore is keyed to.
+
+`platform_admin` is installation-wide, reaches every tenant, and outlives whoever
+granted it, so it is a separate act with a recorded reason:
+
+```bash
+docker exec -i keel-lab-gateway node \
+  packages/core/dist/onboarding/enroll-admin-cli.js \
+  --admin-email you@example.com --admin-password-stdin \
+  --platform-admin --reason '<why>'
+```
+
+### Sign-in methods, and the placeholder that used to pass
+
+`keel_auth_methods: password` — this deployment offers password sign-in only.
+
+> ⚠️ It previously rendered `KEEL_OIDC_ISSUER=https://keel.dc1.lan/oidc/`: the
+> instance pointing at **itself**. Keel serves no OIDC endpoints, so no sign-in
+> could ever complete — but the production check was "non-empty and https", so it
+> booted and the console offered a "Continue with SSO" button that reached
+> discovery against its own SPA. A self-referential issuer is refused at boot now,
+> and declaring `password` is how an instance with no provider configures nothing
+> instead of inventing an issuer to get past a check.
+
+`keel_allow_public_registration: false` — `/auth/register` was public and
+unconditional, so anyone who could reach the gateway could create an account in
+this installation's permanent tenant. Closed in code by default; stated here so
+the rendered env file carries the posture rather than implying it by omission.
+
 ## Rollback
 
 ```bash

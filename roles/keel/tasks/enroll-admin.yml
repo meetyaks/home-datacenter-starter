@@ -1,0 +1,179 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# ENROLL THE FIRST HUMAN ADMINISTRATOR of the existing Keel tenant.
+#
+# Invoked by playbooks/enroll-admin.yml, which carries the password prompt:
+#
+#   ansible-playbook playbooks/enroll-admin.yml \
+#     -e keel_admin_email=you@example.com --ask-vault-pass --ask-become-pass
+#
+# ═══ WHY IT IS ITS OWN PLAYBOOK AND NOT A TAG ON THE DEPLOY ══════════════════
+#
+# It needs a password typed by a person, and it is a one-time act. `vars_prompt`
+# is evaluated BEFORE task selection, so a prompt living in playbooks/keel.yml
+# would ask for a password on every ordinary deploy — tags or not. Separating it
+# is what keeps the deploy unattended.
+#
+# ═══ WHERE THE PASSWORD GOES, AND WHERE IT DOES NOT ══════════════════════════
+#
+# It is read on the CONTROLLER with `vars_prompt` (echo off), and reaches the
+# managed host exactly once, as the STDIN of one command. It is therefore never:
+#
+#   · an argument         — `/proc/<pid>/cmdline`, `ps`, `docker inspect`
+#   · a file              — no temporary file is created at all, so there is
+#                            none to secure, none to forget and none to leak on
+#                            a crash between write and delete
+#   · an environment var  — `docker exec` env is readable via `docker inspect`
+#   · in shell history    — nothing is typed at a shell
+#   · in Ansible output   — `no_log` on the only task that touches it
+#
+# `keel-enroll-admin` itself refuses `--admin-password` when KEEL_ENV=production
+# for the same reasons, so this is the supported channel rather than a local
+# convention.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Require an email to enroll
+  ansible.builtin.assert:
+    that:
+      - keel_admin_email is defined
+      - keel_admin_email | length > 0
+      - keel_admin_email is match('^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$')
+    fail_msg: >-
+      Pass the administrator's address: -e keel_admin_email=you@example.com
+      This enrolls the first human administrator of the EXISTING tenant at
+      KEEL_DEFAULT_TENANT_ID. It never creates a tenant.
+    quiet: true
+
+- name: Require the password that was prompted for
+  # The prompt is on the play, so an empty answer means somebody pressed enter.
+  # Failing here is better than handing an empty string to the command and
+  # reading its policy refusal three layers down.
+  ansible.builtin.assert:
+    that:
+      - keel_admin_password is defined
+      - keel_admin_password | length > 0
+    fail_msg: >-
+      No password was supplied. Re-run and type one at the prompt; it is read
+      without echo and never written anywhere.
+    quiet: true
+  no_log: true
+
+- name: Confirm the gateway container is running
+  # The command needs the gateway's database credentials, which exist in that
+  # container's environment and nowhere else on this host. Checked first so a
+  # stopped stack is not reported as an enrollment failure.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - --format
+      - '{{ "{{" }}.State.Running{{ "}}" }}'
+      - "{{ keel_gateway_container }}"
+  register: keel_gateway_running
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: The gateway must be running to enroll
+  ansible.builtin.assert:
+    that:
+      - (keel_gateway_running.stdout | default('') | trim) == 'true'
+    fail_msg: >-
+      {{ keel_gateway_container }} is not running
+      ({{ keel_gateway_running.stdout | default('no such container') | trim }}).
+      Deploy the stack first — enrollment runs inside that container because the
+      database credentials live in its environment.
+    quiet: true
+
+- name: Report what a real run would enroll
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: would enroll {{ keel_admin_email }} as the first administrator
+      of the existing tenant, granting tenant admin and builder (no
+      platform_admin — that is a separate, explicitly reasoned act).
+      Nothing was created. The password was not used.
+  when: ansible_check_mode
+
+# ═══ THE ONE TASK THAT TOUCHES THE PASSWORD ═════════════════════════════════
+#
+# `docker exec -i` with the password on stdin. Two details carry the safety:
+#
+#   `-i` and `stdin:`      the value travels as data on a pipe, never as argv
+#   `no_log: true`         Ansible would otherwise echo `stdin` into the log on
+#                          a failure, which is exactly when a log is read
+#
+# `printf`-style trailing newline is deliberately NOT added: the command strips
+# at most one, and adding one here would make a password ending in whitespace
+# behave differently through Ansible than through a shell.
+- name: Enroll the first administrator
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -i
+      - "{{ keel_gateway_container }}"
+      - node
+      - packages/core/dist/onboarding/enroll-admin-cli.js
+      - --admin-email
+      - "{{ keel_admin_email }}"
+      - --admin-password-stdin
+      - --json
+      # ⚠️ NO `--platform-admin` HERE, DELIBERATELY. This path grants tenant
+      # admin + builder, which is what a first administrator needs. Installation-
+      # wide authority reaches every tenant and outlives whoever granted it, so it
+      # is a separate, deliberate act with its own recorded reason:
+      #
+      #   docker exec -i keel-lab-gateway node \
+      #     packages/core/dist/onboarding/enroll-admin-cli.js \
+      #     --admin-email you@example.com --admin-password-stdin \
+      #     --platform-admin --reason '<why>'
+      #
+      # An earlier draft made it a variable and padded argv with repeated --json
+      # to keep the list a fixed length. That is unreadable in `ps` and hides
+      # which grant was actually requested — worse than asking for one more
+      # command on the rare occasion it is wanted.
+      #
+      # The tenant comes from KEEL_DEFAULT_TENANT_ID inside the container — the
+      # same value bootstrap seeded the tenant at. Deliberately NOT passed from
+      # here: two sources for one permanent identity is how they drift.
+    stdin: "{{ keel_admin_password }}"
+    stdin_add_newline: false
+  register: keel_enrollment
+  no_log: true
+  changed_when: keel_enrollment.rc == 0
+  failed_when: false
+  when: not ansible_check_mode
+
+# The result is SAFE to show — the command prints ids and roles, never the
+# password — and showing it is the point: an operator needs to see which tenant
+# the administrator landed in.
+- name: Report the enrollment
+  ansible.builtin.debug:
+    msg: "{{ (keel_enrollment.stdout | default('{}') | from_json) }}"
+  when:
+    - not ansible_check_mode
+    - keel_enrollment.rc | default(1) == 0
+
+- name: Enrollment must have succeeded
+  ansible.builtin.assert:
+    that:
+      - keel_enrollment.rc | default(1) == 0
+    fail_msg: >-
+      Enrollment failed (exit {{ keel_enrollment.rc | default('?') }}).
+      {{ keel_enrollment.stderr | default('') | trim }}
+      —
+      The command is idempotent and refuses rather than half-applying, so it is
+      safe to correct the input and re-run. It never changes an existing
+      password: if this address already has one, rotate it deliberately instead.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: What to do next
+  ansible.builtin.debug:
+    msg:
+      - "Sign in at https://{{ keel_hostname }}/ with {{ keel_admin_email }}"
+      - "and the password you just typed. It was not written anywhere — if it is"
+      - "lost, enroll a different address rather than trying to recover this one."
+  when:
+    - not ansible_check_mode
+    - keel_enrollment.rc | default(1) == 0
