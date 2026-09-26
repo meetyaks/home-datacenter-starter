@@ -73,6 +73,20 @@ echo "══ runtime group scenarios (7, on a disposable Linux host) ═══�
 tests/run-runtime-group-scenarios.sh
 
 echo
+echo "══ rendered auth posture (password-only, registration closed) ═════"
+# Renders roles/keel/templates/keel.env.j2 with the role's OWN defaults and
+# asserts the posture it produces. Grepping the template would prove the lines
+# exist; only rendering proves which survive the `{% if %}`.
+ansible-playbook tests/env-render.yml
+
+echo
+echo "══ enrollment operator path (19 checks, executes the play) ═════════"
+# ⚠️ EXECUTES the play against a local stand-in host — never dc1-x86. The email
+# validator shipped rejecting EVERY valid address and passed --syntax-check,
+# because a syntax check does not evaluate a template.
+tests/run-enroll-admin-path.sh
+
+echo
 echo "══ platform version gate ═══════════════════════════════════════════"
 # ⚠️ READ THE PIN, DO NOT RESTATE IT. This used to carry its own copy of the
 # 40-character SHA, which meant the deployment pin lived in two hand-maintained

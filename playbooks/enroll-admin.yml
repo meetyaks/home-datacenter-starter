@@ -17,8 +17,11 @@
 # as the STDIN of one command. It is therefore never:
 #
 #   · an argument         — `/proc/<pid>/cmdline`, `ps`, `docker inspect`
-#   · a file              — none is created, so there is none to secure, none to
-#                            forget, and none to leak if the run dies midway
+#   · a file of our own   — this play creates none. Ansible itself stages module
+#                            arguments (including `stdin`) in an AnsiballZ payload
+#                            under a `umask 77` directory it removes immediately
+#                            after — protected, transient staging rather than an
+#                            absence. See roles/keel/tasks/enroll-admin.yml.
 #   · an environment var  — `docker exec` env is readable via `docker inspect`
 #   · in shell history    — nothing is typed at a shell
 #   · in Ansible output   — `no_log` on the only task that touches it

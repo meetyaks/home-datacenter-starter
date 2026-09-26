@@ -20,9 +20,20 @@
 # managed host exactly once, as the STDIN of one command. It is therefore never:
 #
 #   · an argument         — `/proc/<pid>/cmdline`, `ps`, `docker inspect`
-#   · a file              — no temporary file is created at all, so there is
-#                            none to secure, none to forget and none to leak on
-#                            a crash between write and delete
+#   · a file of our own   — this task creates none, so there is none to secure,
+#                            none to forget, and none to leak on a crash between
+#                            write and delete.
+#
+#                            ⚠️ ANSIBLE ITSELF STAGES ONE, and saying otherwise
+#                            would be false. Every module invocation writes its
+#                            arguments — including `stdin` — into an AnsiballZ
+#                            payload under the remote tmp directory. Measured at
+#                            -vvv: the directory is created with `umask 77`
+#                            (`drwx------`, owned by the connection user) and the
+#                            per-task subdirectory is removed with `rm -f -r`
+#                            immediately after the module returns. That is
+#                            Ansible's transient staging, protected and
+#                            short-lived — not an absence.
 #   · an environment var  — `docker exec` env is readable via `docker inspect`
 #   · in shell history    — nothing is typed at a shell
 #   · in Ansible output   — `no_log` on the only task that touches it
@@ -37,7 +48,13 @@
     that:
       - keel_admin_email is defined
       - keel_admin_email | length > 0
-      - keel_admin_email is match('^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$')
+      # ⚠️ `\S`, NOT `[:space:]`. Jinja's `match` is Python `re`, which has no POSIX classes — and
+      # worse, the unescaped `]` in `[^@[:space:]]` CLOSED the character class early, leaving a
+      # literal `]` that every address then had to contain. The old pattern rejected
+      # admin@example.com, you@company.com and bob@x.io alike: it could never enroll anyone.
+      # (enforced: tests/run-enroll-admin-path.sh, which EXECUTES this task rather than
+      #  syntax-checking it — the defect survived a syntax check)
+      - keel_admin_email is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
     fail_msg: >-
       Pass the administrator's address: -e keel_admin_email=you@example.com
       This enrolls the first human administrator of the EXISTING tenant at

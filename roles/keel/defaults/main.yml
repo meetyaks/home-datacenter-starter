@@ -15,9 +15,24 @@
 # version identity this deployment has: the image tag, the build directory and
 # the manifest all derive from it, and the role refuses to build if the archive
 # it received does not carry this exact value.
-keel_commit: a6b2a40b6bf75e105b08f8436d31125c52c1226e
+# ⚠️ THIS PIN AND THIS ROLE'S CONFIGURATION MOVE TOGETHER.
+#
+# It pointed at a6b2a40b (PR #10's head) while this role already rendered
+# KEEL_AUTH_METHODS=password and omitted KEEL_OIDC_*. Against that commit the
+# combination is a guaranteed outage, not a mismatch to tidy up later:
+#
+#   · a6b2a40b's validator requires OIDC unconditionally, so assertProductionSafe
+#     refuses and the gateway crash-loops
+#   · packages/core/dist/onboarding/enroll-admin-cli.js does not exist there, so
+#     the enrollment play fails with exit 127 — reproduced, not predicted
+#
+# Verified present at the commit below: the enrollment CLI, the auth-methods
+# route, password-only validator support (authMethodsOf /
+# oidcIssuerIsSelfReferential), and a compose file that no longer hard-requires
+# the KEEL_OIDC_* variables.
+keel_commit: 1e04c4ad93047ae5ac9606f5bd0593729ac6417e
 
-# Derived. `sha-a6b2a40b` — short enough to read, long enough to be unambiguous.
+# Derived. `sha-1e04c4ad` — short enough to read, long enough to be unambiguous.
 keel_commit_short: "{{ keel_commit[:8] }}"
 keel_image_tag: "sha-{{ keel_commit_short }}"
 keel_gateway_image: "keel-gateway:{{ keel_image_tag }}"
