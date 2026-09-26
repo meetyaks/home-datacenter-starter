@@ -40,7 +40,7 @@ echo "══ remote image check (runs on the managed host, list as data) ══�
 tests/run-remote-image-check.sh
 
 echo
-echo "══ ingress ownership (24 static checks) ═══════════════════════════"
+echo "══ ingress ownership (25 static checks) ═══════════════════════════"
 # One owner for Caddy, provisioned before Keel, and a route that does not try
 # to split ~80 gateway prefixes from the SPA's router by path.
 tests/run-ingress-ownership.sh

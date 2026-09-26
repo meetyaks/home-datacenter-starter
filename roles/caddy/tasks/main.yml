@@ -65,8 +65,12 @@
 
 - name: Report the installed version
   ansible.builtin.debug:
+    # `stdout_lines`, NOT `stdout.split('\n')`. This is a FOLDED (`>-`) scalar,
+    # where YAML leaves `\n` as a literal backslash-n — so the split matches
+    # nothing, returns the whole string as element 0, and prints `caddy
+    # version`'s second build line along with it. Measured: 1 element vs 2.
     msg: >-
-      Caddy {{ (caddy_installed_version.stdout | default('(unknown)')).split('\n')[0] }}
+      Caddy {{ (caddy_installed_version.stdout_lines | default(['(unknown)']))[0] }}
       ({{ 'pinned to ' ~ caddy_version if caddy_version | length > 0
           else 'version policy: install-once from stable, never auto-upgraded' }})
 

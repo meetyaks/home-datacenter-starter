@@ -201,6 +201,38 @@ else
   ok "no task disables TLS verification (comments about it do not count)"
 fi
 
+# ── 5b. No folded scalar splits on a literal backslash-n ───────────────────
+#
+# In a FOLDED (`>-`) or PLAIN scalar, YAML leaves `\n` as two characters, so
+# `.split('\n')` matches nothing and returns the whole string as one element.
+# In a DOUBLE-QUOTED scalar YAML turns it into a real newline and the same
+# expression is correct — which is why this keeps coming back: the identical
+# line is right in one place and wrong three lines away.
+#
+# Measured, not assumed: on a two-line value the folded form yields 1 element,
+# `splitlines()` yields 2.
+echo
+echo "── 5b. no folded scalar splits on a literal backslash-n ──"
+
+folded_split=0
+for f in $(find roles playbooks -name '*.yml' 2>/dev/null); do
+  # A `\n` split is only safe on a line whose value is double-quoted. Anything
+  # else — folded, literal or plain — gets the literal two characters.
+  while IFS= read -r hit; do
+    lineno=${hit%%:*}
+    body=${hit#*:}
+    # Skip comments, and skip `msg: "…"` / `loop: "…"` double-quoted values.
+    case "$body" in
+      *'#'*split*) continue ;;
+    esac
+    printf '%s' "$body" | grep -qE ':[[:space:]]*"' && continue
+    bad "no literal-backslash-n split: $f:$lineno" "folded/plain scalar — the split matches nothing"
+    printf '           %s\n' "$(printf '%s' "$body" | sed 's/^[[:space:]]*//')"
+    folded_split=$((folded_split + 1))
+  done < <(grep -nF ".split('\\n')" "$f" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#')
+done
+[ "$folded_split" -eq 0 ] && ok "every \\n split sits in a double-quoted scalar, where YAML makes it a newline"
+
 # ── 5. Every "enforced:" citation names a test that exists ─────────────────
 #
 # A claim that cites its enforcer is only worth anything while the enforcer is
