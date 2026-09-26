@@ -1,0 +1,106 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Everything that must be true BEFORE anything is created. Each check exists
+# because its absence produces a confusing failure later rather than here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Confirm the target is x86-64
+  ansible.builtin.assert:
+    that:
+      - ansible_architecture == 'x86_64'
+    fail_msg: >-
+      dc1-ci-1 must be x86-64: the runner tarball, the Actions runner itself and
+      the linux/amd64 images the integration lane builds are all architecture
+      specific. Got {{ ansible_architecture }}.
+    quiet: true
+
+- name: Confirm hardware virtualisation is available
+  # An LXD VM needs KVM. Without it LXD silently falls back to nothing usable,
+  # and a CONTAINER would share the host kernel — which is exactly the boundary
+  # this role exists to create.
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: ci_kvm
+
+- name: /dev/kvm must exist
+  ansible.builtin.assert:
+    that:
+      - ci_kvm.stat.exists | default(false)
+    fail_msg: >-
+      /dev/kvm is absent, so LXD cannot start a virtual machine. A container
+      would share the host kernel and could not be called isolated from
+      production — this role refuses to degrade to one silently.
+    quiet: true
+
+- name: Read the LXD version
+  ansible.builtin.command:
+    argv: [lxd, version]
+  register: ci_lxd_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: LXD must be installed
+  ansible.builtin.assert:
+    that:
+      - ci_lxd_version.rc == 0
+    fail_msg: >-
+      `lxd` is not available on {{ inventory_hostname }}. Install it before
+      running this role; provisioning a hypervisor is a host-lifecycle decision
+      and not something a CI role should take on its own.
+    quiet: true
+
+- name: Find out what already uses LXD on this host
+  # ⚠️ THIS ROLE INITIALISES LXD, which is only defensible because nothing else
+  # owns it. Inspection found no pools, no managed networks and no instances. If
+  # that has changed, another owner exists and initialising would be taking over
+  # somebody else's hypervisor.
+  ansible.builtin.command:
+    argv: [lxc, list, --format, csv]
+  register: ci_lxd_instances
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: No instance may exist that this role did not create
+  ansible.builtin.assert:
+    that:
+      - (ci_lxd_instances.stdout_lines | reject('search', '^' ~ ci_vm_name ~ ',') | list | length) == 0
+    fail_msg: >-
+      LXD on {{ inventory_hostname }} already holds instances this role does not
+      own: {{ ci_lxd_instances.stdout_lines | reject('search', '^' ~ ci_vm_name ~ ',') | list }}.
+      Someone else is using this hypervisor. Stop and establish ownership rather
+      than reconfiguring it underneath them.
+    quiet: true
+
+- name: Confirm the volume group has room for the CI volume
+  ansible.builtin.command:
+    argv: [vgs, --noheadings, --nosuffix, --units, g, -o, vg_free, "{{ ci_vg_name }}"]
+  register: ci_vg_free
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: The volume group must have room, with a reserve left over
+  # Checked BEFORE `lvcreate` so "not enough space" arrives as a sentence rather
+  # than as a half-made volume. The reserve is the point: a production host with
+  # a full VG cannot grow /srv/data or take a snapshot.
+  ansible.builtin.assert:
+    that:
+      - (ci_vg_free.stdout | default('0') | trim | float) >= (ci_lv_size | regex_replace('[gG]$', '') | float)
+    fail_msg: >-
+      {{ ci_vg_name }} has {{ ci_vg_free.stdout | default('?') | trim }} GiB free,
+      which is less than the {{ ci_lv_size }} this role wants. Reduce ci_lv_size
+      rather than consuming the last extents of a production volume group.
+    success_msg: >-
+      {{ ci_vg_name }} has {{ ci_vg_free.stdout | default('?') | trim }} GiB free;
+      taking {{ ci_lv_size }} leaves a reserve.
+    quiet: true
+  when: ci_vg_free.rc == 0
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ ci_vm_name }}: {{ ci_vm_cpu }} vCPU, {{ ci_vm_memory }},
+      {{ ci_vm_root_size }} root on a dedicated {{ ci_lv_size }} volume;
+      labels [{{ ci_runner_labels }}]; scoped to {{ ci_runner_scope_url }}.

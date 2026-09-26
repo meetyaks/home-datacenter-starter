@@ -1,0 +1,146 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REGISTRATION — the one step that carries a credential, kept out of the main
+# provisioning flow on purpose.
+#
+# ⚠️ WHY THIS IS NOT PART OF `main.yml`. A GitHub runner registration token is
+# minted by a human in the repository's settings, is single-use and expires in
+# an hour. Wiring it into ordinary provisioning would mean either storing a
+# long-lived credential that can mint them — inside the machine that runs
+# untrusted code, which is the one place it must never be — or breaking every
+# routine re-run of the role. So provisioning is unattended and repeatable, and
+# registration is an explicit, tagged, operator-initiated act.
+#
+#   ansible-playbook playbooks/ci-runner.yml --tags register -e ci_runner_token=…
+#
+# The token reaches the guest ON STDIN. It is never written to disk on either
+# machine, never an argument to `lxc exec`, and the task that carries it is
+# `no_log`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: A registration token must be supplied
+  ansible.builtin.assert:
+    that:
+      - ci_runner_token is defined
+      - (ci_runner_token | default('') | trim | length) > 10
+    fail_msg: >-
+      No registration token. Generate a one-time token at
+      {{ ci_runner_scope_url }}/settings/actions/runners/new?arch=x64&os=linux
+      and pass it for this run only:
+      ansible-playbook playbooks/ci-runner.yml --tags register -e ci_runner_token=<token>
+    # ⚠️ `quiet` AND the length-only condition together are what keep the token
+    # out of the output. An assertion that printed the value it checked would
+    # defeat the entire stdin-only discipline in its error path.
+    quiet: true
+
+- name: The guest must already be provisioned
+  # Registering into a VM without the runner binaries produces a confusing
+  # `config.sh: not found`; this names the actual cause.
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", test, -x, "{{ ci_runner_dir }}/config.sh"]
+  register: ci_runner_present
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Refuse to register an unprovisioned guest
+  ansible.builtin.assert:
+    that: ci_runner_present.rc == 0
+    fail_msg: >-
+      {{ ci_vm_name }} has no runner installed at {{ ci_runner_dir }}.
+      Run the role without --tags first.
+    quiet: true
+
+- name: A staging directory for the registration script
+  # tasks/guest.yml removes this at the end of provisioning, and this entry
+  # point runs on its own, so it cannot assume the directory survives.
+  ansible.builtin.file:
+    path: "{{ ci_stage_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Stage the registration script on the host
+  ansible.builtin.template:
+    src: guest-register.sh.j2
+    dest: "{{ ci_stage_dir }}/register.sh"
+    mode: "0700"
+    validate: /bin/bash -n %s
+  # The SCRIPT holds no token — only the shape of the call — so this task is
+  # not no_log, and its diff stays reviewable.
+
+- name: Push the registration script into the guest
+  ansible.builtin.command:
+    argv:
+      - lxc
+      - file
+      - push
+      - "{{ ci_stage_dir }}/register.sh"
+      - "{{ ci_vm_name }}/root/register.sh"
+      - --mode=0700
+      - --uid=0
+      - --gid=0
+  changed_when: true
+
+- name: Register the runner
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", /root/register.sh]
+    # THE ONLY PLACE THE TOKEN EXISTS IN THIS PLAY. `-T` above disables pty
+    # allocation, which is what makes `lxc exec` pipe this straight through to
+    # the script's stdin.
+    stdin: "{{ ci_runner_token }}"
+    stdin_add_newline: true
+  register: ci_register
+  # ⚠️ NOT NEGOTIABLE. Without this the token appears in -v output, in any
+  # callback plugin and in AWX/Ansible logs. The result is unwrapped in the
+  # next task, which is safe because the script prints no token.
+  no_log: true
+  changed_when: "'CHANGED:' in ci_register.stdout"
+
+- name: Remove the staged registration script
+  ansible.builtin.file:
+    path: "{{ ci_stage_dir }}/register.sh"
+    state: absent
+
+- name: Remove it from the guest too
+  # It contains no secret, but a script whose whole purpose is to consume a
+  # registration token has no reason to stay on disk in the CI VM.
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", rm, -f, /root/register.sh]
+    # Not conditional on the registration succeeding — a failed attempt is
+    # exactly when it must not be left behind.
+  changed_when: false
+
+- name: What registration reported
+  ansible.builtin.debug:
+    var: ci_register.stdout_lines
+
+# ── Proof, not assumption ───────────────────────────────────────────────────
+- name: Read the runner service state
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", /bin/sh, -c,
+           "systemctl is-active 'actions.runner.*' 2>/dev/null | head -1"]
+  register: ci_svc_state
+  changed_when: false
+  check_mode: false
+
+- name: The runner service must be active
+  ansible.builtin.assert:
+    # ⚠️ EXACT EQUALITY, NOT A SUBSTRING. `systemctl is-active` prints the word
+    # "inactive" when it is not running, and "inactive" contains "active" — a
+    # grep-style check here passes on precisely the failure it exists to catch.
+    that:
+      - (ci_svc_state.stdout | trim) == 'active'
+    fail_msg: >-
+      The runner service is '{{ ci_svc_state.stdout | trim }}', not 'active'.
+      Inspect with: lxc exec {{ ci_vm_name }} -- journalctl -u 'actions.runner.*' -n 50
+    quiet: true
+
+- name: Registered
+  ansible.builtin.debug:
+    msg:
+      - "{{ ci_runner_name }} is registered to {{ ci_runner_scope_url }} and its service is active."
+      - "Labels: {{ ci_runner_labels }}"
+      - "Ephemeral: {{ ci_runner_ephemeral }}"
+      - "Confirm it shows Idle at {{ ci_runner_scope_url }}/settings/actions/runners"

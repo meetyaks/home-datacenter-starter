@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# MANAGED BY roles/ci_runner — ACTIONS_RUNNER_HOOK_JOB_STARTED.
+#
+# Runs in the guest, as {{ ci_runner_user }}, before every job's first step.
+# Two jobs: give the job a clean workspace, and REFUSE TO RUN if the isolation
+# this whole role exists for has been undone.
+set -uo pipefail
+
+RUNNER_WORK='{{ ci_runner_work }}'
+CACHE_DIR='{{ ci_runner_cache_dir }}'
+
+fail() { echo "::error title=CI isolation::$*"; exit 1; }
+
+# ── The isolation self-check ────────────────────────────────────────────────
+#
+# ⚠️ THIS IS THE RUNTIME HALF OF THE ISOLATION CLAIM. tests/ proves the VM is
+# built without a path to production; this proves it at the moment code is about
+# to run, which is the only moment that matters. If someone adds a bind-mount to
+# "just share the pnpm cache", the next job fails here instead of quietly
+# handing the repository's own CI a copy of the lab's JWT signing key.
+[ -e /srv/data ]            && fail "/srv/data is visible inside the CI VM. A host path has been mounted in. Refusing to run."
+[ -S /var/run/docker.sock ] || fail "no Docker socket in the guest — the CI daemon is not running."
+
+# The guest's own socket must be the guest's. A host socket bind-mounted in
+# would answer with the HOST's containers, production Keel among them.
+if command -v docker >/dev/null 2>&1; then
+  names="$(docker ps --format '{{ '{{' }}.Names{{ '}}' }}' 2>/dev/null || true)"
+  case "$names" in
+    *keel-gateway*|*keel-postgres*|*keel-caddy*|*keel-minio*)
+      fail "production Keel containers are visible from the CI runner. Refusing to run." ;;
+  esac
+fi
+
+# Production must be unreachable by ADDRESS as well as by mount. The host's own
+# LAN address runs Caddy on 443 and is inside 10.0.0.0/24, which the host's
+# `inet ci_egress` table drops. Reaching it would mean the policy is not loaded
+# — so this checks the control is in force instead of assuming it.
+#
+# `/dev/tcp` with a timeout, not curl: no dependency, and a DROP shows up as the
+# timeout rather than a connection refused.
+for hp in {% for p in ci_isolation_denied_probes %}'{{ p }}' {% endfor %}; do
+  host="${hp%:*}"; port="${hp##*:}"
+  if timeout 4 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+    fail "${hp} answered from inside the CI VM. The host egress policy is not in force."
+  fi
+done
+
+# ── A clean workspace ───────────────────────────────────────────────────────
+#
+# Every repository checkout directory is removed, so no job inherits another
+# job's files, node_modules, containers-under-test or stray credentials. The
+# runner's own caches (_actions, _tool) and the pnpm store are kept: they hold
+# no job state, and rebuilding them every run would triple the cycle time.
+if [ -d "$RUNNER_WORK" ]; then
+  find "$RUNNER_WORK" -mindepth 1 -maxdepth 1 \
+    ! -name '_actions' ! -name '_tool' ! -name '_temp' \
+    -exec rm -rf {} + 2>/dev/null
+  rm -rf "${RUNNER_WORK:?}/_temp/"* 2>/dev/null
+fi
+
+mkdir -p "$CACHE_DIR/pnpm"
+echo "CI isolation checks passed; workspace reset."

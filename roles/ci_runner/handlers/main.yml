@@ -1,0 +1,14 @@
+---
+- name: Reload the CI egress policy
+  # Delete-then-load rather than a plain load: nft `-f` ADDS to an existing
+  # table, so reloading a policy whose deny rules had been removed would leave
+  # the old ones in place and report success.
+  ansible.builtin.shell:
+    cmd: >-
+      nft delete table inet ci_egress 2>/dev/null || true;
+      nft -f /etc/nftables.d/ci-egress.nft
+  changed_when: true
+
+- name: Reload systemd for the egress unit
+  ansible.builtin.systemd_service:
+    daemon_reload: true

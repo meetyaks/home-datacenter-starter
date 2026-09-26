@@ -1,0 +1,46 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# A DEDICATED LOGICAL VOLUME, AND NOT A DIRECTORY ON /srv/data.
+#
+# /srv/data holds production Keel's database, object store and secrets. Putting
+# the CI pool there would mean a runaway job's disk use lands on the production
+# data volume, and CI I/O competes with production I/O on the same filesystem.
+# A separate LV gives a hard capacity boundary the kernel enforces.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Create the CI logical volume
+  community.general.lvol:
+    vg: "{{ ci_vg_name }}"
+    lv: "{{ ci_lv_name }}"
+    size: "{{ ci_lv_size }}"
+    state: present
+    # ⚠️ NEVER shrink or resize implicitly. `resizefs` and a smaller size would
+    # silently destroy data on a re-run with a changed variable.
+    resizefs: false
+  register: ci_lvol
+
+- name: Put a filesystem on it
+  community.general.filesystem:
+    fstype: ext4
+    dev: "/dev/{{ ci_vg_name }}/{{ ci_lv_name }}"
+    # `force: false` is the default and is load-bearing: it refuses to overwrite
+    # an existing filesystem, so a re-run cannot erase the CI pool.
+    force: false
+
+- name: Mount it, and record it in fstab so a reboot keeps the runner
+  ansible.posix.mount:
+    path: "{{ ci_lv_mount }}"
+    src: "/dev/{{ ci_vg_name }}/{{ ci_lv_name }}"
+    fstype: ext4
+    opts: defaults,noatime
+    state: mounted
+
+- name: Only root may read the CI pool from the host side
+  # The pool holds the VM's disk image. Anything that can read it can read the
+  # guest's whole filesystem, so it is not group- or world-readable.
+  ansible.builtin.file:
+    path: "{{ ci_lv_mount }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"

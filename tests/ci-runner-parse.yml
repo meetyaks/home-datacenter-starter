@@ -1,0 +1,39 @@
+---
+# Parse every ci_runner entry point.
+#
+# ⚠️ `import_role`, NOT `include_role`. An import is STATIC: `--syntax-check`
+# parses the task files and fails on a malformed one. The dynamic include the
+# real playbook uses is resolved at run time, so a syntax error in
+# register.yml or rebuild.yml would sit undetected until the day an operator
+# reaches for it — which is the worst possible day to discover it.
+#
+# `when: false` keeps every task from executing while still parsing the files.
+- name: Parse the ci_runner task files
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Main provisioning flow
+      ansible.builtin.import_role:
+        name: ci_runner
+      when: false
+
+    - name: Registration
+      ansible.builtin.import_role:
+        name: ci_runner
+        tasks_from: register.yml
+      when: false
+
+    - name: Removal
+      ansible.builtin.import_role:
+        name: ci_runner
+        tasks_from: unregister.yml
+      when: false
+
+    - name: Rebuild
+      ansible.builtin.import_role:
+        name: ci_runner
+        tasks_from: rebuild.yml
+      when: false

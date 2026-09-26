@@ -1,0 +1,121 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# INSIDE dc1-ci-1: Docker, the unprivileged service account, the pinned runner
+# binaries, and the per-job hygiene hooks.
+#
+# ⚠️ EVERYTHING HERE GOES THROUGH `lxc exec`, NOT SSH. The CI VM runs no sshd,
+# so it has no inbound listener to attack, no host key to manage and no account
+# with remote login. Administration is the host's `lxc exec`, which already
+# requires root on dc1-x86 — the same privilege that could read the VM's disk
+# directly, so it grants nothing new.
+#
+# The scripts are rendered on the HOST and pushed in. The guest never fetches
+# its own configuration, so nothing inside the VM decides what the VM may be.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: A staging directory for the guest scripts
+  ansible.builtin.file:
+    path: "{{ ci_stage_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Stage the guest scripts on the host
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ ci_stage_dir }}/{{ item.dest }}"
+    mode: "0700"
+    # `bash -n` catches a template that renders to a syntax error BEFORE it is
+    # pushed into the guest and run as root there. A hook with an unbalanced
+    # quote would otherwise surface as every future job failing in its first
+    # second, with the cause three layers away.
+    validate: /bin/bash -n %s
+  loop:
+    - { src: guest-provision.sh.j2,    dest: provision.sh }
+    - { src: job-hook-started.sh.j2,   dest: job-started.sh }
+    - { src: job-hook-completed.sh.j2, dest: job-completed.sh }
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Stage the runner environment file
+  ansible.builtin.template:
+    src: runner.env.j2
+    dest: "{{ ci_stage_dir }}/runner.env"
+    mode: "0600"
+
+- name: Push the provisioning script into the guest
+  ansible.builtin.command:
+    argv:
+      - lxc
+      - file
+      - push
+      - "{{ ci_stage_dir }}/provision.sh"
+      - "{{ ci_vm_name }}/root/provision.sh"
+      - --mode=0700
+      - --uid=0
+      - --gid=0
+  changed_when: true
+
+- name: Provision the guest
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", /root/provision.sh]
+  register: ci_provision
+  # The script prints `CHANGED: <what>` for what it altered and nothing
+  # otherwise, so a converged re-run reports ok instead of the permanent yellow
+  # that trains an operator to stop reading the output.
+  changed_when: "'CHANGED:' in ci_provision.stdout"
+
+- name: What provisioning did
+  ansible.builtin.debug:
+    var: ci_provision.stdout_lines
+
+- name: Push the per-job hooks into the guest
+  # root:root 0755 — see the hook-directory comment in the provisioning script.
+  # The runner executes these; it must not be able to edit them.
+  ansible.builtin.command:
+    argv:
+      - lxc
+      - file
+      - push
+      - "{{ ci_stage_dir }}/{{ item }}"
+      - "{{ ci_vm_name }}{{ ci_runner_hook_dir }}/{{ item }}"
+      - --mode=0755
+      - --uid=0
+      - --gid=0
+  loop:
+    - job-started.sh
+    - job-completed.sh
+  changed_when: true
+
+- name: Push the runner environment file into the guest
+  # ⚠️ THIS FILE IS WHAT WIRES THE HOOKS TO THE RUNNER. Without it the cleanup
+  # scripts sit on disk doing nothing: the VM would look provisioned and clean
+  # up after nothing.
+  ansible.builtin.command:
+    argv:
+      - lxc
+      - file
+      - push
+      - "{{ ci_stage_dir }}/runner.env"
+      - "{{ ci_vm_name }}{{ ci_runner_dir }}/.env"
+      - --mode=0644
+      - --uid=0
+      - --gid=0
+  changed_when: true
+
+- name: Give the runner its environment file back
+  # Pushed as root, then handed over — `lxc file push --uid` wants a numeric id
+  # the controller does not know, and looking it up to pass it back in is a
+  # round trip to learn something the guest already knows.
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--",
+           chown, "{{ ci_runner_user }}:{{ ci_runner_user }}", "{{ ci_runner_dir }}/.env"]
+  changed_when: false
+
+- name: Remove the staged copies from the host
+  # They are rendered configuration, not state. Leaving them on dc1-x86 gives a
+  # second place for the guest's setup to drift from the role that owns it.
+  ansible.builtin.file:
+    path: "{{ ci_stage_dir }}"
+    state: absent

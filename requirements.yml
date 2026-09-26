@@ -3,3 +3,11 @@ collections:
   - name: community.general
     version: ">=10.0.0"
 
+  # roles/ci_runner mounts the CI logical volume with ansible.posix.mount.
+  # It ships with most Ansible installations, which is exactly why it has to be
+  # declared: an undeclared dependency that happens to be present works until
+  # the first controller where it is not, and then fails as "module not found"
+  # against a host that is already halfway provisioned.
+  - name: ansible.posix
+    version: ">=1.5.0"
+

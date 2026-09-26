@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# MANAGED BY roles/ci_runner — runs inside {{ ci_vm_name }}, as root.
+#
+# ⚠️ THE TOKEN ARRIVES ON STDIN AND NOWHERE ELSE. Not in this file, not in the
+# `lxc exec` argument vector, not in an environment variable, not in a file on
+# either machine. It is therefore absent from `ps` on dc1-x86, from the host's
+# shell history and from Ansible's recorded task arguments — and the one task
+# that carries it is `no_log`.
+#
+# The single place it becomes an argument is `config.sh --token` in this guest,
+# for the seconds that call runs. GitHub's runner offers no stdin form; that
+# residue is inside the VM that is already entitled to use the token, and the
+# token is single-use and expires within the hour.
+set -euo pipefail
+
+RUNNER_USER='{{ ci_runner_user }}'
+RUNNER_DIR='{{ ci_runner_dir }}'
+RUNNER_WORK='{{ ci_runner_work }}'
+
+IFS= read -r TOKEN || true
+if [ -z "${TOKEN:-}" ]; then
+  echo "FATAL: no registration token on stdin." >&2
+  exit 1
+fi
+
+cd "$RUNNER_DIR"
+
+if [ -f .runner ]; then
+  # Already configured. Re-running must not silently re-register under a new
+  # identity — that leaves an orphaned offline runner in the repository's list
+  # and makes 'which machine ran this job' unanswerable.
+  echo "OK: already configured as $(jq -r '.agentName // "?"' .runner 2>/dev/null || echo '?')"
+  echo "    To re-register, run the unregister entry point first."
+  exit 0
+fi
+
+runuser -u "$RUNNER_USER" -- ./config.sh \
+  --unattended \
+  --url '{{ ci_runner_scope_url }}' \
+  --token "$TOKEN" \
+  --name '{{ ci_runner_name }}' \
+  --labels '{{ ci_runner_labels }}' \
+  --work "$RUNNER_WORK" \
+  --replace \
+{% if ci_runner_ephemeral | bool %}
+  --ephemeral \
+{% endif %}
+  --disableupdate
+unset TOKEN
+
+# ⚠️ `--disableupdate` IS NOT LAZINESS. A self-updating runner replaces its own
+# binaries from the internet outside this role's control, which would silently
+# void the pinned-and-SHA-256-verified install the provisioning script just
+# made. Upgrades happen by changing ci_runner_version and re-running.
+
+# The service runs AS the unprivileged account; `svc.sh install` only needs root
+# to write the unit.
+./svc.sh install "$RUNNER_USER"
+./svc.sh start
+
+echo "CHANGED: registered {{ ci_runner_name }} with labels {{ ci_runner_labels }}"

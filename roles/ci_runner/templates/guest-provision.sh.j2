@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# MANAGED BY roles/ci_runner — edits inside the guest are overwritten.
+#
+# Everything in this script runs INSIDE {{ ci_vm_name }}. It exists as a script
+# rather than as Ansible tasks because the guest has no inbound listener for
+# Ansible to connect to: it is reached only through `lxc exec` from the host, so
+# the modules that would normally do this (apt, user, unarchive) cannot run
+# against it. The trade-off is deliberate — no sshd in the CI VM at all beats
+# prettier task output.
+#
+# It is idempotent, and prints `CHANGED: <what>` for anything it actually
+# altered so the calling task can report honestly instead of always-changed.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+RUNNER_USER='{{ ci_runner_user }}'
+RUNNER_HOME='{{ ci_runner_home }}'
+RUNNER_DIR='{{ ci_runner_dir }}'
+RUNNER_WORK='{{ ci_runner_work }}'
+RUNNER_VERSION='{{ ci_runner_version }}'
+RUNNER_URL='{{ ci_runner_url }}'
+RUNNER_TARBALL='{{ ci_runner_tarball }}'
+RUNNER_SHA256='{{ ci_runner_sha256 }}'
+CACHE_DIR='{{ ci_runner_cache_dir }}'
+LOG_DIR='{{ ci_runner_log_dir }}'
+HOOK_DIR='{{ ci_runner_hook_dir }}'
+RETAIN_DAYS='{{ ci_runner_log_retain_days }}'
+DIST_DIR=/opt/ci-dist
+
+note() { echo "CHANGED: $*"; }
+
+# ── 1. Base packages ────────────────────────────────────────────────────────
+#
+# ⚠️ A GITHUB-HOSTED `ubuntu-latest` IMAGE IS NOT A BARE UBUNTU. It ships with a
+# large toolchain preinstalled, and a workflow written against it depends on
+# that toolchain without ever naming it. These are the ones Keel's lanes reach
+# for and an LXD `ubuntu:24.04` image does not have:
+#
+#   postgresql-client  `psql -f infra/dev/postgres/init.sql` bootstraps the lane
+#   build-essential    native node modules compile during pnpm install
+#   python3            node-gyp's interpreter
+#   unzip, zstd        actions/setup-node's tool cache unpacks with both
+#
+# Missing any of them is a lane that fails deep inside an unrelated step, which
+# is why they are installed rather than discovered.
+need_base=()
+for p in curl ca-certificates gnupg jq git rsync logrotate \
+         postgresql-client build-essential python3 unzip zstd; do
+  dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' || need_base+=("$p")
+done
+# ⚠️ EMPTINESS IS TESTED BY JOINING, NOT BY LENGTH. This file is a Jinja
+# template first and a shell script second, and bash's array-LENGTH syntax opens
+# with the two characters Jinja reads as "start of comment" — so using it makes
+# the render die with "Missing end of comment tag", pointing at a line that is
+# perfectly good shell. (Writing that sequence in this comment breaks it too,
+# which is why the comment describes it instead of quoting it.)
+if [ -n "${need_base[*]:-}" ]; then
+  apt-get update -qq
+  apt-get install -y -qq "${need_base[@]}"
+  note "installed base packages: ${need_base[*]}"
+fi
+
+# ── 2. Docker, from Docker's own repository ─────────────────────────────────
+#
+# The distro's docker.io has no `docker compose` v2 plugin, and Keel's
+# integration lane is compose-driven. This daemon is the GUEST's: it is not the
+# host's socket, and nothing about it can reach production containers.
+if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  note "added the Docker apt keyring"
+fi
+
+codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+docker_list="deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable"
+if [ "$(cat /etc/apt/sources.list.d/docker.list 2>/dev/null || true)" != "$docker_list" ]; then
+  echo "$docker_list" > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  note "configured the Docker apt repository"
+fi
+
+need_docker=()
+for p in docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; do
+  dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' || need_docker+=("$p")
+done
+if [ -n "${need_docker[*]:-}" ]; then
+  apt-get install -y -qq "${need_docker[@]}"
+  note "installed Docker: ${need_docker[*]}"
+fi
+systemctl is-enabled --quiet docker || { systemctl enable --now docker; note "enabled docker"; }
+
+# ── 3. The service account ──────────────────────────────────────────────────
+#
+# ⚠️ UNPRIVILEGED, AND DELIBERATELY NOT IN `sudo`. A runner user with sudo is a
+# root user with extra steps: any job could then install a kernel module, read
+# the guest's whole disk, or disable the guest-side hygiene below. It IS in
+# `docker`, which is root-equivalent INSIDE THIS VM — that is the cost of a
+# compose-driven test lane, and it is why the VM boundary, not the user
+# boundary, is what keeps production safe.
+if ! id -u "$RUNNER_USER" >/dev/null 2>&1; then
+  useradd --create-home --home-dir "$RUNNER_HOME" --shell /bin/bash "$RUNNER_USER"
+  note "created the $RUNNER_USER service account"
+fi
+id -nG "$RUNNER_USER" | tr ' ' '\n' | grep -qx docker \
+  || { usermod -aG docker "$RUNNER_USER"; note "added $RUNNER_USER to docker"; }
+
+# A guard, not a comment: if anyone ever grants it sudo, provisioning fails loudly.
+if id -nG "$RUNNER_USER" | tr ' ' '\n' | grep -qxE 'sudo|admin|root'; then
+  echo "FATAL: $RUNNER_USER is in an administrative group: $(id -nG "$RUNNER_USER")" >&2
+  exit 1
+fi
+
+# ── 4. Directories that survive a job, and one that does not ────────────────
+#
+# CACHE_DIR is outside _work on purpose: the completed-job hook wipes the
+# workspace, and a pnpm store inside it would make every job a cold install.
+for d in "$CACHE_DIR" "$CACHE_DIR/pnpm" "$RUNNER_WORK"; do
+  [ -d "$d" ] || { install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0750 "$d"; note "created $d"; }
+done
+[ -d "$LOG_DIR" ] || { install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0750 "$LOG_DIR"; note "created $LOG_DIR"; }
+[ -d "$DIST_DIR" ] || { install -d -o root -g root -m 0755 "$DIST_DIR"; note "created $DIST_DIR"; }
+
+# ⚠️ THE HOOK DIRECTORY IS ROOT'S, NOT THE RUNNER'S. The hooks are the cleanup
+# and the isolation self-check. If $RUNNER_USER could write here, any job could
+# disable both on its way past — so the runner may execute them and not alter
+# them.
+[ -d "$HOOK_DIR" ] || { install -d -o root -g root -m 0755 "$HOOK_DIR"; note "created $HOOK_DIR"; }
+
+# ── 4b. Log retention ───────────────────────────────────────────────────────
+rotate_conf="$(printf '%s/*/*.log {\n  rotate 4\n  weekly\n  compress\n  delaycompress\n  missingok\n  notifempty\n  copytruncate\n}\n' "$LOG_DIR")"
+if [ "$(cat /etc/logrotate.d/ci-runner 2>/dev/null || true)" != "$rotate_conf" ]; then
+  printf '%s' "$rotate_conf" > /etc/logrotate.d/ci-runner
+  chmod 0644 /etc/logrotate.d/ci-runner
+  note "installed the ci-runner logrotate policy (${RETAIN_DAYS}d directory retention is the job hook's)"
+fi
+
+# ── 5. The runner binaries — pinned, and checked ────────────────────────────
+#
+# ⚠️ THE SHA-256 IS THE POINT. `curl | tar` trusts whatever the release page
+# serves at download time. A withdrawn or substituted artefact has already
+# stopped one Keel deployment in this lab; a verified digest turns that class of
+# surprise into a failed task.
+tarball="$DIST_DIR/$RUNNER_TARBALL"
+if [ ! -f "$tarball" ] || ! echo "$RUNNER_SHA256  $tarball" | sha256sum -c --quiet -; then
+  rm -f "$tarball"
+  curl -fsSL --retry 3 -o "$tarball" "$RUNNER_URL"
+  if ! echo "$RUNNER_SHA256  $tarball" | sha256sum -c --quiet -; then
+    echo "FATAL: $RUNNER_TARBALL does not match the pinned SHA-256." >&2
+    echo "  expected $RUNNER_SHA256" >&2
+    echo "  got      $(sha256sum "$tarball" | awk '{print $1}')" >&2
+    rm -f "$tarball"
+    exit 1
+  fi
+  note "downloaded and verified $RUNNER_TARBALL"
+fi
+
+stamp="$RUNNER_DIR/.keel-runner-version"
+if [ "$(cat "$stamp" 2>/dev/null || true)" != "$RUNNER_VERSION" ]; then
+  install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0750 "$RUNNER_DIR"
+  tar -xzf "$tarball" -C "$RUNNER_DIR"
+  chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR"
+  [ -x "$RUNNER_DIR/bin/installdependencies.sh" ] && "$RUNNER_DIR/bin/installdependencies.sh" >/dev/null
+  echo "$RUNNER_VERSION" > "$stamp"
+  chown "$RUNNER_USER:$RUNNER_USER" "$stamp"
+  note "unpacked actions-runner $RUNNER_VERSION"
+fi
+
+echo "OK: runner $RUNNER_VERSION present for $RUNNER_USER, docker $(docker --version | awk '{print $3}' | tr -d ,)"

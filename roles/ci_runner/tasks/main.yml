@@ -1,0 +1,45 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# CI runner lifecycle, in five stages that are each safe to re-run.
+#
+#   preflight  the host can host a VM, and this role is LXD's only owner
+#   storage    a dedicated logical volume — never a directory on /srv/data
+#   vm         dc1-ci-1, with no device that reaches the host filesystem
+#   egress     the outbound policy, on the HOST where the guest cannot edit it
+#   guest      Docker, the service account, and the runner binaries
+#
+# Registration is deliberately NOT here: it needs a one-time token that is the
+# operator's to generate. `tasks/register.yml` is a separate entry point.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Preflight — the host can actually host a VM
+  ansible.builtin.include_tasks: preflight.yml
+
+- name: Storage — a dedicated volume for the CI pool
+  ansible.builtin.include_tasks: storage.yml
+
+- name: LXD — initialise the pool and an isolated NAT bridge
+  ansible.builtin.include_tasks: lxd.yml
+
+- name: VM — create dc1-ci-1 with no path to the host
+  ansible.builtin.include_tasks: vm.yml
+
+- name: Egress — the outbound policy, enforced on the host
+  ansible.builtin.include_tasks: egress.yml
+
+- name: Guest — Docker, the service account, and the runner binaries
+  ansible.builtin.include_tasks: guest.yml
+
+- name: What remains for the operator
+  ansible.builtin.debug:
+    msg:
+      - "dc1-ci-1 is provisioned and the runner binaries are installed."
+      - ""
+      - "REGISTRATION IS MANUAL, BY DESIGN. The token is single-use, short-lived,"
+      - "and must not pass through a playbook's recorded output. Generate one at:"
+      - "  {{ ci_runner_scope_url }}/settings/actions/runners/new?arch=x64&os=linux"
+      - "then run, on the controller:"
+      - "  ansible-playbook playbooks/ci-runner.yml --tags register \\"
+      - "    -e ci_runner_token=<the token>"
+      - ""
+      - "Nothing above this line ever sees that token."

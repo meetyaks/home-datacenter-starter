@@ -1,0 +1,92 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTBOUND-ONLY EGRESS FOR {{ ci_vm_name }}, ENFORCED ON THE HOST.
+#
+# ⚠️ WHY THIS IS NOT INSIDE THE GUEST. A CI runner executes repository code, so
+# the working assumption is arbitrary code execution as the runner user. From
+# there the guest's own nftables is editable, and a policy written there is
+# advisory. This chain is on dc1-x86, outside the blast radius.
+#
+# ⚠️ ITS OWN TABLE, deliberately. dc1-x86 already has an `ip filter` ruleset that
+# belongs to TAILSCALE (ts-input, tailscale0, udp/41641). Adding rules to a table
+# somebody else owns is how one of these gets flushed by the other's next
+# reload. `inet ci_egress` is only ever written by this role.
+#
+# ⚠️ AND IT IS A SUBNET DENY, NOT A DOMAIN ALLOW-LIST. nftables cannot match
+# hostnames. The honest statement of policy is:
+#
+#     tcp/{{ ci_egress_allowed_ports | join(',') }} to the PUBLIC internet is permitted
+#     every RFC1918 range, Tailscale CGNAT and link-local is DENIED
+#     every service on the HOST itself is DENIED, bar LXD's DNS and DHCP
+#     everything else from the CI bridge is DENIED
+#
+# A true "github.com and ghcr.io only" list needs an egress proxy doing SNI
+# inspection. That is a deliberate non-goal, recorded here rather than implied by
+# the phrase "outbound-only".
+# ─────────────────────────────────────────────────────────────────────────────
+
+table inet ci_egress {
+
+  # ═══ TRAFFIC ADDRESSED TO THE HOST ITSELF ═══════════════════════════════
+  #
+  # ⚠️ THE FORWARD CHAIN NEVER SEES THIS, AND ITS ABSENCE WAS VERY NEARLY THE
+  # HOLE THAT UNDID THE ROLE. A packet addressed to one of dc1-x86's OWN
+  # addresses — the bridge address, its LAN address, its Tailscale address — is
+  # delivered locally through INPUT. It is not forwarded, so every drop in
+  # `forward` below misses it entirely.
+  #
+  # Production Caddy listens on 0.0.0.0:443, which includes the bridge address.
+  # Without this chain the CI VM reaches production Keel by asking the host it
+  # runs on, and the policy would have read as airtight while the isolation it
+  # describes did not exist.
+  chain input {
+    type filter hook input priority -10; policy accept;
+
+    # Not from the CI bridge: not this table's business. Tailscale owns the
+    # host's `ip filter` ruleset, and this must not become a second opinion
+    # about traffic that is nothing to do with CI.
+    iifname != "{{ ci_lxd_bridge }}" accept
+
+    ct state established,related accept
+
+    # The two services the guest legitimately needs FROM the host: LXD's
+    # resolver and its DHCP server.
+    ip saddr {{ ci_lxd_subnet_cidr }} udp dport { 53, 67 } counter accept
+    ip saddr {{ ci_lxd_subnet_cidr }} tcp dport 53 counter accept
+
+    # Everything else the CI VM aims at this host — every other port, on every
+    # address the host owns — is refused.
+    ip saddr {{ ci_lxd_subnet_cidr }} counter drop
+  }
+
+  chain forward {
+    # priority -10: ahead of Docker's and LXD's own forward rules, so a DROP here
+    # is not overridden by an ACCEPT they install.
+    type filter hook forward priority -10; policy accept;
+
+    # Replies to connections the VM opened. Without this, every allowed outbound
+    # connection would stall on its first response packet.
+    ct state established,related accept
+
+    # ── Everything below concerns traffic ORIGINATING in the CI VM ──────────
+{% for cidr in ci_egress_denied_cidrs %}
+    # {{ cidr }}
+    iifname "{{ ci_lxd_bridge }}" ip saddr {{ ci_lxd_subnet_cidr }} ip daddr {{ cidr }} counter drop
+{% endfor %}
+
+    # The public internet, on the ports a build actually needs: package
+    # registries, the GitHub API and the Actions service, container registries.
+    iifname "{{ ci_lxd_bridge }}" ip saddr {{ ci_lxd_subnet_cidr }} \
+      tcp dport { {{ ci_egress_allowed_ports | join(', ') }} } counter accept
+
+    # DNS is answered by LXD's own resolver on the bridge address, which is
+    # INPUT to the host rather than forward — so it needs no rule here, and the
+    # VM cannot reach any other resolver.
+
+    # Anything else leaving the CI bridge is refused. Last, so the accepts above
+    # are what define the policy.
+    iifname "{{ ci_lxd_bridge }}" ip saddr {{ ci_lxd_subnet_cidr }} counter drop
+  }
+}

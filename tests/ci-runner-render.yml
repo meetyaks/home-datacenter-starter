@@ -1,0 +1,86 @@
+---
+# Render every ci_runner guest script and the host egress policy into
+# `render_dir`, for tests/run-ci-runner-isolation.sh to inspect.
+#
+# ⚠️ IT RENDERS, IT DOES NOT RESTATE. The play loads the ROLE'S OWN defaults and
+# the ROLE'S OWN templates; nothing here carries a second copy of a value. A
+# harness with its own copy of a template passes against a template the role
+# does not have — which is exactly how a check once certified a hand-built
+# environment while the deployment crash-looped on the rendered one.
+- name: Render the ci_runner artefacts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    # Stands in for the managed host's address, which the isolation probes are
+    # derived from. An obvious fake: nothing asserts on the value, only on the
+    # fact that the probes are built from it.
+    ansible_host: "10.0.0.254"
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/ci_runner/defaults/main.yml
+
+    - name: Render the guest scripts
+      ansible.builtin.template:
+        src: "../roles/ci_runner/templates/{{ item.src }}"
+        dest: "{{ render_dir }}/{{ item.dest }}"
+        mode: "0755"
+        # The same validator the role uses. If a template renders to a shell
+        # syntax error, this fails here rather than in the guest at 3am.
+        validate: /bin/bash -n %s
+      loop:
+        - { src: guest-provision.sh.j2,    dest: provision.sh }
+        - { src: job-hook-started.sh.j2,   dest: job-started.sh }
+        - { src: job-hook-completed.sh.j2, dest: job-completed.sh }
+        - { src: guest-register.sh.j2,     dest: register.sh }
+        - { src: guest-unregister.sh.j2,   dest: unregister.sh }
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: Render the runner environment file
+      ansible.builtin.template:
+        src: ../roles/ci_runner/templates/runner.env.j2
+        dest: "{{ render_dir }}/runner.env"
+        mode: "0644"
+
+    - name: Render the host egress policy
+      ansible.builtin.template:
+        src: ../roles/ci_runner/templates/ci-egress.nft.j2
+        dest: "{{ render_dir }}/ci-egress.nft"
+        mode: "0644"
+
+# Also render the EPHEMERAL variant, so the suite can prove the opt-in path is
+# real rather than a comment claiming it is supported.
+#
+# ⚠️ A SEPARATE PLAY, AND `set_fact`, FOR A REASON THAT COST A DEBUGGING ROUND.
+# The first version overrode the flag with a task-level `vars:` and rendered a
+# file identical to the default one — because `include_vars` sits ABOVE task
+# vars in Ansible's precedence order, so the defaults loaded above silently won.
+# The suite would then have "proved" the ephemeral path by inspecting a
+# non-ephemeral render. `set_fact` outranks `include_vars`; a separate play
+# keeps the override from leaking into the default render.
+- name: Render the ephemeral registration variant
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/ci_runner/defaults/main.yml
+
+    - name: Select ephemeral registration
+      ansible.builtin.set_fact:
+        ci_runner_ephemeral: true
+
+    - name: Render the registration script in ephemeral mode
+      ansible.builtin.template:
+        src: ../roles/ci_runner/templates/guest-register.sh.j2
+        dest: "{{ render_dir }}/register-ephemeral.sh"
+        mode: "0755"
+        validate: /bin/bash -n %s

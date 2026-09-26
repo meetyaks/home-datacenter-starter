@@ -1,0 +1,82 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# The egress policy, installed on the HOST and reloaded atomically.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+    update_cache: false
+
+- name: Make sure the drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/nftables.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Render the CI egress policy
+  # `validate` parses it with nft BEFORE it replaces the live file, so a
+  # malformed rule set can never be the thing that is loaded. `-c` is check-only.
+  ansible.builtin.template:
+    src: ci-egress.nft.j2
+    dest: /etc/nftables.d/ci-egress.nft
+    owner: root
+    group: root
+    mode: "0600"
+    validate: "/usr/sbin/nft -c -f %s"
+  register: ci_egress_file
+  notify: Reload the CI egress policy
+
+- name: Load the policy now if it is not already loaded
+  # `notify` fires only on a change, and a host that rebooted without the
+  # systemd unit would have an empty table with the file already correct. This
+  # closes that gap: the table must be LOADED, not merely present on disk.
+  ansible.builtin.command:
+    argv: [nft, list, table, inet, ci_egress]
+  register: ci_egress_loaded
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Apply the policy
+  ansible.builtin.command:
+    argv: [nft, -f, /etc/nftables.d/ci-egress.nft]
+  when: ci_egress_loaded.rc != 0
+  changed_when: true
+
+- name: Persist it across reboots
+  # A one-shot unit rather than editing /etc/nftables.conf, which belongs to the
+  # distribution and may already be carrying Tailscale's rules.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ci-egress.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # {{ ansible_managed }}
+      #
+      # Loads the CI egress policy at boot. Separate from nftables.service so it
+      # cannot be flushed by, or flush, the Tailscale rules in `ip filter`.
+      [Unit]
+      Description=Egress policy for the CI runner VM
+      After=lxd.service network-pre.target
+      Wants=lxd.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/nftables.d/ci-egress.nft
+      ExecStop=/usr/sbin/nft delete table inet ci_egress
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Reload systemd for the egress unit
+
+- name: Enable the egress unit
+  ansible.builtin.systemd_service:
+    name: ci-egress
+    enabled: true
+    daemon_reload: true
