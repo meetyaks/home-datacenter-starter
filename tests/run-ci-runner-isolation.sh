@@ -181,6 +181,35 @@ if [ -f "$nft" ]; then
     *)      bad "the last rule is a drop" "it is: $last" ;;
   esac
 
+  # ⚠️ THE POLICY IS TWO FIREWALLS, AND THE SECOND ONE IS EASY TO FORGET.
+  # Docker sets the iptables FORWARD policy to DROP. Our chain at priority -10
+  # decides first — so its drops are authoritative — but an ACCEPT there is not
+  # terminal across tables, and the packet then dies in Docker's chain. The CI
+  # VM resolved DNS, our accept counter climbed past 400, every drop counter
+  # read zero, and not one connection completed.
+  if grep -q 'DOCKER-USER' "$ROLE/templates/ci-egress-apply.sh.j2"; then
+    ok "the applier permits the CI bridge in DOCKER-USER"
+  else
+    bad "DOCKER-USER carries the matching accept" \
+        "nftables would permit traffic that Docker's FORWARD DROP then discards"
+  fi
+
+  if grep -q 'PartOf=docker.service' "$ROLE/tasks/egress.yml"; then
+    ok "a Docker restart re-applies the policy (PartOf=docker.service)"
+  else
+    bad "the policy survives a Docker restart" \
+        "Docker recreates DOCKER-USER empty; the CI VM would lose its network"
+  fi
+
+  # The convergence check must test BOTH halves, or it reports green through
+  # exactly the failure above.
+  if grep -q 'iptables -C DOCKER-USER' "$ROLE/tasks/egress.yml"; then
+    ok "the in-force check tests both halves of the policy"
+  else
+    bad "the in-force check tests both halves" \
+        "it would pass on a host where the CI VM has no egress at all"
+  fi
+
   if command -v nft >/dev/null 2>&1; then
     if nft -c -f "$nft" > "$R/nft.log" 2>&1; then
       ok "nft accepts the ruleset"
@@ -225,6 +254,33 @@ if [ -f "$prov" ]; then
     ok "a digest mismatch discards the download"
   else
     bad "a mismatch discards the download" "a failed check could leave the artefact in place"
+  fi
+
+  # ⚠️ AND THE PIN MUST BE THE PUBLISHED DIGEST, NOT A PLAUSIBLE ONE. The first
+  # value in this role was neither copied nor verified: provisioning failed with
+  # a computed hash whose first SIXTEEN BYTES matched the pin and whose tail did
+  # not — which no real mismatch produces. It was a fabricated value, and it
+  # would have failed every honest download while catching no tampering at all.
+  #
+  # Network-dependent, like the remote image check: "is this the digest upstream
+  # publishes" is only answerable by asking upstream.
+  ver=$(awk '/^ci_runner_version:/{gsub(/"/,"",$2); print $2; exit}' "$ROLE/defaults/main.yml")
+  pin=$(awk '/^ci_runner_sha256:/{gsub(/"/,"",$2); print $2; exit}' "$ROLE/defaults/main.yml")
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    published=$(gh api "repos/actions/runner/releases/tags/v${ver}" --jq '.body' 2>/dev/null \
+                | grep -oE 'BEGIN SHA linux-x64 -->[0-9a-f]{64}' | sed 's/.*-->//')
+    if [ -z "$published" ]; then
+      bad "the pinned digest matches the release" \
+          "could not read a linux-x64 digest from the v${ver} release notes"
+    elif [ "$published" = "$pin" ]; then
+      ok "the pinned digest is the one actions/runner publishes for v${ver}"
+    else
+      bad "the pinned digest matches the release" \
+          "pinned $pin, published $published"
+    fi
+  else
+    skip "the pinned digest matches the release" \
+         "needs an authenticated gh; the provisioning script verifies on the host"
   fi
 
   # No sshd in the guest: nothing to attack, no host key to rotate.
@@ -276,6 +332,17 @@ if grep -q '/dev/tcp/' "$started"; then
   ok "the started hook probes that the egress policy is in force"
 else
   bad "the started hook probes egress" "the policy would be assumed, not proven"
+fi
+
+# ⚠️ AND THE PROBES MUST BE ADDRESSES. `/dev/tcp` to a name that does not
+# resolve fails exactly like a dropped packet — so a probe list rendered from an
+# inventory NAME would report every target unreachable while testing nothing.
+# The controller's own `ansible_host` for this lab IS such a name.
+if grep -q 'is not an IP address' "$started"; then
+  ok "a probe target that is not an address fails the job instead of passing"
+else
+  bad "unresolvable probe targets are rejected" \
+      "a probe that cannot resolve would report success without testing anything"
 fi
 
 completed="$R/job-completed.sh"
@@ -401,17 +468,33 @@ echo
 echo "── 10. live checks inside the VM ──"
 if [ -z "${CI_RUNNER_LIVE:-}" ]; then
   skip "in-guest isolation probes" \
-       "set CI_RUNNER_LIVE=<host> to run them against the real dc1-ci-1"
+       "set CI_RUNNER_LIVE=1 to run them against the real dc1-ci-1"
 else
-  H="$CI_RUNNER_LIVE"
+  # ⚠️ THROUGH ANSIBLE, NOT `ssh`. The inventory already knows the host's
+  # address, user and key, and an earlier version of this section invented its
+  # own ssh invocation — which meant the suite could only run from a controller
+  # whose ssh config happened to match. CI_RUNNER_HOST overrides the address for
+  # a controller that cannot resolve the inventory name.
   vm=$(awk '/^ci_vm_name:/{print $2; exit}' "$ROLE/defaults/main.yml")
+  AOPT=(-i inventory/hosts.yml linux_servers -b)
+  [ -n "${CI_RUNNER_HOST:-}" ] && AOPT+=(-e "ansible_host=${CI_RUNNER_HOST}")
 
-  live() { ssh "$H" "sudo lxc exec $vm -T -- $*" 2>/dev/null; }
+  # Returns the guest's stdout, and a non-zero status when the command failed
+  # inside the guest — `ansible -m command` propagates the remote exit code.
+  live() {
+    ansible "${AOPT[@]}" -m command -a "lxc exec $vm -T -- $*" 2>/dev/null \
+      | sed '1d'
+  }
+  live_rc() {
+    ansible "${AOPT[@]}" -m command -a "lxc exec $vm -T -- $*" > "$R/live.log" 2>&1
+  }
 
-  if live /bin/true; then
+  if live_rc /bin/true; then
     ok "the guest answers over lxc exec"
 
-    if live test -e /srv/data; then
+    # ⚠️ EACH OF THESE IS A NEGATIVE CLAIM, so read the direction carefully: the
+    # check PASSES when the command inside the guest FAILS.
+    if live_rc test -e /srv/data; then
       bad "/srv/data is not visible in the guest" "a host path is mounted in"
     else
       ok "/srv/data is not visible in the guest"
@@ -423,31 +506,60 @@ else
       *)       ok "no production container is visible from the guest" ;;
     esac
 
-    # The probes the started hook uses, run here so a failure is diagnosed now
-    # rather than as a mysteriously failing job later.
-    hostip=$(ssh "$H" "ip -4 -o addr show scope global | awk '{print \$4}' | cut -d/ -f1 | head -1")
-    for port in 443 5432; do
-      if live timeout 4 bash -c "exec 3\<\>/dev/tcp/$hostip/$port"; then
-        bad "the host's $port is unreachable from the guest" \
-            "$hostip:$port answered — the egress policy is not in force"
-      else
-        ok "the host's $port is unreachable from the guest"
-      fi
-    done
+    # The probes the started hook uses, run here so a misconfiguration is
+    # diagnosed now rather than as a mysteriously failing job later. The host's
+    # own LAN address is read from the host, not assumed.
+    hostip=$(ansible "${AOPT[@]}" -m shell \
+               -a "ip -4 -o addr show scope global | awk '{print \$4}' | cut -d/ -f1 | head -1" \
+               2>/dev/null | sed '1d' | tr -d '[:space:]')
+    if [ -z "$hostip" ]; then
+      bad "the host's own address is known" "could not read it; the probes below would prove nothing"
+    else
+      for port in 443 5432; do
+        # Quoted so the command module passes `exec 3<>…` to bash as one
+        # argument instead of the controller's shell trying to redirect it.
+        if live_rc "timeout 4 bash -c 'exec 3<>/dev/tcp/$hostip/$port'"; then
+          bad "the host's $port is unreachable from the guest" \
+              "$hostip:$port answered — the egress policy is not in force"
+        else
+          ok "the host's $port is unreachable from the guest ($hostip)"
+        fi
+      done
+    fi
 
-    if live timeout 15 curl -sS -o /dev/null -w '%{http_code}' https://api.github.com/zen | grep -q 200; then
+    # ⚠️ A THIRD PARTY ON THE LAN, NOT JUST THE HOST. The host is denied by the
+    # INPUT chain; this is the only check that exercises the FORWARD chain's
+    # drops — and those are the ones a broad `ACCEPT` in DOCKER-USER would
+    # undermine if the priority ordering were ever wrong. The router is used
+    # because it is guaranteed to be up, so a timeout means dropped rather than
+    # absent.
+    gw=$(ansible "${AOPT[@]}" -m shell -a "ip route show default | awk '{print \$3}' | head -1" \
+           2>/dev/null | sed '1d' | tr -d '[:space:]')
+    if [ -n "$gw" ]; then
+      if live_rc "timeout 4 bash -c 'exec 3<>/dev/tcp/$gw/80'"; then
+        bad "the LAN is unreachable from the guest" \
+            "the router at $gw answered — the forward-chain drops are not in force"
+      else
+        ok "the rest of the LAN is unreachable from the guest ($gw)"
+      fi
+    else
+      bad "the default gateway is known" "could not read it; the LAN drop is unproven"
+    fi
+
+    if live_rc "curl -sS -m 20 -o /dev/null https://api.github.com/zen"; then
       ok "github.com is reachable from the guest"
     else
       bad "github is reachable" "the runner could not talk to GitHub"
     fi
 
-    if live id -nG ghrunner | grep -qwE 'sudo|admin|root'; then
-      bad "the runner user is unprivileged" "it is in an administrative group"
-    else
-      ok "the runner user is unprivileged"
-    fi
+    groups=$(live id -nG "$(awk '/^ci_runner_user:/{print $2; exit}' "$ROLE/defaults/main.yml")")
+    case " $groups " in
+      *" sudo "*|*" admin "*|*" root "*)
+        bad "the runner user is unprivileged" "it is in an administrative group: $groups" ;;
+      *) ok "the runner user is unprivileged (groups:$groups)" ;;
+    esac
   else
-    bad "the guest answers over lxc exec" "cannot reach $vm on $H"
+    bad "the guest answers over lxc exec" "cannot reach $vm — see $R/live.log"
   fi
 fi
 

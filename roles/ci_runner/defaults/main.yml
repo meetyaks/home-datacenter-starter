@@ -110,10 +110,22 @@ ci_runner_name: "{{ ci_vm_name }}"
 # installer is a dependency on someone else's release state at download time,
 # which is the same class of defect that stopped a Keel deployment at
 # `docker compose pull`.
-ci_runner_version: "2.328.0"
+#
+# ⚠️ THE DIGEST IS COPIED FROM THE RELEASE NOTES, NEVER RECONSTRUCTED. The first
+# value here was not: provisioning failed with a computed hash whose first
+# SIXTEEN BYTES matched the pin and whose tail did not, which is not something a
+# real mismatch does — it is what a fabricated value looks like. The download was
+# genuine; the pin was invented.
+#
+#   gh api repos/actions/runner/releases/tags/v<version> --jq .body \
+#     | grep -oE 'BEGIN SHA linux-x64 -->[0-9a-f]{64}'
+#
+# That is the only acceptable source. A checksum that is "about right" is worse
+# than none: it fails honest downloads and would pass nothing an attacker did.
+ci_runner_version: "2.337.0"
 ci_runner_tarball: "actions-runner-linux-x64-{{ ci_runner_version }}.tar.gz"
 ci_runner_url: "https://github.com/actions/runner/releases/download/v{{ ci_runner_version }}/{{ ci_runner_tarball }}"
-ci_runner_sha256: "01066fad3a2893e63e6ca880ae3a1fad455b1b07eafe0b3c9e2399c0ff54b91d"
+ci_runner_sha256: "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
 
 # ── Registration ───────────────────────────────────────────────────────────
 #

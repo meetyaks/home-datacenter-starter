@@ -29,6 +29,10 @@
 
 - name: Guest — Docker, the service account, and the runner binaries
   ansible.builtin.include_tasks: guest.yml
+  # Everything in guest.yml goes through `lxc exec`, so it needs a VM that
+  # exists. In a dry run on a host that has none, the whole stage is skipped
+  # rather than failing task by task against a machine that was only predicted.
+  when: ci_vm_inspectable | default(true)
 
 - name: What remains for the operator
   ansible.builtin.debug:

@@ -1,12 +1,14 @@
 ---
 - name: Reload the CI egress policy
-  # Delete-then-load rather than a plain load: nft `-f` ADDS to an existing
-  # table, so reloading a policy whose deny rules had been removed would leave
-  # the old ones in place and report success.
-  ansible.builtin.shell:
-    cmd: >-
-      nft delete table inet ci_egress 2>/dev/null || true;
-      nft -f /etc/nftables.d/ci-egress.nft
+  # The applier, not a bare `nft -f`: the policy is nftables AND the DOCKER-USER
+  # accept that lets anything nftables permitted actually leave. Reloading only
+  # the first half produces a host that looks correctly configured and a CI VM
+  # with no internet.
+  #
+  # The nft file deletes its own table before redefining it, so this is atomic
+  # and idempotent — see the create-then-delete idiom at the top of the template.
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/ci-egress-apply]
   changed_when: true
 
 - name: Reload systemd for the egress unit

@@ -55,8 +55,17 @@
   # owns it. Inspection found no pools, no managed networks and no instances. If
   # that has changed, another owner exists and initialising would be taking over
   # somebody else's hypervisor.
+  #
+  # ⚠️ `-c n` — THE NAME COLUMN ONLY, AND THAT IS NOT TIDINESS. The full CSV
+  # includes the addresses column, which is QUOTED AND MULTI-LINE once an
+  # instance has an IP: `dc1-ci-1,RUNNING,"10.71.0.60 (enp5s0)` and its
+  # continuation arrive as two entries in `stdout_lines`, and the continuation
+  # matches no instance name. The check duly reported the role's own VM as a
+  # stranger's — `LXD already holds instances this role does not own:
+  # ['10.71.0.60 (enp5s0)",,VIRTUAL-MACHINE,0']` — and refused to re-run. One
+  # column, no commas, no quoting, nothing to misparse.
   ansible.builtin.command:
-    argv: [lxc, list, --format, csv]
+    argv: [lxc, list, --format, csv, -c, n]
   register: ci_lxd_instances
   changed_when: false
   failed_when: false
@@ -65,7 +74,7 @@
 - name: No instance may exist that this role did not create
   ansible.builtin.assert:
     that:
-      - (ci_lxd_instances.stdout_lines | reject('search', '^' ~ ci_vm_name ~ ',') | list | length) == 0
+      - (ci_lxd_instances.stdout_lines | map('trim') | select | reject('equalto', ci_vm_name) | list | length) == 0
     fail_msg: >-
       LXD on {{ inventory_hostname }} already holds instances this role does not
       own: {{ ci_lxd_instances.stdout_lines | reject('search', '^' ~ ci_vm_name ~ ',') | list }}.
@@ -79,6 +88,19 @@
   register: ci_vg_free
   changed_when: false
   failed_when: false
+  check_mode: false
+
+# ⚠️ AND WHETHER THE VOLUME IS ALREADY ALLOCATED, WHICH THIS USED TO IGNORE.
+# The first provisioning run took its 180 GiB. The second refused to start,
+# because the free space the assertion demands had become the volume the role
+# itself created — leaving `ubuntu-vg has 74.68 GiB free, which is less than the
+# 180g this role wants`. A role that can only be run once is not a role, it is a
+# script; and this fired on the re-run that was recovering an interrupted
+# deployment, which is exactly when a preflight must not be the obstacle.
+- name: Observe whether the CI volume is already allocated
+  ansible.builtin.stat:
+    path: "/dev/{{ ci_vg_name }}/{{ ci_lv_name }}"
+  register: ci_lv_already
   check_mode: false
 
 - name: The volume group must have room, with a reserve left over
@@ -96,7 +118,17 @@
       {{ ci_vg_name }} has {{ ci_vg_free.stdout | default('?') | trim }} GiB free;
       taking {{ ci_lv_size }} leaves a reserve.
     quiet: true
-  when: ci_vg_free.rc == 0
+  when:
+    - ci_vg_free.rc == 0
+    - not ci_lv_already.stat.exists
+
+- name: The CI volume is already allocated
+  ansible.builtin.debug:
+    msg: >-
+      /dev/{{ ci_vg_name }}/{{ ci_lv_name }} already exists, so no new extents
+      are needed; {{ ci_vg_name }} has
+      {{ ci_vg_free.stdout | default('?') | trim }} GiB free beyond it.
+  when: ci_lv_already.stat.exists
 
 - name: Report the plan
   ansible.builtin.debug:

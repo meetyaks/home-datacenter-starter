@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# MANAGED BY roles/ci_runner — the CI egress policy, applied in full.
+#
+# ═══ WHY THIS TAKES TWO FIREWALLS AND NOT ONE ═══════════════════════════════
+#
+# dc1-x86 runs Docker, and Docker sets the iptables FORWARD policy to DROP. In
+# nftables terms that is a base chain in the `ip filter` table at priority 0.
+# Our own `inet ci_egress` forward chain sits at priority -10, so it is
+# evaluated FIRST — which is what makes its `drop` rules authoritative, because
+# a drop is terminal and the packet never reaches Docker's chain at all.
+#
+# But an `accept` is NOT terminal across tables. It ends evaluation of OUR
+# chain and the packet carries on to `ip filter` FORWARD, where Docker's DROP
+# policy discards it. The symptom is precise and misleading: the CI VM resolves
+# DNS (that is INPUT to the host, a different hook), our accept counter climbs
+# into the hundreds, every drop counter reads zero — and not one connection
+# completes. It cost a provisioning run to find, because `apt-get update` does
+# not fail, it hangs.
+#
+# So the second half of the policy is an ACCEPT in DOCKER-USER, which is the
+# extension point Docker documents for exactly this and evaluates before its own
+# rules. It is deliberately broad — everything from the CI bridge — and that is
+# safe BECAUSE OF THE ORDERING ABOVE: whatever must be denied has already been
+# dropped by `inet ci_egress` before this chain is reached. This chain lets the
+# survivors through; it does not decide anything.
+#
+# ⚠️ AND DOCKER EMPTIES DOCKER-USER WHEN IT RESTARTS. That is why this is a
+# script run by a unit that is `PartOf=docker.service`, rather than two rules
+# applied once by Ansible and silently lost on the next `systemctl restart
+# docker`.
+set -euo pipefail
+
+BRIDGE='{{ ci_lxd_bridge }}'
+POLICY=/etc/nftables.d/ci-egress.nft
+
+# ── 1. The policy that decides ──────────────────────────────────────────────
+# The file declares an empty table, deletes it, then defines the real one, so
+# this is atomic and idempotent — see the note at the top of it.
+/usr/sbin/nft -f "$POLICY"
+
+# ── 2. The permission to leave, from the firewall that owns the verdict ─────
+# `-C` first: iptables has no "insert if absent", and re-running this must not
+# stack duplicates every boot.
+if ! iptables -C DOCKER-USER -i "$BRIDGE" -j ACCEPT 2>/dev/null; then
+  iptables -I DOCKER-USER -i "$BRIDGE" -j ACCEPT
+fi
+
+if ! iptables -C DOCKER-USER -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+  iptables -I DOCKER-USER -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+fi
+
+echo "CI egress policy applied: inet ci_egress loaded, DOCKER-USER permits ${BRIDGE}."

@@ -38,6 +38,7 @@
         - { src: job-hook-completed.sh.j2, dest: job-completed.sh }
         - { src: guest-register.sh.j2,     dest: register.sh }
         - { src: guest-unregister.sh.j2,   dest: unregister.sh }
+        - { src: ci-egress-apply.sh.j2,    dest: ci-egress-apply.sh }
       loop_control:
         label: "{{ item.dest }}"
 

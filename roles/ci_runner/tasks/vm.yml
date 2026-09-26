@@ -20,6 +20,14 @@
   failed_when: false
   check_mode: false
 
+# The same observe-before-predicting rule as storage.yml. In `--check` the
+# launch below does not happen, so every task that INSPECTS the VM — the agent
+# wait, the device list, the two assertions — would be interrogating a machine
+# that does not exist, and would fail the dry run on its own prediction.
+- name: Whether this run can inspect the VM
+  ansible.builtin.set_fact:
+    ci_vm_inspectable: "{{ (ci_vm_check.rc == 0) or (not ansible_check_mode) }}"
+
 - name: Launch the CI virtual machine
   ansible.builtin.command:
     argv:
@@ -65,12 +73,14 @@
   retries: 40
   delay: 5
   until: ci_agent.rc == 0
+  when: ci_vm_inspectable
   changed_when: false
 
 - name: Read the VM's device list
   ansible.builtin.command:
     argv: [lxc, config, device, show, "{{ ci_vm_name }}"]
   register: ci_devices
+  when: ci_vm_inspectable
   changed_when: false
   check_mode: false
 
@@ -88,11 +98,13 @@
       Remove it. A bind-mount from this host puts production secrets one `cat`
       away from anything CI executes.
     quiet: true
+  when: ci_vm_inspectable
 
 - name: The VM must not be privileged
   ansible.builtin.command:
     argv: [lxc, config, show, "{{ ci_vm_name }}"]
   register: ci_vm_config
+  when: ci_vm_inspectable
   changed_when: false
   check_mode: false
 
@@ -102,3 +114,15 @@
       - ci_vm_config.stdout is not search('security\.privileged:\s*(true|"true")')
     fail_msg: "{{ ci_vm_name }} is configured privileged. Remove it."
     quiet: true
+  when: ci_vm_inspectable
+
+# ⚠️ AND SAY SO WHEN THEY DID NOT RUN. A skipped assertion is not a satisfied
+# assertion; a dry run that stays silent here would read as "isolation
+# verified" when nothing was inspected at all.
+- name: What the dry run could not assert about the VM
+  ansible.builtin.debug:
+    msg: >-
+      {{ ci_vm_name }} does not exist yet, so the device list and the
+      privileged-mode check were NOT verified in this dry run. They run for
+      real on the next `ansible-playbook playbooks/ci-runner.yml`.
+  when: not ci_vm_inspectable

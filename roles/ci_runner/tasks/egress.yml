@@ -9,6 +9,16 @@
     state: present
     update_cache: false
 
+- name: Observe whether nft is actually on the host
+  # ⚠️ THE TEMPLATE BELOW VALIDATES WITH `nft -c -f`, WHICH NEEDS THE BINARY.
+  # Under --check on a host without nftables, apt only PREDICTS the package and
+  # the validator then dies with ENOENT — the exact failure that stopped a dry
+  # run of roles/caddy at `caddy version` against a binary apt had not installed.
+  ansible.builtin.stat:
+    path: /usr/sbin/nft
+  register: ci_nft_bin
+  check_mode: false
+
 - name: Make sure the drop-in directory exists
   ansible.builtin.file:
     path: /etc/nftables.d
@@ -29,13 +39,33 @@
     validate: "/usr/sbin/nft -c -f %s"
   register: ci_egress_file
   notify: Reload the CI egress policy
+  when: ci_nft_bin.stat.exists or not ansible_check_mode
 
-- name: Load the policy now if it is not already loaded
-  # `notify` fires only on a change, and a host that rebooted without the
-  # systemd unit would have an empty table with the file already correct. This
-  # closes that gap: the table must be LOADED, not merely present on disk.
-  ansible.builtin.command:
-    argv: [nft, list, table, inet, ci_egress]
+- name: Install the applier
+  # BOTH HALVES OF THE POLICY IN ONE PLACE, because they have to be re-applied
+  # together and on the same events. The script carries the reasoning; the short
+  # version is that our nftables chain decides what may leave, and Docker's
+  # FORWARD DROP means a separate ACCEPT in DOCKER-USER is needed before
+  # anything actually does.
+  ansible.builtin.template:
+    src: ci-egress-apply.sh.j2
+    dest: /usr/local/sbin/ci-egress-apply
+    owner: root
+    group: root
+    mode: "0700"
+    validate: /bin/bash -n %s
+  notify: Reload the CI egress policy
+
+- name: Check whether the policy is fully in force
+  # ⚠️ BOTH CONDITIONS, NOT JUST THE TABLE. An earlier version checked only that
+  # `inet ci_egress` was loaded — and it WAS, with a healthy accept counter,
+  # while every connection out of the CI VM timed out in Docker's FORWARD chain.
+  # A check that reads the half of the system you already trust will report
+  # green through the exact failure it exists to catch.
+  ansible.builtin.shell:
+    cmd: >-
+      nft list table inet ci_egress >/dev/null 2>&1 &&
+      iptables -C DOCKER-USER -i {{ ci_lxd_bridge }} -j ACCEPT 2>/dev/null
   register: ci_egress_loaded
   changed_when: false
   failed_when: false
@@ -43,7 +73,7 @@
 
 - name: Apply the policy
   ansible.builtin.command:
-    argv: [nft, -f, /etc/nftables.d/ci-egress.nft]
+    argv: [/usr/local/sbin/ci-egress-apply]
   when: ci_egress_loaded.rc != 0
   changed_when: true
 
@@ -56,27 +86,51 @@
     group: root
     mode: "0644"
     content: |
-      # {{ ansible_managed }}
+      # Managed by roles/ci_runner (home-datacenter-starter). Do not edit here.
+      #
+      # ⚠️ NOT `{{ '{{ ansible_managed }}' }}`. That variable is injected by the
+      # TEMPLATE module; in a `copy: content:` block it is simply undefined, and
+      # the task fails at argument resolution — which is how this was found.
       #
       # Loads the CI egress policy at boot. Separate from nftables.service so it
       # cannot be flushed by, or flush, the Tailscale rules in `ip filter`.
+      #
+      # ⚠️ `PartOf=docker.service` IS LOAD-BEARING. Docker RECREATES DOCKER-USER
+      # empty every time it restarts, which silently removes half of this policy
+      # — the half without which the CI VM has no internet at all. PartOf makes
+      # systemd restart this unit whenever docker restarts, so the rules come
+      # back with it instead of the next CI job hanging in `apt-get update` for
+      # a reason nothing on the host reports.
       [Unit]
       Description=Egress policy for the CI runner VM
-      After=lxd.service network-pre.target
+      After=lxd.service docker.service network-pre.target
       Wants=lxd.service
+      PartOf=docker.service
 
       [Service]
       Type=oneshot
       RemainAfterExit=yes
-      ExecStart=/usr/sbin/nft -f /etc/nftables.d/ci-egress.nft
+      ExecStart=/usr/local/sbin/ci-egress-apply
       ExecStop=/usr/sbin/nft delete table inet ci_egress
 
       [Install]
       WantedBy=multi-user.target
   notify: Reload systemd for the egress unit
 
+- name: Observe whether the unit file is on disk
+  # ⚠️ `systemd_service` FAILS IN CHECK MODE ON A UNIT THAT DOES NOT EXIST YET —
+  # the same predicted-artifact trap as the logical volume above, and the same
+  # one that aborted a dry run of roles/caddy. The `copy` task above only
+  # PREDICTS the unit under --check, so enabling it is gated on the file being
+  # real.
+  ansible.builtin.stat:
+    path: /etc/systemd/system/ci-egress.service
+  register: ci_egress_unit
+  check_mode: false
+
 - name: Enable the egress unit
   ansible.builtin.systemd_service:
     name: ci-egress
     enabled: true
     daemon_reload: true
+  when: ci_egress_unit.stat.exists or not ansible_check_mode

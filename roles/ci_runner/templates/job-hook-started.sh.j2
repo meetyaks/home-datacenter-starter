@@ -40,6 +40,18 @@ fi
 # timeout rather than a connection refused.
 for hp in {% for p in ci_isolation_denied_probes %}'{{ p }}' {% endfor %}; do
   host="${hp%:*}"; port="${hp##*:}"
+
+  # ⚠️ A PROBE THAT CANNOT RESOLVE PASSES, AND MEANS NOTHING. `/dev/tcp` to an
+  # unresolvable name fails exactly like a dropped packet, so if this list is
+  # ever rendered from an inventory NAME — the controller's `ansible_host` is
+  # `dc1-x86`, which does not resolve inside the guest — every check here would
+  # report the host as unreachable while nothing had been tested. A negative
+  # result is only evidence when the target was addressable.
+  case "$host" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*) : ;;
+    *) fail "isolation probe '${hp}' is not an IP address. An unresolvable target cannot prove anything; set ci_isolation_denied_probes to addresses." ;;
+  esac
+
   if timeout 4 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
     fail "${hp} answered from inside the CI VM. The host egress policy is not in force."
   fi

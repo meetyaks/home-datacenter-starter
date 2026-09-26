@@ -64,14 +64,44 @@ nftables cannot match hostnames. The honest statement of policy is:
 
 ```
 tcp/80 and tcp/443 to the PUBLIC internet          permitted
+udp/123 to the PUBLIC internet (time)              permitted
 every RFC1918 range, CGNAT and link-local          DENIED
 every service on dc1-x86 itself, bar DNS and DHCP  DENIED
 anything else from the CI bridge                   DENIED
 ```
 
+NTP is in the list because a guest with no path to it drifts, and a drifted
+clock fails every TLS handshake as an expired or not-yet-valid certificate —
+weeks later, as a CI outage that looks nothing like a firewall rule.
+
 A true "GitHub and registries only" list needs an egress proxy doing SNI
 inspection. That is a deliberate non-goal, recorded rather than implied by the
 phrase "outbound-only".
+
+### It takes two firewalls, and that is not an accident
+
+Docker sets the iptables `FORWARD` policy to **DROP** on this host. In nftables
+terms that is a base chain in `ip filter` at priority 0, while `inet ci_egress`
+sits at **-10** and is evaluated first. That ordering is what makes this role's
+drops authoritative: a drop is terminal, so a denied packet never reaches
+Docker's chain at all.
+
+An **accept**, though, is not terminal across tables. It ends evaluation of our
+chain and the packet carries on into `ip filter`, where Docker's DROP policy
+discards it. The symptom is precise and misleading — the CI VM resolves DNS
+(that is INPUT, a different hook), the accept counter climbs into the hundreds,
+every drop counter reads zero, and not one connection completes. It cost a
+provisioning run to find, because `apt-get update` does not fail, it hangs.
+
+So `/usr/local/sbin/ci-egress-apply` installs both halves: the nftables policy
+that decides, and a broad `ACCEPT` for the CI bridge in **DOCKER-USER**, the
+extension point Docker documents for exactly this. The breadth is safe because
+of the ordering: whatever must be denied was already dropped before that chain
+is reached. DOCKER-USER lets the survivors out; it decides nothing.
+
+`ci-egress.service` is `PartOf=docker.service`, because **Docker recreates
+DOCKER-USER empty every time it restarts** — silently removing the half without
+which CI has no network.
 
 **The input chain is load-bearing and non-obvious.** A packet addressed to one
 of the host's own addresses — the bridge address, its LAN address, its Tailscale
@@ -174,6 +204,32 @@ destroyed after — and `ci_runner_ephemeral` stays `false`.
 Set it `true` if you ever mint short-lived tokens out of band on the controller.
 The path is implemented and covered by a test that renders both variants and
 proves they differ; it simply is not the default.
+
+## Upgrading the runner
+
+`--disableupdate` means the runner never replaces its own binaries, so upgrades
+are a change to this role:
+
+```bash
+gh api repos/actions/runner/releases/latest --jq .tag_name
+gh api repos/actions/runner/releases/tags/v<version> --jq .body \
+  | grep -oE 'BEGIN SHA linux-x64 -->[0-9a-f]{64}'
+```
+
+Put both in `defaults/main.yml` and re-run. The provisioning script unpacks a
+new version over the old one when the stamp file disagrees, and the service
+picks it up on its next restart.
+
+⚠️ **Copy the digest, never reconstruct it.** The first pin in this role was a
+plausible-looking value that was never copied from anywhere: provisioning
+failed with a computed hash whose first sixteen bytes matched and whose tail did
+not, which is not what a real mismatch looks like. A checksum that is *about*
+right fails every honest download and catches nothing. The test suite now
+compares the pin against the published release notes.
+
+GitHub eventually refuses runners below a minimum version, so an
+un-upgraded runner stops being able to register rather than silently running old
+code.
 
 ## Logs
 

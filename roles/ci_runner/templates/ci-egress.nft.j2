@@ -17,7 +17,7 @@
 # ⚠️ AND IT IS A SUBNET DENY, NOT A DOMAIN ALLOW-LIST. nftables cannot match
 # hostnames. The honest statement of policy is:
 #
-#     tcp/{{ ci_egress_allowed_ports | join(',') }} to the PUBLIC internet is permitted
+#     tcp/{{ ci_egress_allowed_ports | join(',') }} and udp/123 to the PUBLIC internet is permitted
 #     every RFC1918 range, Tailscale CGNAT and link-local is DENIED
 #     every service on the HOST itself is DENIED, bar LXD's DNS and DHCP
 #     everything else from the CI bridge is DENIED
@@ -26,6 +26,19 @@
 # inspection. That is a deliberate non-goal, recorded here rather than implied by
 # the phrase "outbound-only".
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ⚠️ CREATE-THEN-DELETE, AND IT IS NOT A TYPO. `nft -f` ADDS to an existing
+# table, so re-applying this file over a live table would leave stale rules in
+# place and report success. Deleting first fixes that — but `delete` on a table
+# that does not exist aborts the whole file, and deleting in a SEPARATE command
+# leaves a window, however short, in which the CI VM has no egress policy at all.
+#
+# The idiom below is the answer to both: an empty declaration makes the table
+# exist, the delete then always succeeds, and nft applies the entire file as ONE
+# ATOMIC TRANSACTION — so the ruleset goes from the old policy to the new one
+# with no moment in between.
+table inet ci_egress {}
+delete table inet ci_egress
 
 table inet ci_egress {
 
@@ -84,6 +97,14 @@ table inet ci_egress {
     # DNS is answered by LXD's own resolver on the bridge address, which is
     # INPUT to the host rather than forward — so it needs no rule here, and the
     # VM cannot reach any other resolver.
+
+    # ⚠️ TIME, WHICH IS NOT OPTIONAL. Without this the guest's clock drifts
+    # freely, and a drifted clock makes every TLS handshake fail with an expired
+    # or not-yet-valid certificate — weeks later, as an inexplicable CI outage
+    # that looks nothing like a firewall rule. The private ranges above are
+    # dropped before this, so it reaches public NTP only.
+    iifname "{{ ci_lxd_bridge }}" ip saddr {{ ci_lxd_subnet_cidr }} \
+      udp dport 123 counter accept
 
     # Anything else leaving the CI bridge is refused. Last, so the accepts above
     # are what define the policy.
