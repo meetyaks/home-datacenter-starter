@@ -22,6 +22,20 @@
 	# reach this host.
 	admin {{ caddy_admin_listen }}
 
+	# Ansible publishes the root to {{ caddy_internal_ca_dest }} and runs
+	# `update-ca-certificates` as root, so the host trust store is managed from
+	# the play. Caddy must therefore not ALSO try to install it: the service
+	# runs unprivileged, so the attempt fails on every start with
+	#
+	#   failed to install root certificate: failed to execute sudo
+	#
+	# The alternative to this one line is granting the caddy service sudo — a
+	# real privilege, to silence a log line about work already done. This sets
+	# `install_trust: false` in the adapted config and changes nothing else;
+	# the CA is still generated, published and trusted.
+	# (enforced: tests/run-caddy-handler-order.sh "no sudo trust error")
+	skip_install_trust
+
 	# ⚠️ DECLARED SO THE ROOT CA EXISTS AFTER THIS ROLE RUNS, not whenever some
 	# application later happens to ask for a certificate.
 	#

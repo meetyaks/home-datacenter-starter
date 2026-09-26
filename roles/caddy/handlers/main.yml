@@ -21,13 +21,7 @@
   # not guaranteed to be the binary apt installed. The check-mode guard below
   # also keeps this off a host where the binary was only ever predicted.
   ansible.builtin.command:
-    argv:
-      - "{{ caddy_binary }}"
-      - validate
-      - --adapter
-      - caddyfile
-      - --config
-      - "{{ caddy_config_file }}"
+    argv: "{{ caddy_validate_argv }}"
   changed_when: false
   when: not ansible_check_mode
   listen: Reload Caddy

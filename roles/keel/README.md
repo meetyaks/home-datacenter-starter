@@ -275,7 +275,9 @@ encrypted or not, is loaded with it.
    non-zero exit fails the play.
 8. **Configures** one Caddy drop-in, `caddy validate`-checked before install and
    applied with a *reload*, never a restart. Caddy itself is installed and owned
-   by roles/caddy, which runs first.
+   by roles/caddy, which runs first. The reload is APPLIED AND PROVED ACTIVE
+   here — not left pending for end of play, which is how a correct route once
+   stayed on disk and never loaded.
 9. **Verifies** `/healthz`, `/readyz`, the console, container state, the baked
    packs — and then INGRESS: name resolution, the console and the API through
    https://keel.dc1.lan with certificates verified, and that no stack port is
@@ -314,7 +316,24 @@ most likely way this stack would accidentally become reachable.
 
 **Caddy itself is owned by [`roles/caddy`](../caddy/README.md)** — the package,
 the service, `/etc/caddy/Caddyfile` and `/etc/caddy/conf.d`. This role writes
-exactly one file, `conf.d/keel.caddy`, and notifies the owner's reload handler.
+exactly one file, `conf.d/keel.caddy`, notifies the owner's reload handler, and
+then asks the owner to **apply and prove it** before anything is verified.
+
+> That last clause is the fix for a second failure. Ansible runs handlers at
+> the end of a play, so the notification was still pending when `verify.yml`
+> ran: Caddy active, the drop-in on disk, `caddy validate` reporting *Valid
+> configuration* and HTTPS on `:443` — and the running process's journal
+> saying `No files matching import glob pattern`, with nothing listening on
+> `:80` or `:443`. Verification tested the configuration Caddy had loaded
+> before the drop-in existed, failed, and the failing play never flushed the
+> handler — so the route never became active at all.
+>
+> `roles/caddy`'s `reload-and-verify` now runs in place: validate the composed
+> configuration, flush, prove the service is active, prove `:80`/`:443` belong
+> to Caddy, and read the **loaded** configuration back from the loopback admin
+> API. This role then asserts `keel.dc1.lan` is in it — the one claim no file
+> check can make, because every file was correct throughout the failure.
+> (enforced: `tests/run-caddy-handler-order.sh`)
 
 > This boundary used to have no owner on the other side of it. A deployment
 > finished with every service healthy and was completely unreachable: there was

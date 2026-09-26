@@ -173,7 +173,7 @@
       - "  4. install the stack from the built commit and refuse any non-loopback publish"
       - "  5. run migrations once, and stop if they exit non-zero"
       - "  6. start the stack and wait for health"
-      - "  7. write the Caddy drop-in, validate it, and reload Caddy"
+      - "  7. write the Caddy drop-in, validate the composed config, reload Caddy and prove the route is live"
       - "  8. verify /healthz, /readyz, the console, container state and the baked packs"
       - ""
       - "None of the above was performed, predicted-as-done, or required to exist."

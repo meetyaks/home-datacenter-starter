@@ -103,3 +103,47 @@
     # try to run it.
     validate: "{{ caddy_binary_path | default('/usr/bin/caddy') }} validate --adapter caddyfile --config %s"
   notify: Reload Caddy
+
+# ═══ APPLY IT NOW. DO NOT LEAVE THE RELOAD PENDING. ══════════════════════════
+#
+# Ansible runs handlers at the END of a play, so the notification above was
+# still pending when verify.yml ran a few tasks later. Not a theory — what
+# dc1-x86 did:
+#
+#   · Caddy v2.11.4 active; /etc/caddy/conf.d/keel.caddy present
+#   · `caddy validate` on those files: Valid configuration, HTTPS on :443
+#   · the RUNNING process's journal:
+#       No files matching import glob pattern /etc/caddy/conf.d/*.caddy
+#   · nothing listening on :80 or :443
+#
+# Caddy had loaded before the drop-in existed. Verification tested the old
+# in-memory configuration and failed — and because the play failed, the
+# pending handler never ran at all. The route never became active, while every
+# file on disk was correct and every file-based check would have passed.
+#
+# roles/caddy owns the sequence, because it owns the service. This role
+# notifies the canonical handler and asks the owner to apply and prove it; it
+# carries no reload command of its own.
+# (enforced: tests/run-caddy-handler-order.sh "the route is already live at
+#  verification time")
+- name: Apply the pending reload and prove Caddy is serving it
+  ansible.builtin.import_role:
+    name: caddy
+    tasks_from: reload-and-verify
+
+- name: The Keel route must be in the configuration Caddy has LOADED
+  # THE CLAIM NO FILE CHECK CAN MAKE. During the failure the drop-in was on
+  # disk and `caddy validate` passed; what was false was that the running
+  # process had ever read it. This asks the process.
+  ansible.builtin.assert:
+    that:
+      - keel_hostname in (caddy_active_config_json | default(''))
+    fail_msg: >-
+      INGRESS: {{ keel_hostname }} is not in the configuration Caddy currently
+      has LOADED, even though {{ keel_caddy_site_file }} is on disk and
+      validates. The reload did not take effect. Look for "No files matching
+      import glob pattern" in `journalctl -u caddy` — that line means Caddy
+      started before this drop-in existed and has not re-read it since.
+    success_msg: "INGRESS: {{ keel_hostname }} is live in Caddy's loaded configuration."
+    quiet: true
+  when: caddy_can_be_executed_now | default(false) | bool

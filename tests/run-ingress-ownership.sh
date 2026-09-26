@@ -201,6 +201,63 @@ else
   ok "no task disables TLS verification (comments about it do not count)"
 fi
 
+# ── 4b. A notified reload is applied before anything verifies it ───────────
+#
+# Ansible runs handlers at the END of a play. A role that notifies `Reload
+# Caddy` and then verifies the site is reachable verifies a reload that has not
+# happened — which is exactly what dc1-x86 did, with every file on disk
+# correct and nothing listening on :80 or :443.
+echo
+echo "── 4b. the reload is applied before verification, not at end of play ──"
+
+if [ -f roles/caddy/tasks/reload-and-verify.yml ]; then
+  ok "roles/caddy owns a reload-and-prove-active sequence"
+else
+  bad "the owner provides the sequence" "roles/caddy/tasks/reload-and-verify.yml is missing"
+fi
+
+if grep -q 'meta: flush_handlers' roles/caddy/tasks/reload-and-verify.yml 2>/dev/null; then
+  ok "it flushes handlers explicitly"
+else
+  bad "the sequence flushes handlers" "nothing forces the pending reload to run"
+fi
+
+# The application notifies, then asks the owner to apply — and must not carry
+# its own reload command.
+notify_line=$(grep -n 'notify: Reload Caddy' roles/keel/tasks/caddy.yml | head -1 | cut -d: -f1)
+apply_line=$(grep -n 'tasks_from: reload-and-verify' roles/keel/tasks/caddy.yml | head -1 | cut -d: -f1)
+if [ -n "$notify_line" ] && [ -n "$apply_line" ] && [ "$notify_line" -lt "$apply_line" ]; then
+  ok "roles/keel notifies (line $notify_line) then applies via the owner (line $apply_line)"
+else
+  bad "the drop-in's reload is applied in place" \
+      "notify=${notify_line:-absent} apply=${apply_line:-absent}"
+fi
+
+if grep -vE '^[[:space:]]*#' roles/keel/tasks/caddy.yml | grep -qE 'systemctl (reload|restart)|state: (reloaded|restarted)'; then
+  bad "roles/keel duplicates no reload command" "it reloads the service itself"
+else
+  ok "roles/keel issues no reload of its own (the comment about it does not count)"
+fi
+
+# The Caddy step must come before verification in the role's own ordering.
+caddy_step=$(grep -n 'include_tasks: caddy.yml' roles/keel/tasks/main.yml | head -1 | cut -d: -f1)
+verify_step=$(grep -n 'include_tasks: verify.yml' roles/keel/tasks/main.yml | head -1 | cut -d: -f1)
+if [ -n "$caddy_step" ] && [ -n "$verify_step" ] && [ "$caddy_step" -lt "$verify_step" ]; then
+  ok "caddy.yml (line $caddy_step) runs before verify.yml (line $verify_step)"
+else
+  bad "the route is configured before it is verified" \
+      "caddy=${caddy_step:-absent} verify=${verify_step:-absent}"
+fi
+
+# The active-state claim must come from the running process, not from files.
+if grep -q 'caddy_admin_listen' roles/caddy/tasks/reload-and-verify.yml 2>/dev/null \
+   && grep -q 'caddy_active_config_json' roles/keel/tasks/caddy.yml; then
+  ok "the route is asserted against the LOADED config, not files on disk"
+else
+  bad "activation is proved from the running process" \
+      "nothing reads the admin API and asserts the hostname is loaded"
+fi
+
 # ── 5b. No folded scalar splits on a literal backslash-n ───────────────────
 #
 # In a FOLDED (`>-`) or PLAIN scalar, YAML leaves `\n` as two characters, so

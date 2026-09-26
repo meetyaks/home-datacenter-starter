@@ -103,6 +103,63 @@ The distinction is a fact, not a mode test:
 On a task that **consumes** a prediction it is the defect itself. That is the
 whole line, and `tests/run-caddy-check-mode.sh` holds it.
 
+## Applying an ingress change — `tasks_from: reload-and-verify`
+
+Ansible runs handlers at the **end of a play**. A role that writes a route,
+notifies `Reload Caddy` and then verifies the site is reachable is verifying a
+reload that has not happened.
+
+> ⚠️ **That is what dc1-x86 did.** Caddy v2.11.4 active, `conf.d/keel.caddy`
+> present, `caddy validate` reporting *Valid configuration* and HTTPS on
+> `:443` — and the running process's journal saying
+> `No files matching import glob pattern /etc/caddy/conf.d/*.caddy`, with
+> nothing listening on `:80` or `:443`. Caddy had loaded before the drop-in
+> existed. Verification tested the old in-memory configuration, failed — and
+> because the play failed, the pending handler never ran at all. Every file on
+> disk was correct, so every file-based check would have passed.
+
+So an application role does not leave its reload pending:
+
+```yaml
+- name: Install the route
+  ansible.builtin.template: { … }
+  notify: Reload Caddy
+
+- name: Apply the pending reload and prove Caddy is serving it
+  ansible.builtin.import_role:
+    name: caddy
+    tasks_from: reload-and-verify
+
+- name: My hostname must be in the configuration Caddy has LOADED
+  ansible.builtin.assert:
+    that:
+      - my_hostname in (caddy_active_config_json | default(''))
+```
+
+`reload-and-verify` runs, in this order:
+
+| | step | why it is separate |
+|---|---|---|
+| c | validate the **composed** configuration | read-only; fails before the service is touched, with the whole config in the error |
+| d | `meta: flush_handlers` | the fix — the reload happens **here**, not at end of play |
+| e | assert the service is active | a reload that killed the service is not a reload |
+| f | assert `:80` and `:443` exist and are held **only** by caddy | a site can adapt and validate and still bind nothing |
+| — | read the loaded config from the admin API into `caddy_active_config_json` | "on disk" and "loaded" are different claims, and only the second serves traffic |
+
+The caller then runs its HTTPS verification (g), against a route already proved
+live. The admin API read uses the loopback-only endpoint this role configures
+(`admin localhost:2019`); it is queried from the host itself and nothing is
+exposed. (enforced: `tests/run-caddy-handler-order.sh`)
+
+**Reload, never restart, for a drop-in.** A restart drops every in-flight
+connection for every site on the host. `Restart Caddy` exists, but only a
+package or unit change notifies it.
+
+**An invalid configuration leaves the running one intact.** Validation happens
+before the flush and again inside the handler, so a malformed drop-in fails the
+play on the same process, still serving the previous route — verified down to
+the PID.
+
 ### For roles that consume this one
 
 An application role must not assert on `/etc/caddy/conf.d` unconditionally: in
@@ -170,6 +227,24 @@ published on the FIRST deploy")
 This role also adds the root to **dc1-x86's own** trust store
 (`update-ca-certificates`), so health checks made on that host verify the chain
 properly instead of being told to skip verification.
+
+Because the play does that, **Caddy is told not to**. The main Caddyfile sets
+the global option `skip_install_trust`, which puts `install_trust: false` in
+the adapted config. Without it Caddy tries to install the root itself on every
+start, fails because it runs unprivileged, and logs:
+
+```
+failed to install root certificate: failed to execute sudo
+```
+
+The error is harmless — the root is already installed, by Ansible, as root —
+but the only ways to silence it are this option or **granting the caddy
+service sudo**, which is a real privilege handed over to quiet a log line
+about work already done. The CA is still generated, still published, still
+trusted; only Caddy's own attempt is switched off. (enforced:
+`tests/run-caddy-handler-order.sh` "no sudo trust error", "the caddy service
+account has no sudo access", and an HTTPS request that verifies without
+`--insecure`)
 
 ### Trusting it on the Mac Mini
 

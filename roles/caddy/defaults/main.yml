@@ -56,6 +56,24 @@ caddy_log_dir: /var/log/caddy
 caddy_user: caddy
 caddy_group: caddy
 
+# ── Validating the COMPOSED configuration ───────────────────────────────────
+#
+# Defined once, because it is invoked from two places — the reload handler, and
+# the explicit pre-reload check an application role runs before flushing it.
+# Two hand-maintained copies of one command drift, and the copy nobody
+# remembers to change is the one that stops matching what actually reloads.
+#
+# It reads the MAIN file, which imports every drop-in, so this is the whole
+# configuration and not one application's fragment. A drop-in can be valid
+# alone and still break the composed whole.
+caddy_validate_argv:
+  - "{{ caddy_binary }}"
+  - validate
+  - --adapter
+  - caddyfile
+  - --config
+  - "{{ caddy_config_file }}"
+
 # ── Internal TLS for private hostnames ──────────────────────────────────────
 #
 # `.lan` names cannot get a public certificate — no ACME CA will validate a name
