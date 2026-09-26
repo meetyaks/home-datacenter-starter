@@ -328,24 +328,36 @@
   # The checker then verified its single argument and printed PASS. A green
   # check that had examined a fifth of its input.
   #
-  # `stdout_lines` is already a LIST — no splitting, no filter that can silently
-  # return the wrong shape — and `command: argv:` passes each element as one
-  # opaque argument with no shell between here and the script. There is no
-  # command string left to get wrong.
+  # ⚠️ RUNS ON THE MANAGED HOST. NOT DELEGATED. That is the whole point.
   #
-  # Delegated to the CONTROLLER because that is where the role's files live, so
-  # the checker needs no copy onto the target and preflight writes nothing
-  # anywhere. The trade-off is honest and worth stating: this proves the
-  # REGISTRY serves these images anonymously, not that this particular target's
-  # network path to it is clear. A target-specific block would still surface at
-  # `docker compose pull`, loudly and before anything is started.
-  ansible.builtin.command:
-    argv: "{{ [ role_path ~ '/files/check-anonymous-pull.sh' ] + keel_external_images.stdout_lines }}"
-  delegate_to: localhost
-  become: false
-  vars:
-    ansible_connection: local
-    ansible_python_interpreter: "{{ keel_controller_python }}"
+  # The incident this exists for was HOST-PATH-SPECIFIC: one machine could
+  # resolve an image while dc1-x86 got 401. Checking from anywhere else tests
+  # the wrong DNS, the wrong routes, the wrong proxy, the wrong TLS trust store
+  # and the wrong source address for whatever the registry decides about — and
+  # would have reported everything fine while the deploy was about to fail.
+  #
+  # A CUSTOM MODULE rather than a script, because a module's arguments arrive as
+  # JSON. `images` is a LIST — five discrete values — and no shell exists
+  # anywhere between this task and the HTTP requests. An earlier version built a
+  # command string from the same list; it was newline-separated, so the shell
+  # received it as a PROGRAM, checked one reference and executed the other four.
+  # There is no command string here to get wrong.
+  #
+  # `stdout_lines` is already a list. No `split('\n')`, which in a folded scalar
+  # splits on a literal backslash-n and silently returns one element.
+  #
+  # Read-only: the module opens sockets and returns facts, writing nothing at
+  # all, so check mode gets the same answer a real run would.
+  anonymous_image_check:
+    images: "{{ keel_external_images.stdout_lines }}"
+    expected_host: "{{ inventory_hostname }}"
+    # `lookup` ALWAYS evaluates on the controller, so this is the controller's
+    # own hostname. The module refuses to report anything if it finds itself
+    # running there — which catches delegation even when the inventory name and
+    # the target's real hostname happen to differ, a case `expected_host` alone
+    # would report as an ordinary mismatch rather than as running in the wrong
+    # place.
+    forbidden_host: "{{ lookup('pipe', 'hostname') }}"
   register: keel_anon_pull
   changed_when: false
   failed_when: false
@@ -353,23 +365,48 @@
 
 - name: Show the anonymous-pullability result
   ansible.builtin.debug:
-    msg: "{{ (keel_anon_pull.stdout | default('(no output)')).split('\n') }}"
+    msg: >-
+      {{ ['verified ' ~ (keel_anon_pull.verified_count | default(0)) ~ ' of '
+          ~ (keel_anon_pull.input_count | default(0)) ~ ' from '
+          ~ (keel_anon_pull.execution_host | default('(unknown host)'))] +
+         (keel_anon_pull.results | default([]) | map(attribute='image') | list) }}
 
 - name: Fail when an external image cannot be pulled without credentials
+  # THREE conditions, and all three are load-bearing:
+  #
+  #   host_matches    the requests came from the deployment host, not from the
+  #                   controller. A green result from the wrong machine is the
+  #                   regression this assertion exists to make impossible.
+  #   counts equal    every image supplied was verified. "No failures recorded"
+  #                   is not the same claim — a checker that examined a prefix
+  #                   would satisfy it.
+  #   per-image ok    stated explicitly so a future change to the counters
+  #                   cannot quietly widen what PASS means.
   ansible.builtin.assert:
     that:
-      - (keel_anon_pull.rc | default(1)) == 0
+      - keel_anon_pull.host_matches | default(false)
+      - (keel_anon_pull.input_count | default(0)) > 0
+      - (keel_anon_pull.verified_count | default(-1)) == (keel_anon_pull.input_count | default(0))
+      - (keel_anon_pull.results | default([]) | rejectattr('ok') | list | length) == 0
     fail_msg: >-
-      One or more pinned images are not anonymously pullable from
-      {{ inventory_hostname }} — see the per-image results above. This is a
-      property of the REGISTRY, not of this host's cache: the check speaks HTTP
-      to the registry and sends no credentials. Do not add registry credentials
-      to this host; find a source that serves the image anonymously, or mirror
-      it somewhere that does. A deploy started now would stop at
-      `docker compose pull`.
+      Anonymous image verification failed. Ran on
+      {{ keel_anon_pull.execution_host | default('(unknown)') }}, expected
+      {{ inventory_hostname }} (host_matches={{ keel_anon_pull.host_matches | default(false) }});
+      verified {{ keel_anon_pull.verified_count | default(0) }} of
+      {{ keel_anon_pull.input_count | default(0) }}.
+      {% for r in (keel_anon_pull.results | default([]) | rejectattr('ok') | list) %}
+      FAILED {{ r.image }} — {{ r.reason }}
+      {% endfor %}
+      This is a property of the REGISTRY AND THIS HOST'S PATH TO IT, not of any
+      local image cache: the module speaks HTTP directly and sends no
+      credentials. Do not add registry credentials to this host; find a source
+      that serves the image anonymously, or mirror it somewhere that does. A
+      deploy started now would stop at `docker compose pull`.
     success_msg: >-
-      Every pinned external image resolves anonymously, by digest, with a
-      linux/amd64 manifest.
+      verified {{ keel_anon_pull.verified_count | default(0) }} of
+      {{ keel_anon_pull.input_count | default(0) }} from
+      {{ keel_anon_pull.execution_host | default('?') }} —
+      {{ keel_anon_pull.results | default([]) | map(attribute='image') | join(', ') }}
     quiet: true
 
 - name: Read the platform version declared by this commit

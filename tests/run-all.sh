@@ -29,15 +29,15 @@ echo "══ check-mode runtime group (chgrp by GID, not name) ═════�
 tests/run-check-mode-runtime-group.sh
 
 echo
-echo "══ argv passing (16 cases; references are data, not shell) ════════"
-# The checker is only as good as how it is called. This covers the invocation.
-tests/run-argv-passing.sh
-
-echo
-echo "══ anonymous pullability (7 cases, against real registries) ═══════"
-# Network-dependent by nature: "can this be fetched right now, with no
+echo "══ remote image check (runs on the managed host, list as data) ════"
+# Covers the module AND how preflight calls it. Both have gone wrong: once by
+# interpolating the image list into shell text, and once by delegating the
+# check to the controller — which removed the host-specific protection it
+# exists to provide.
+#
+# Network-dependent in part: "can this be fetched right now, with no
 # credentials and no cache" is only answerable by asking a registry.
-tests/run-anonymous-pull.sh
+tests/run-remote-image-check.sh
 
 echo
 echo "══ runtime group scenarios (7, on a disposable Linux host) ═════════"
