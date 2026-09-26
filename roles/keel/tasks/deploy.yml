@@ -1,0 +1,270 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Compose deployment. The stack definition comes from the COMMIT, not from this
+# repository — two hand-maintained copies of one stack drift, and the drift is
+# silent until a deploy behaves unlike the tree it claims to be.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Install the stack definition from the built commit
+  ansible.builtin.copy:
+    src: "{{ keel_build_dir }}/infra/lab/compose.lab.yml"
+    dest: "{{ keel_compose_file }}"
+    remote_src: true
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  notify: Restart Keel stack
+  # In check mode on a fresh host the source was never unpacked, so there is
+  # nothing to copy and `remote_src` would fail on a missing file.
+  when: not ansible_check_mode
+
+- name: Install the OIDC overlay
+  # ⚠️ RENDERED HERE, NOT TAKEN FROM THE COMMIT, and ONLY in oidc mode. Unlike the
+  # compose file and the pg_hba policy, this expresses THIS DEPLOYMENT'S choice of
+  # sign-in methods — an infrastructure decision, the same reasoning that puts
+  # `keel_auth_methods` in this role's defaults rather than in the stack.
+  #
+  # Password-only renders NOTHING, which is the whole point: the base stack
+  # declares no KEEL_OIDC_* key, so with no overlay the three exist neither in
+  # `docker compose config` nor in any container. `${KEEL_OIDC_*:-}` used to put
+  # them there as empty strings and crash-looped the gateway.
+  ansible.builtin.template:
+    src: compose.auth-profile.yml.j2
+    dest: "{{ keel_compose_auth_file }}"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  notify: Restart Keel stack
+  when: keel_oidc_selected | bool
+
+- name: Remove a stale OIDC overlay when the deployment is password-only
+  # A leftover from a previous oidc run would still be loaded by any invocation
+  # that names it, so switching a deployment BACK to password-only has to take the
+  # file away rather than merely stop rendering it.
+  ansible.builtin.file:
+    path: "{{ keel_compose_auth_file }}"
+    state: absent
+  notify: Restart Keel stack
+  when: not (keel_oidc_selected | bool)
+
+- name: Install the PostgreSQL auth policy from the built commit
+  # ALSO FROM THE COMMIT, for the same reason as the compose file above: the
+  # auth policy is part of the stack definition, and a copy maintained here
+  # would drift from the compose file that names it.
+  #
+  # It lands beside the generated TLS material because the compose file mounts
+  # ONE directory at /etc/keel-pg and `hba_file` points inside it. 0644: this is
+  # policy, not a credential — the private key next to it carries its own 0600.
+  ansible.builtin.copy:
+    src: "{{ keel_build_dir }}/infra/lab/pg_hba.conf"
+    dest: "{{ keel_pg_hba_file }}"
+    remote_src: true
+    owner: "{{ keel_pg_uid }}"
+    group: "{{ keel_pg_gid }}"
+    mode: "0644"
+  notify: Restart Keel stack
+  when: not ansible_check_mode
+
+- name: Look for an already-installed stack definition
+  # Read-only, and it runs in EVERY mode — because the ingress assertion below
+  # must still fire against a stack that is already on disk. An existing file
+  # publishing a LAN port is a live exposure whether or not this run changes it.
+  ansible.builtin.stat:
+    path: "{{ keel_compose_file }}"
+  register: keel_compose_installed
+  check_mode: false
+
+- name: Refuse to continue if the stack would publish a LAN port
+  # The whole ingress rule in one check, made from the RENDERED config rather
+  # than the template: only 127.0.0.1 publishes are allowed, because Caddy is the
+  # single way in. A `3000:3000` slipping in here would put the gateway on every
+  # interface, which is the most likely way this stack becomes reachable by
+  # accident.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      {{ keel_compose_cmd }} config
+      | grep -E '^\s+host_ip:' | grep -v '127\.0\.0\.1' | wc -l
+    executable: /bin/bash
+    chdir: "{{ keel_root }}"
+  register: keel_lan_publishes
+  changed_when: false
+  failed_when: false
+  # Runs in check mode too — see the stat above. Guarded on the file existing so
+  # a fresh host does not try to render a stack that is not there yet.
+  check_mode: false
+  when: keel_compose_installed.stat.exists | default(false)
+
+- name: Fail when any publish is not loopback
+  ansible.builtin.assert:
+    that:
+      - (keel_lan_publishes.stdout | default('0') | trim | int) == 0
+    fail_msg: >-
+      The rendered stack publishes
+      {{ keel_lan_publishes.stdout | default('?') | trim }} port(s) on a
+      non-loopback address. Caddy is the only permitted LAN ingress. This fails
+      in check mode too: an installed stack that exposes a dependency is exposing
+      it right now, whatever this run was going to change.
+    success_msg: Every published port is bound to 127.0.0.1.
+  when: keel_compose_installed.stat.exists | default(false)
+
+- name: Note that ingress cannot be checked before the stack is installed
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: {{ keel_compose_file }} does not exist yet, so the
+      loopback-only ingress rule cannot be evaluated. It is enforced before the
+      stack starts on the next ordinary run, and again on every run thereafter.
+  when:
+    - ansible_check_mode
+    - not (keel_compose_installed.stat.exists | default(false))
+
+- name: Pull the pinned dependency images
+  # Only the upstream dependencies; the two Keel images are local builds and have
+  # no registry to pull from, so `--ignore-pull-failures` would hide a real
+  # problem. Naming the services instead is explicit about which are external.
+  ansible.builtin.command:
+    cmd: >-
+      {{ keel_compose_cmd }}
+      pull postgres nats temporal minio minio-bucket
+    chdir: "{{ keel_root }}"
+  register: keel_pull
+  changed_when: "'Pulled' in (keel_pull.stderr | default('')) or 'Downloaded' in (keel_pull.stderr | default(''))"
+  when: not ansible_check_mode
+
+# ── Starting the stack, with the diagnostics attached ───────────────────────
+#
+# `--wait` fails on a service that never becomes healthy, and what it prints is
+# a timeout — not the reason. The first native startup failed exactly here, and
+# every fact that explained it (a `Permission denied` in the gateway log, a
+# config validator listing four findings) had to be fetched by hand afterwards
+# over SSH. Those facts exist at the moment of failure; the deploy should hand
+# them over rather than make the next operator go looking.
+#
+# ⚠️ THIS RESCUE DOES NOT SWALLOW THE FAILURE. `ignore_errors` and
+# `failed_when: false` would turn a broken deploy into a green one; the rescue
+# ends with an explicit `fail`, so the play still stops exactly as it would
+# have. The only difference is what is on the screen when it does.
+- name: Start the stack, reporting the state of everything if it fails
+  when: not ansible_check_mode
+  block:
+    - name: Start the stack
+      # `up -d` runs `bootstrap` to completion first: the gateway declares
+      # `service_completed_successfully` on it, so a failed migration stops the
+      # deploy here rather than leaving a gateway serving a half-migrated schema.
+      ansible.builtin.command:
+        cmd: >-
+          {{ keel_compose_cmd }}
+          up -d --remove-orphans --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
+        chdir: "{{ keel_root }}"
+      register: keel_up
+      changed_when: true
+
+  rescue:
+    - name: Capture what compose reports about every container
+      ansible.builtin.command:
+        cmd: >-
+          {{ keel_compose_cmd }}
+          ps -a
+        chdir: "{{ keel_root }}"
+      register: keel_diag_ps
+      changed_when: false
+      failed_when: false
+
+    - name: Capture the logs of the services that explain a failed start
+      # Each separately, so one absent container cannot suppress the others —
+      # and `bootstrap` in particular exits, so it is gone from a plain `logs`
+      # follow but still holds the reason the gateway never started.
+      ansible.builtin.command:
+        cmd: >-
+          {{ keel_compose_cmd }}
+          logs --no-color --tail {{ keel_diagnostic_log_lines }} {{ item }}
+        chdir: "{{ keel_root }}"
+      register: keel_diag_logs
+      changed_when: false
+      failed_when: false
+      loop:
+        - gateway
+        - bootstrap
+        - runtime-worker
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Report the container states
+      ansible.builtin.debug:
+        msg: "{{ (keel_diag_ps.stdout | default('(docker compose ps produced nothing)')).split('\n') }}"
+
+    - name: Report each service's log
+      # `stdout_lines`, not `stdout.split('\n')`. In a FOLDED (`>-`) scalar `\n`
+      # is a literal backslash-n, not a newline, so that split returns ONE
+      # element and the whole log renders as a single unreadable blob — in the
+      # diagnostics that exist precisely to be read when a deploy has failed.
+      # The same mistake in preflight silently reduced a five-image list to one.
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['══ ' ~ item.item ~ ' ══'] +
+             (item.stdout_lines | default(['(no output)'])) }}
+      loop: "{{ keel_diag_logs.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Fail with the original error, now with context above it
+      # The deploy failed and still fails. Everything above is context, not a
+      # recovery — nothing here has fixed anything.
+      ansible.builtin.fail:
+        msg: >-
+          The stack did not come up. `docker compose ps -a` and the gateway,
+          bootstrap and runtime-worker logs are printed above. compose said:
+          {{ (keel_up.stderr | default(keel_up.stdout | default('no output')))
+             | regex_replace('\s+', ' ') | truncate(400) }}
+
+- name: Report the bootstrap result
+  ansible.builtin.command:
+    cmd: >-
+      {{ keel_compose_cmd }}
+      logs --no-color --tail 40 bootstrap
+    chdir: "{{ keel_root }}"
+  register: keel_bootstrap_logs
+  changed_when: false
+  # Post-deployment verification. In check mode nothing was started, so there is
+  # no bootstrap container to read — and a `docker compose logs` against an absent
+  # project would fail on its own predicted state.
+  when: not ansible_check_mode
+
+- name: Show the bootstrap output
+  ansible.builtin.debug:
+    var: keel_bootstrap_logs.stdout_lines
+  when: not ansible_check_mode
+
+- name: Confirm the bootstrap exited cleanly
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      docker inspect --format '{{ '{{' }}.State.ExitCode{{ '}}' }}' keel-lab-bootstrap
+    executable: /bin/bash
+  register: keel_bootstrap_exit
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Fail on a non-zero bootstrap exit
+  # STRICT IN NORMAL MODE, unchanged: the deployment is not complete unless the
+  # one-shot bootstrap exited 0. `| default('')` protects only the check-mode
+  # path where this task is skipped entirely.
+  ansible.builtin.assert:
+    that:
+      - (keel_bootstrap_exit.stdout | default('') | trim | int) == 0
+    fail_msg: >-
+      The one-shot bootstrap exited
+      {{ keel_bootstrap_exit.stdout | default('(unknown)') | trim }}. The stack is
+      up but the schema is not what this commit expects; do not treat this
+      deployment as complete.
+    success_msg: Bootstrap completed successfully (migrations applied, seal rotated, tenant seeded).
+  when: not ansible_check_mode
+
+- name: Note that the stack was not started
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: no image was built and no container was started, so the
+      migration result and container health are not verified here. Both are
+      enforced strictly on the next ordinary run, and the run fails there if the
+      migration exits non-zero.
+  when: ansible_check_mode

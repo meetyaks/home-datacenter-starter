@@ -1,0 +1,32 @@
+# A disposable Debian host with systemd, for exercising the caddy role.
+#
+# The role installs a package, enables a unit and reloads a service. None of
+# that can be tested on the control node, and dc1-x86 is not a throwaway
+# machine. systemd in a container needs a real PID 1, hence the init below and
+# the cgroup mount the runner passes.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV container=docker
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      systemd systemd-sysv dbus \
+      python3 python3-apt python3-yaml \
+      ca-certificates curl gnupg debian-keyring debian-archive-keyring \
+      apt-transport-https iproute2 procps \
+ && rm -rf /var/lib/apt/lists/*
+
+# Ansible, so the role runs with `-c local` inside the container.
+RUN apt-get update && apt-get install -y --no-install-recommends ansible \
+ && rm -rf /var/lib/apt/lists/*
+
+# Trim units that cannot work in a container and only add noise.
+RUN find /etc/systemd/system /lib/systemd/system \
+      -path '*.wants/*' \
+      \( -name '*getty*' -o -name '*udev*' -o -name '*mount*' \
+         -o -name '*swap*' -o -name '*networkd*' -o -name '*resolved*' \) \
+      -exec rm -f {} + 2>/dev/null || true
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

@@ -1,0 +1,180 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Keel lab deployment — one host, one commit, images built natively on that host.
+#
+# ═══ TWO MODES, AND THEY ARE NOT THE SAME SHAPE ══════════════════════════════
+#
+#   --check   PREFLIGHT. Everything that can be established without changing
+#             anything: the target's architecture, filesystem, Docker access and
+#             secrets; and — from the controller's git objects — that the named
+#             commit exists and actually carries every path this deployment
+#             needs. Then it prints what a real run would do, and exits.
+#
+#             It creates no archive, transfers nothing, builds nothing, starts
+#             nothing and touches no Caddy config. It also never REQUIRES any of
+#             those to exist, because on a fresh host none of them can.
+#
+#   normal    The full deployment, with every postcondition strict: manifest
+#             provenance, image identity, migration exit code, container health
+#             and the baked pack catalogue in the running image.
+#
+# ⚠️ CHECK MODE IS A PREFLIGHT, NOT A SIMULATED DEPLOYMENT. An earlier version
+# blurred that: the archive task reported `changed` under --check without
+# executing, and the unpack that followed failed on a file that had never been
+# created. A dry run must not invent work it has not done, and must not fail on
+# the absence of work it correctly declined to do.
+#
+# Every mutating phase below is therefore guarded explicitly rather than relying
+# on each module's own check-mode behaviour, which differs by module and is what
+# made the earlier failure so easy to miss.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Verify the deployment candidate is a full commit SHA
+  ansible.builtin.assert:
+    that:
+      - keel_commit is match('^[0-9a-f]{40}$')
+    fail_msg: >-
+      keel_commit must be the full 40-character SHA, not a branch, tag or
+      abbreviation. The image tag, build directory and manifest all derive from
+      it, and an abbreviation can become ambiguous as the repository grows.
+    success_msg: "Deploying Keel commit {{ keel_commit }}"
+
+- name: Prove the group_vars directory for this host is actually loaded
+  # ⚠️ ASKED FIRST, AND ASKED SEPARATELY FROM THE SECRETS, because the two
+  # failures look identical from the outside and have completely different fixes.
+  #
+  # An undefined `keel_vault_*` can mean "you forgot to write the vault file" or
+  # it can mean "Ansible never loaded the file you did write" — and the second
+  # is what happened when the vault lived at `group_vars/vault.yml`, which binds
+  # to a group named `vault` that does not exist. `--ask-vault-pass` decrypted it
+  # happily and the variables were still undefined.
+  #
+  # This canary is a committed, non-secret file sitting in the same directory as
+  # the encrypted vault. If it is visible, that directory is being loaded for
+  # this host, so a missing secret below is genuinely a missing secret.
+  ansible.builtin.assert:
+    that:
+      - keel_group_vars_source is defined
+      - keel_group_vars_source == 'inventory/group_vars/linux_servers'
+    fail_msg: >-
+      inventory/group_vars/linux_servers/ is not being loaded for
+      {{ inventory_hostname }}. Variables placed there — including the encrypted
+      vault file — are invisible to this play, so nothing below can work.
+      Confirm {{ inventory_hostname }} is in the `linux_servers` group in
+      inventory/hosts.yml, and that the directory name matches that group
+      exactly. `--ask-vault-pass` succeeding proves only that a file DECRYPTED,
+      never that it was LOADED.
+    success_msg: >-
+      group_vars/linux_servers is loaded for {{ inventory_hostname }}.
+    quiet: true
+
+- name: Require every secret to be present before anything is written
+  ansible.builtin.assert:
+    that:
+      - keel_vault_admin_db_password is defined and keel_vault_admin_db_password | length > 0
+      - keel_vault_app_db_password is defined and keel_vault_app_db_password | length > 0
+      - keel_vault_blob_access_key is defined and keel_vault_blob_access_key | length > 0
+      - keel_vault_blob_secret_key is defined and keel_vault_blob_secret_key | length > 0
+      - keel_vault_oidc_client_secret is defined and keel_vault_oidc_client_secret | length > 0
+      - keel_vault_master_key is defined and keel_vault_master_key | length > 0
+      - keel_vault_mfa_master_key is defined and keel_vault_mfa_master_key | length > 0
+      - keel_vault_jwt_private_key is defined and keel_vault_jwt_private_key | length > 0
+      - keel_vault_jwt_public_key is defined and keel_vault_jwt_public_key | length > 0
+      # Not a credential, but required in exactly the same way and for a harder
+      # reason: it is PERMANENT installation identity. There is no default for it
+      # anywhere, so an absent value must stop the run here rather than let the
+      # stack start having invented its own.
+      - keel_vault_default_tenant_id is defined and keel_vault_default_tenant_id | length > 0
+    fail_msg: >-
+      One or more keel_vault_* variables are missing. The canary above passed, so
+      inventory/group_vars/linux_servers/ IS being loaded — this is a genuinely
+      absent or misnamed variable, not a loading problem. Create
+      inventory/group_vars/linux_servers/vault.yml with ansible-vault and define
+      every name listed in roles/keel/README.md. Nothing is written until all are
+      present — a half-rendered environment file would start a stack on a blank
+      credential.
+    success_msg: All required secrets are present.
+    quiet: true
+
+# ── PREFLIGHT. Identical in both modes, and in check mode it is the run. ─────
+- name: Preflight — target, paths and the commit's own tree
+  ansible.builtin.include_tasks: preflight.yml
+
+# ── Directories and secrets ─────────────────────────────────────────────────
+#
+# Both PREDICT cleanly under --check: `file` and `template` report what they
+# would do and write nothing, which is the behaviour a preflight wants. Secret
+# CONTENT is never shown, because every task touching one is `no_log`.
+#
+# ⚠️ ORDERING IS LOAD-BEARING, IN THIS ORDER:
+#
+#   1. the runtime group — probed, validated, then created
+#   2. the directory tree — the secrets directory is group-owned by it
+#   3. the secret material — the PEMs inside that directory
+#
+# The group is provisioned FIRST and COMPLETELY, because a `chgrp` to a group
+# that does not exist is a hard failure, which is exactly how a real `--check`
+# against a fresh dc1-x86 died. The group file decides all four possible host
+# states before anything is created — in BOTH modes, since a name/GID conflict
+# is a property of the host that no run can fix — and publishes
+# `keel_runtime_group_present` so the directory file knows whether it may act.
+- name: Provision the container's runtime group
+  ansible.builtin.include_tasks: runtime-group.yml
+
+- name: Create the persistent directory tree
+  ansible.builtin.include_tasks: directories.yml
+
+- name: Install the secret material and rendered environment
+  ansible.builtin.include_tasks: secrets.yml
+
+# ── MUTATING PHASES. Guarded explicitly, not left to each module's own
+#    check-mode behaviour — which differs by module and is exactly what let a
+#    `command` report `changed` without running while the `unarchive` after it
+#    failed on the file it never produced.
+- name: Transfer and verify the source for this exact commit
+  ansible.builtin.include_tasks: source.yml
+  when: not ansible_check_mode
+
+- name: Build the images natively on this host
+  ansible.builtin.include_tasks: build.yml
+  when: not ansible_check_mode
+
+- name: Deploy the Compose stack
+  ansible.builtin.include_tasks: deploy.yml
+  when: not ansible_check_mode
+
+- name: Configure the Caddy route
+  ansible.builtin.include_tasks: caddy.yml
+  when:
+    - keel_caddy_enabled | bool
+    - not ansible_check_mode
+
+- name: Verify the deployment is healthy
+  ansible.builtin.include_tasks: verify.yml
+  when: not ansible_check_mode
+
+# ── The plan, printed only under --check. ───────────────────────────────────
+- name: What a real run would do
+  ansible.builtin.debug:
+    msg:
+      - "PREFLIGHT PASSED — nothing was changed."
+      - ""
+      - "commit        {{ keel_commit }}"
+      - "images        {{ keel_gateway_image }}, {{ keel_web_image }}"
+      - "build source  {{ keel_build_dir }}   (from git archive on the controller)"
+      - "data root     {{ keel_data_root }}"
+      - "secrets       {{ keel_secrets_dir }}, {{ keel_env_file }}   (0600 root:root)"
+      - "ingress       https://{{ keel_hostname }} via Caddy; 127.0.0.1 only otherwise"
+      - ""
+      - "An ordinary run would then:"
+      - "  1. git archive {{ keel_commit_short }} on the controller and unpack it to the build dir"
+      - "  2. verify the deployment manifest names this exact commit"
+      - "  3. build {{ keel_gateway_image }} and {{ keel_web_image }} natively here"
+      - "  4. install the stack from the built commit and refuse any non-loopback publish"
+      - "  5. run migrations once, and stop if they exit non-zero"
+      - "  6. start the stack and wait for health"
+      - "  7. write the Caddy drop-in, validate the composed config, reload Caddy and prove the route is live"
+      - "  8. verify /healthz, /readyz, the console, container state and the baked packs"
+      - ""
+      - "None of the above was performed, predicted-as-done, or required to exist."
+  when: ansible_check_mode

@@ -1,0 +1,21 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# PROOF THAT THIS DIRECTORY IS LOADED. Committed, non-secret, and deliberately
+# boring.
+#
+# It exists because the first version of this role put the vault at
+# `inventory/group_vars/vault.yml`, where Ansible reads it as variables for a
+# GROUP NAMED "vault". No such group exists, so the file was decrypted on the
+# command line, never loaded, and every `keel_vault_*` variable was undefined —
+# a failure that looked like a Vault problem and was not one.
+#
+# `group_vars/linux_servers/` is a directory, so EVERY file inside it is loaded
+# for every host in `linux_servers`, which is where dc1-x86 lives. This canary
+# rides in beside the encrypted vault file and is asserted by roles/keel, so the
+# loading path is proven by the run itself rather than assumed — and proven
+# WITHOUT reading, printing or depending on a single secret value.
+#
+# If this assertion ever fails, the vault file beside it is not being loaded
+# either, whatever the vault password prompt appeared to do.
+# ─────────────────────────────────────────────────────────────────────────────
+keel_group_vars_source: inventory/group_vars/linux_servers

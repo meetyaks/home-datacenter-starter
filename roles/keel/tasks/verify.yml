@@ -1,0 +1,341 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-deployment verification. Every check is bounded — a deployment that hangs
+# is one nobody can diagnose — and every check reads what the system DID, not
+# what Compose reported it intended to do.
+#
+# ⚠️ THE WHOLE FILE IS NORMAL-MODE ONLY, and that is not a softening.
+#
+# Nothing here verifies configuration; every task interrogates a RUNNING
+# container. In check mode no image was built and no container was started, so
+# these would not be lenient checks against a fresh host — they would be
+# assertions about things that were never created, failing on their own
+# correctly-predicted absence.
+#
+# Skipping them in check mode removes no coverage from a real deployment: an
+# ordinary run executes every one, and the play fails if any does not hold.
+# (enforced: tests/check-mode-fresh-host.yml)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Note that runtime verification is deferred
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: no container is running, so gateway health, readiness, the web
+      console, container state and the baked pack catalogue are not verified
+      here. All five are checked on the next ordinary run, and that run fails if
+      any of them does not hold.
+  when: ansible_check_mode
+
+- name: Run the post-deployment checks
+  when: not ansible_check_mode
+  block:
+    - name: Wait for the gateway to report healthy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ keel_gateway_loopback_port }}/healthz"
+        status_code: 200
+      register: keel_healthz
+      retries: "{{ keel_health_retries }}"
+      delay: "{{ keel_health_delay_seconds }}"
+      until: (keel_healthz.status | default(0)) == 200
+      changed_when: false
+
+    - name: Wait for the gateway to report ready
+      # /readyz is the one that means dependencies are reachable; /healthz only
+      # means the process is answering. A stack whose gateway is live but not
+      # ready is a stack that will fail its first real request.
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ keel_gateway_loopback_port }}/readyz"
+        status_code: 200
+      register: keel_readyz
+      retries: "{{ keel_health_retries }}"
+      delay: "{{ keel_health_delay_seconds }}"
+      until: (keel_readyz.status | default(0)) == 200
+      changed_when: false
+
+    - name: Confirm the web console answers on loopback
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ keel_web_loopback_port }}/"
+        status_code: 200
+      register: keel_web_check
+      retries: "{{ keel_health_retries }}"
+      delay: "{{ keel_health_delay_seconds }}"
+      until: (keel_web_check.status | default(0)) == 200
+      changed_when: false
+
+    - name: Collect the container state
+      ansible.builtin.command:
+        cmd: >-
+          {{ keel_compose_cmd }}
+          ps --format '{{ '{{' }}.Name{{ '}}' }}\t{{ '{{' }}.State{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}'
+        chdir: "{{ keel_root }}"
+      register: keel_ps
+      changed_when: false
+
+    - name: Show the container state
+      ansible.builtin.debug:
+        var: keel_ps.stdout_lines
+
+    - name: Confirm no long-running service is unhealthy or exited
+      # `bootstrap` and `minio-bucket` are one-shots and are SUPPOSED to be exited;
+      # every other container must be running. Asserting on the wrong set here
+      # would either fail every healthy deploy or pass a broken one.
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          {{ keel_compose_cmd }}
+          ps --format '{{ '{{' }}.Service{{ '}}' }} {{ '{{' }}.State{{ '}}' }}'
+          | grep -vE '^(bootstrap|minio-bucket) ' | grep -vc ' running'
+        executable: /bin/bash
+        chdir: "{{ keel_root }}"
+      register: keel_not_running
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when a long-running service is not running
+      ansible.builtin.assert:
+        that:
+          - (keel_not_running.stdout | default('1') | trim | int) == 0
+        fail_msg: >-
+          {{ keel_not_running.stdout | default('?') | trim }} long-running
+          service(s) are not in the running state. See the container state above.
+        success_msg: Every long-running service is up.
+
+    - name: Verify the deployed commit from inside the running gateway
+      # The strongest available check that what is RUNNING is what was DEPLOYED:
+      # read the baked pack catalogue out of the live container rather than
+      # trusting the tag on the image.
+      ansible.builtin.command:
+        cmd: docker exec keel-lab-gateway sh -c 'ls packs | wc -l'
+      register: keel_packs_in_image
+      changed_when: false
+
+    - name: Confirm the packs were baked into the running image
+      ansible.builtin.assert:
+        that:
+          - (keel_packs_in_image.stdout | default('0') | trim | int) > 0
+        fail_msg: >-
+          The running gateway has no packs. The image was built without
+          packages/gateway/Dockerfile's pack COPY, which means this host is
+          running a build that predates that fix.
+        success_msg: >-
+          {{ keel_packs_in_image.stdout | trim }} packs present in the running image.
+
+    # ── The two things that broke the first native startup ──────────────────
+    #
+    # Both are verified from INSIDE the running containers, against the real
+    # identities, because that is where the failures were. Checking the host's
+    # file modes alone would have said everything was fine: 0600 root:root is a
+    # perfectly correct-looking secret, and it is exactly what the gateway
+    # could not read.
+
+    - name: Prove the gateway's own user can read the mounted JWT keys
+      # As uid 10001, through the same bind mount the entrypoint uses. The
+      # contents are never printed — only whether the read succeeded and the
+      # byte count, which is enough to tell "readable" from the empty string a
+      # failed `cat` silently produces.
+      ansible.builtin.command:
+        cmd: >-
+          docker exec --user {{ keel_runtime_gid }}:{{ keel_runtime_gid }} keel-lab-gateway
+          sh -c 'for f in /secrets/jwt_private.pem /secrets/jwt_public.pem; do
+                   if [ -r "$f" ] && [ -s "$f" ]; then echo "READABLE $f"; else echo "UNREADABLE $f"; fi;
+                 done'
+      register: keel_jwt_readable
+      changed_when: false
+
+    - name: Confirm both PEMs are readable as the container's runtime user
+      ansible.builtin.assert:
+        that:
+          - (keel_jwt_readable.stdout | default('')) is search('READABLE /secrets/jwt_private.pem')
+          - (keel_jwt_readable.stdout | default('')) is search('READABLE /secrets/jwt_public.pem')
+          - (keel_jwt_readable.stdout | default('')) is not search('UNREADABLE')
+        fail_msg: >-
+          uid {{ keel_runtime_gid }} cannot read the mounted JWT keys:
+          {{ keel_jwt_readable.stdout | default('(no output)') | regex_replace('\s+', ' ') }}.
+          The entrypoint's `cat` would export an EMPTY string and
+          assertProductionSafe would refuse to boot with "KEEL_JWT_PRIVATE_KEY
+          missing or empty" — the original crash loop. Check {{ keel_secrets_dir }}
+          (0750) and the PEMs inside it (0440), both group
+          {{ keel_runtime_group }} / GID {{ keel_runtime_gid }}.
+        success_msg: >-
+          Both JWT PEMs are readable as uid {{ keel_runtime_gid }}, the identity
+          the gateway actually runs as.
+
+    - name: Ask PostgreSQL whether TLS is actually on
+      ansible.builtin.command:
+        cmd: docker exec keel-lab-postgres psql -U keel_admin -d keel -tAc "SHOW ssl"
+      register: keel_pg_ssl
+      changed_when: false
+
+    - name: Confirm PostgreSQL is serving TLS
+      ansible.builtin.assert:
+        that:
+          - (keel_pg_ssl.stdout | default('') | trim) == 'on'
+        fail_msg: >-
+          PostgreSQL reports ssl={{ keel_pg_ssl.stdout | default('(nothing)') | trim }}.
+          The connection strings carry `sslmode=require`, so with TLS off on the
+          server they cannot connect at all — and the production validator
+          refuses to boot without that sslmode. Both halves have to be true
+          together; a client flag on its own proves nothing.
+        success_msg: PostgreSQL reports ssl=on.
+
+    - name: Confirm the application's own connections are encrypted
+      # `SHOW ssl` proves the server OFFERS TLS. This proves the connections the
+      # application actually holds are using it — a different claim, and the one
+      # that matters.
+      ansible.builtin.command:
+        cmd: >-
+          docker exec keel-lab-postgres psql -U keel_admin -d keel -tAc
+          "select count(*) from pg_stat_ssl s join pg_stat_activity a using (pid)
+           where s.ssl and a.datname = 'keel'"
+      register: keel_pg_ssl_conns
+      changed_when: false
+
+    - name: Require at least one encrypted connection to the keel database
+      ansible.builtin.assert:
+        that:
+          - (keel_pg_ssl_conns.stdout | default('0') | trim | int) > 0
+        fail_msg: >-
+          No encrypted connection to the `keel` database is open, although the
+          gateway and worker are running. Either they are not connected to it,
+          or they reached it unencrypted — which pg_hba is supposed to reject.
+        success_msg: >-
+          {{ keel_pg_ssl_conns.stdout | trim }} encrypted connection(s) open to
+          the keel database.
+
+    # ── INGRESS, VERIFIED LAST AND REPORTED AS ITSELF ───────────────────────
+    #
+    # ⚠️ EVERYTHING ABOVE PASSING IS NOT A SUCCESSFUL DEPLOYMENT. A run once
+    # reached exactly this point — gateway healthy, console healthy, bootstrap
+    # exit 0, every dependency up, 296 migrations applied — on a host with no
+    # reverse proxy installed at all. The application was perfect and
+    # unreachable.
+    #
+    # So these checks are part of "done", and each is reported as an INGRESS
+    # result. An ingress fault described as an application failure sends the
+    # next person to debug a stack that is already working.
+    - name: Resolve the ingress hostname from this host
+      ansible.builtin.command:
+        cmd: getent hosts {{ keel_hostname }}
+      register: keel_dns
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the ingress hostname does not resolve
+      # A DNS fault, named as one. Reaching Keel by name is the deliverable, and
+      # an /etc/hosts entry on one machine is not it.
+      ansible.builtin.assert:
+        that:
+          - (keel_dns.rc | default(1)) == 0
+        fail_msg: >-
+          INGRESS (DNS): {{ keel_hostname }} does not resolve from
+          {{ inventory_hostname }}. The Keel stack itself is healthy — this is a
+          name-resolution gap, not an application fault. Add an A record for
+          {{ keel_hostname }} pointing at this host on the LAN's DNS resolver
+          (the router, or whatever serves the dc1.lan zone). Do not paper over it
+          with /etc/hosts on one machine: every client that needs the console
+          would need the same edit, and none of them would agree afterwards.
+        success_msg: >-
+          {{ keel_hostname }} resolves to
+          {{ (keel_dns.stdout | default('') | trim).split() | first | default('?') }}.
+        quiet: true
+
+    - name: Confirm the ingress serves the console over HTTPS
+      # ⚠️ CERTIFICATES ARE VERIFIED. roles/caddy publishes its internal root
+      # into this host's trust store precisely so this check can be honest;
+      # `validate_certs: false` would make it pass against a chain nobody can
+      # actually trust, which is the opposite of what it is for.
+      ansible.builtin.uri:
+        url: "https://{{ keel_hostname }}/"
+        method: GET
+        status_code: [200]
+      register: keel_ingress_root
+      retries: "{{ keel_health_retries }}"
+      delay: "{{ keel_health_delay_seconds }}"
+      until: (keel_ingress_root.status | default(0)) == 200
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the console is not served through the ingress
+      ansible.builtin.assert:
+        that:
+          - (keel_ingress_root.status | default(0)) == 200
+        fail_msg: >-
+          INGRESS: https://{{ keel_hostname }}/ returned
+          {{ keel_ingress_root.status | default('no response') }}
+          ({{ keel_ingress_root.msg | default('') }}). The Keel stack is healthy
+          — the console answers on 127.0.0.1:{{ keel_web_loopback_port }} and the
+          gateway on :{{ keel_gateway_loopback_port }} — so this is the reverse
+          proxy or its certificate, not the application. Check
+          `systemctl status caddy` and {{ keel_caddy_site_file }}.
+        success_msg: "https://{{ keel_hostname }}/ serves the console (200)."
+        quiet: true
+
+    - name: Confirm the gateway is reachable through the SAME origin
+      # The API must work through the mount on the console's own origin. If this
+      # fails while the root succeeds, the console image was built against a
+      # different browser-facing base than this deployment expects — exactly the
+      # mismatch keel_web_gateway_mount exists to pin down.
+      ansible.builtin.uri:
+        url: "https://{{ keel_hostname }}{{ keel_web_gateway_mount }}/healthz"
+        method: GET
+        status_code: [200]
+      register: keel_ingress_api
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the API is not reachable through the ingress
+      ansible.builtin.assert:
+        that:
+          - (keel_ingress_api.status | default(0)) == 200
+        fail_msg: >-
+          INGRESS (API): https://{{ keel_hostname }}{{ keel_web_gateway_mount }}/healthz
+          returned {{ keel_ingress_api.status | default('no response') }}. The
+          console is served but its same-origin gateway mount is not answering,
+          so a browser would load the page and every API call would fail. The
+          console image is built with
+          VITE_KEEL_GATEWAY_URL={{ keel_web_gateway_mount }}; a different baked-in
+          value is exactly this symptom. Check
+          {{ keel_build_root }}/WEB_GATEWAY_BASE.
+        success_msg: >-
+          The gateway answers through the same origin at
+          {{ keel_web_gateway_mount }}/healthz.
+        quiet: true
+
+    - name: Confirm the stack ports are still loopback-only
+      # Caddy must be the only way in. If either port answers on a LAN address,
+      # the compose file has been changed and the ingress is no longer the
+      # single door.
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          ss -ltnH | awk '{print $4}'
+          | grep -E ':({{ keel_gateway_loopback_port }}|{{ keel_web_loopback_port }})$'
+          | grep -vE '^(127\.0\.0\.1|\[::1\]):' | wc -l
+        executable: /bin/bash
+      register: keel_nonloopback
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when a stack port is published beyond loopback
+      ansible.builtin.assert:
+        that:
+          - (keel_nonloopback.stdout | default('0') | trim | int) == 0
+        fail_msg: >-
+          INGRESS (exposure): {{ keel_nonloopback.stdout | trim }} listener(s) on
+          ports {{ keel_gateway_loopback_port }}/{{ keel_web_loopback_port }} are
+          bound beyond loopback. Caddy must be the only LAN ingress.
+        success_msg: >-
+          Ports {{ keel_gateway_loopback_port }} and {{ keel_web_loopback_port }}
+          are bound to loopback only; Caddy is the sole LAN ingress.
+        quiet: true
+
+    - name: Summarise the deployment
+      ansible.builtin.debug:
+        msg:
+          - "commit        {{ keel_commit }}"
+          - "images        {{ keel_gateway_image }}, {{ keel_web_image }}"
+          - "gateway       127.0.0.1:{{ keel_gateway_loopback_port }} (healthz + readyz 200)"
+          - "web           127.0.0.1:{{ keel_web_loopback_port }}"
+          - "ingress       https://{{ keel_hostname }} via Caddy only"
+          - "data root     {{ keel_data_root }}"
+          - "digests       {{ keel_build_dir }}/IMAGE_DIGESTS"

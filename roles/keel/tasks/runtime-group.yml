@@ -1,0 +1,175 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE CONTAINER'S RUNTIME GID, AS A HOST GROUP.
+#
+# The gateway image ends with `USER keel` — uid/gid 10001 — and a bind mount
+# matches NUMERIC ids. So the JWT PEMs must be group-owned by GID 10001, and the
+# host needs a name for it so `ls -l` reads sensibly.
+#
+# A DEDICATED system group with NO MEMBERS. Not a pre-existing group that
+# happens to have this GID: joining a credential to some unrelated group's
+# membership would hand the JWT signing key to whoever is already in it.
+#
+# In its own file because it is a self-contained precondition with four distinct
+# host states to get right, and because `tests/` exercises THESE TASKS rather
+# than a re-implementation of them.
+#
+# ═══ THE FOUR HOST STATES ════════════════════════════════════════════════════
+#
+#   absent                        create it (real) / predict it (check)
+#   present, GID 10001            nothing to do — the desired state
+#   present, GID ≠ 10001          FAIL. `group:` would happily reuse the name at
+#                                 its existing GID, leaving the PEMs owned by a
+#                                 GID nothing in the container belongs to. The
+#                                 gateway would crash-loop and nothing would say
+#                                 why.
+#   GID 10001 held by another     FAIL. `group:` cannot create keel-runtime at
+#   name                          that GID, and chgrp'ing to 10001 anyway would
+#                                 hand the signing key to that group's members.
+#
+# ⚠️ ALL FOUR ARE DECIDED IN BOTH MODES. The two conflicts are properties of the
+# host that a real run cannot fix and must not paper over, so `--check` has to
+# surface them — that is the whole point of a preflight. Only the CREATION
+# differs between modes.
+#
+# ═══ WHY THE PROBE COMES FIRST ═══════════════════════════════════════════════
+#
+# Under `--check` the `group` module correctly creates NOTHING — a dry run must
+# not add an account-database entry — so the NAME does not resolve afterwards.
+# A `file` task naming the group then dies:
+#
+#     chgrp failed: failed to look up group keel-runtime
+#
+# which is how a real `--check` against a fresh dc1-x86 failed. Reading the
+# group database FIRST is what lets everything downstream know whether the name
+# exists, instead of assuming it does.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Read the host's group database
+  # Read-only: it inspects the host and changes nothing, so it runs in both
+  # modes. `check_mode: false` here is not the forbidden kind — that prohibition
+  # is about tasks that MUTATE during a preflight, and this one cannot.
+  # Without it the whole decision below would be made from unpopulated facts.
+  ansible.builtin.getent:
+    database: group
+  check_mode: false
+
+- name: Work out the runtime group's current state
+  ansible.builtin.set_fact:
+    # The GID the name currently has, or '' when the name is absent.
+    keel_rg_existing_gid: >-
+      {{ (getent_group[keel_runtime_group][1] | default('')) | string }}
+    # Every group name currently holding the target GID. Normally empty, or
+    # exactly the name we want.
+    keel_rg_gid_holders: >-
+      {{ getent_group | dict2items
+         | selectattr('value.1', 'equalto', keel_runtime_gid | string)
+         | map(attribute='key') | list }}
+
+- name: Refuse a runtime group that exists at the wrong GID
+  # Fails in BOTH modes. A real run cannot correct this safely — changing an
+  # existing group's GID would orphan every file already owned by it — so it is
+  # a decision for an operator, and a preflight that stayed silent would send
+  # them into a deploy that cannot work.
+  ansible.builtin.assert:
+    that:
+      - keel_rg_existing_gid == '' or keel_rg_existing_gid == (keel_runtime_gid | string)
+    fail_msg: >-
+      Host group {{ keel_runtime_group }} already exists with GID
+      {{ keel_rg_existing_gid }}, but the gateway container runs as GID
+      {{ keel_runtime_gid }}. The JWT PEMs would be group-owned by a GID nothing
+      inside the container belongs to, and the gateway would fail to read them —
+      the exact crash loop this provisioning exists to prevent. Resolve it on the
+      host: either give this group GID {{ keel_runtime_gid }} (and re-chgrp
+      anything it already owns), or set keel_runtime_group to a different name.
+    success_msg: >-
+      {{ keel_runtime_group }} is {{ 'absent' if keel_rg_existing_gid == ''
+         else 'present at the expected GID ' ~ keel_runtime_gid }}.
+    quiet: true
+
+- name: Refuse a target GID already held by a different group
+  # Also both modes, and a distinct failure from the one above: here the NAME is
+  # free but the NUMBER is taken. `group:` cannot create keel-runtime at an
+  # occupied GID, and chgrp'ing the PEMs to 10001 regardless would grant the JWT
+  # signing key to that other group's members.
+  ansible.builtin.assert:
+    that:
+      - (keel_rg_gid_holders | length) == 0
+        or keel_rg_gid_holders == [keel_runtime_group]
+    fail_msg: >-
+      GID {{ keel_runtime_gid }} on this host already belongs to
+      {{ keel_rg_gid_holders | join(', ') }}, not {{ keel_runtime_group }}. The
+      group cannot be created at that GID, and chgrp'ing the JWT keys to it
+      anyway would hand the signing key to that group's members. Free the GID or
+      change keel_runtime_gid — but note the gateway image's `USER keel` fixes it
+      at {{ keel_runtime_gid }}, so changing it means rebuilding the image.
+    success_msg: >-
+      GID {{ keel_runtime_gid }} is
+      {{ 'unused' if (keel_rg_gid_holders | length) == 0
+         else 'held by ' ~ keel_runtime_group ~ ', as intended' }}.
+    quiet: true
+
+- name: Record whether the runtime group already exists
+  # Drives the gating of anything that must name or chgrp to this group. In
+  # check mode on a fresh host this stays false, and the secrets directory is
+  # skipped-and-reported rather than attempted against a group that is not there.
+  ansible.builtin.set_fact:
+    keel_runtime_group_present: "{{ keel_rg_existing_gid == (keel_runtime_gid | string) }}"
+
+- name: Create the dedicated runtime group
+  # Unguarded: the module does the right thing in each mode on its own. In check
+  # mode it reports what it would do and creates nothing, which is why
+  # `keel_runtime_group_present` above is read rather than assumed afterwards.
+  ansible.builtin.group:
+    name: "{{ keel_runtime_group }}"
+    gid: "{{ keel_runtime_gid }}"
+    system: true
+    state: present
+  register: keel_rg_created
+
+- name: Report that the runtime group would be created
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: system group {{ keel_runtime_group }} (GID
+      {{ keel_runtime_gid }}) would be created. Nothing is added to the account
+      database by this run. The secrets directory that is group-owned by it is
+      reported rather than evaluated below, because the name does not resolve
+      until it exists.
+  when:
+    - ansible_check_mode
+    - not keel_runtime_group_present
+
+- name: Read the runtime group back after creating it
+  # REAL MODE ONLY, and this is the postcondition rather than the precondition:
+  # the assertions above decided the host was safe to act on, this one confirms
+  # the action actually took. In check mode nothing was created, so there is
+  # nothing to read back.
+  ansible.builtin.getent:
+    database: group
+    key: "{{ keel_runtime_group }}"
+  register: keel_rg_readback
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Require the created group to have exactly the container's GID
+  ansible.builtin.assert:
+    that:
+      - (getent_group[keel_runtime_group][1] | default('')) | string == (keel_runtime_gid | string)
+    fail_msg: >-
+      After creation, {{ keel_runtime_group }} has GID
+      {{ getent_group[keel_runtime_group][1] | default('(absent)') }} rather than
+      {{ keel_runtime_gid }}. The group module reported success but the account
+      database disagrees; do not continue, because the JWT PEMs would be
+      unreadable inside the container.
+    success_msg: >-
+      {{ keel_runtime_group }} is GID {{ keel_runtime_gid }}, matching the
+      gateway container's runtime group.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: The runtime group is usable from here on
+  # After a real run the group exists whether or not it did beforehand, so
+  # everything downstream may name it.
+  ansible.builtin.set_fact:
+    keel_runtime_group_present: true
+  when: not ansible_check_mode

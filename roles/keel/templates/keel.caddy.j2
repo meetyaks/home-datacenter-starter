@@ -1,0 +1,86 @@
+# {{ ansible_managed }}
+#
+# Rendered by roles/keel. Caddy itself is owned by roles/caddy: this is ONE
+# drop-in under its conf.d, and this role touches nothing else there.
+#
+# The ONLY LAN ingress to Keel. Everything the stack runs binds to 127.0.0.1 or
+# to nothing at all, so removing this file removes external access entirely.
+#
+# ═══ ⚠️ ONE UPSTREAM, NOT TWO. THIS USED TO SPLIT BY PATH PREFIX. ════════════
+#
+# The previous version matched an `@api` list — /auth/*, /records/*, /a/* and a
+# few others — to the gateway and sent everything else to the console. That
+# cannot be made correct, and the application says so itself
+# (apps/web/src/lib/gateway.ts):
+#
+#   "The gateway registers ~80 top-level prefixes and has no shared /api root,
+#    and several of them — /records, /admin, /apps, /a — are ALSO react-router
+#    paths in this SPA. Proxying prefixes by their bare names would hand an
+#    /admin deep link to the gateway instead of index.html."
+#
+# Verified against the deployed commit rather than taken on trust: the gateway
+# registers /admin, /apps, /a, /records, /work, /portal, /surfaces and ~70 more;
+# the console's router claims /admin, /admin/audit, /admin/tenants, /a/:app/…,
+# /actions and others. The two namespaces OVERLAP. The old list was also simply
+# incomplete — /apps/*, /admin/* and most of the rest were never matched, so
+# those API calls would be answered with the SPA's index.html: HTTP 200 and a
+# page of HTML where JSON was expected, which surfaces three layers away as a
+# parse error rather than as a routing bug.
+#
+# The application's own answer is a SAME-ORIGIN MOUNT. The console's bundle is
+# built to call `{{ keel_web_gateway_mount }}`, nginx inside the console image
+# strips that prefix and proxies to the gateway over the compose network, and
+# the browser only ever names this one origin. A prefix nobody routes on keeps
+# the two namespaces disjoint, which is the whole reason the mount exists.
+#
+# So Caddy's job here is exactly one rule, and there is no prefix list to get
+# wrong or to keep in step with ~80 gateway routes.
+# (enforced: tests/run-ingress-ownership.sh "the Keel route does not split gateway prefixes by path")
+
+{{ keel_hostname }} {
+	encode zstd gzip
+
+	# ── TLS ─────────────────────────────────────────────────────────────────
+	#
+	# `internal` — Caddy's own CA issues for this name. A `.lan` hostname can
+	# never get a public certificate: no ACME CA will validate a name that
+	# resolves only inside this network. This is a real chain that clients
+	# verify normally once they trust the root, NOT a self-signed certificate
+	# to be waved past. The root lives at {{ keel_caddy_internal_ca }} on this
+	# host; see roles/caddy/README.md for the client procedure.
+	tls internal
+
+	# ── One upstream: the console ───────────────────────────────────────────
+	#
+	# The console serves the SPA and proxies `{{ keel_web_gateway_mount }}/*` to
+	# the gateway itself. Routing API paths here from Caddy would reintroduce
+	# the collision described above.
+	#
+	# NO `header_up X-Forwarded-*`. Caddy sets those itself, and said so:
+	#
+	#   Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default
+	#   behavior is to pass headers to the upstream
+	#
+	# Measured rather than taken from the warning — with no header_up lines at
+	# all, the upstream received exactly:
+	#
+	#   proto=[https] host=[keel.dc1.lan] for=[127.0.0.1]
+	#
+	# so removing them changes nothing the console sees. Restating a default is
+	# not neutral: it reads as a deliberate override, and the next person has
+	# to work out which behaviour it was meant to change.
+	reverse_proxy 127.0.0.1:{{ keel_web_loopback_port }}
+
+	log {
+		output file {{ keel_caddy_log_dir }}/{{ keel_hostname }}.log
+		# Keep credentials out of the ingress log: Authorization and Cookie are
+		# the two headers most likely to carry one.
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+			}
+		}
+	}
+}

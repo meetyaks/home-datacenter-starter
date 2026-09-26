@@ -1,0 +1,105 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE AUTH PROFILE IS COMPLETE, OR THE DEPLOY STOPS HERE.
+#
+# `keel_auth_methods` is a closed list. Selecting `oidc` is a promise that a real
+# identity provider is configured, and this is where that promise is checked —
+# BEFORE anything is rendered, so an incomplete profile cannot become an env file
+# that starts a gateway.
+#
+# ═══ WHY AN ASSERTION AND NOT A DEFAULT ══════════════════════════════════════
+#
+# Because the alternative is what caused the outage this file was added after. The
+# stack declared `KEEL_OIDC_ISSUER: ${KEEL_OIDC_ISSUER:-}` — a default of "" — so
+# a missing issuer became an empty one, the gateway's config schema rejected it as
+# an invalid URL, and the container crash-looped while everything around it
+# reported healthy. A default turned a configuration mistake into a runtime
+# failure three layers away from its cause.
+#
+# So: absent is absent (password-only), present is complete (oidc), and there is
+# no third state.
+#
+# Included by preflight.yml, and directly by
+# tests/run-compose-auth-profile.sh's render play — one owner, exercised by both.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Record the declared sign-in methods
+  ansible.builtin.set_fact:
+    keel_auth_methods_list: >-
+      {{ keel_auth_methods | default('password') | split(',') | map('trim')
+         | reject('equalto', '') | list }}
+
+- name: The declared sign-in methods must be recognised
+  # A CLOSED vocabulary, for the reason `deploymentMode` is closed in Keel: a
+  # typo must not silently select a different posture. `KEEL_AUTH_METHODS=oidcc`
+  # would otherwise read as "no oidc" and quietly produce a password-only
+  # instance on a deployment that meant to require SSO.
+  ansible.builtin.assert:
+    that:
+      - keel_auth_methods_list | length > 0
+      - keel_auth_methods_list | difference(['password', 'oidc']) | length == 0
+    fail_msg: >-
+      keel_auth_methods must be a comma-separated subset of [password, oidc];
+      got {{ keel_auth_methods | default('(unset)') }}
+      (parsed as {{ keel_auth_methods_list | default([]) }}).
+      An unrecognised value is refused rather than ignored, because ignoring one
+      would silently change which sign-in methods this deployment offers.
+    quiet: true
+
+- name: Password sign-in must remain available
+  # Keel's own `authMethodsOf` never removes it, and this keeps the two ends
+  # agreeing: a deployment that declared its way out of every method would be one
+  # nobody could sign in to.
+  ansible.builtin.assert:
+    that:
+      - "'password' in keel_auth_methods_list"
+    fail_msg: >-
+      keel_auth_methods must include `password`. It is the path that always
+      exists, and removing it would leave no way in.
+    quiet: true
+
+- name: An oidc profile must be complete before anything is rendered
+  ansible.builtin.assert:
+    that:
+      - keel_oidc_issuer | default('') | trim | length > 0
+      - keel_oidc_client_id | default('') | trim | length > 0
+      - keel_vault_oidc_client_secret | default('') | trim | length > 0
+    fail_msg: >-
+      keel_auth_methods selects `oidc`, so keel_oidc_issuer, keel_oidc_client_id
+      and keel_vault_oidc_client_secret must all be set and non-empty.
+      Missing:
+      {{ [
+           ('keel_oidc_issuer' if (keel_oidc_issuer | default('') | trim | length == 0) else ''),
+           ('keel_oidc_client_id' if (keel_oidc_client_id | default('') | trim | length == 0) else ''),
+           ('keel_vault_oidc_client_secret' if (keel_vault_oidc_client_secret | default('') | trim | length == 0) else ''),
+         ] | reject('equalto', '') | join(', ') }}.
+      An EMPTY value is not a missing one to the gateway: it parses the issuer as
+      a URL and rejects "" as invalid, which crash-loops the container while every
+      dependency reports healthy. Either configure a real provider or set
+      keel_auth_methods=password.
+    quiet: true
+  when: "'oidc' in keel_auth_methods_list"
+
+- name: The oidc issuer must not point at this instance
+  # Keel refuses a self-referential issuer at boot — it is a placeholder, not a
+  # provider, and it satisfied a non-empty check while being unable to complete
+  # any sign-in. Caught here so the refusal arrives before a build, not after.
+  ansible.builtin.assert:
+    that:
+      - keel_hostname not in (keel_oidc_issuer | default(''))
+    fail_msg: >-
+      keel_oidc_issuer ({{ keel_oidc_issuer | default('') }}) names this
+      instance's own hostname. Keel serves no OIDC endpoints, so this can never
+      complete a sign-in; the gateway refuses it at boot. Point it at a real
+      provider, or set keel_auth_methods=password.
+    quiet: true
+  when: "'oidc' in keel_auth_methods_list"
+
+- name: Report the auth profile
+  ansible.builtin.debug:
+    msg: >-
+      auth profile: {{ keel_auth_methods_list | join(', ') }};
+      self-registration {{ 'ENABLED' if keel_allow_public_registration | default(false) | bool else 'closed' }}.
+      {{ 'KEEL_OIDC_* will be rendered and passed through.'
+         if 'oidc' in keel_auth_methods_list
+         else 'No KEEL_OIDC_* variable is rendered, and the compose overlay keeps all three ABSENT from the containers.' }}

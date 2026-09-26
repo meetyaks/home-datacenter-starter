@@ -1,0 +1,96 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Keel lab deployment.
+#
+#   check    ansible-playbook playbooks/keel.yml --check --diff --ask-vault-pass --ask-become-pass
+#   deploy   ansible-playbook playbooks/keel.yml --ask-vault-pass --ask-become-pass
+#   backup   ansible-playbook playbooks/keel.yml --tags backup --ask-vault-pass --ask-become-pass
+#   restore  ansible-playbook playbooks/keel.yml --tags restore --ask-vault-pass --ask-become-pass -e keel_restore_archive=…
+#   rollback ansible-playbook playbooks/keel.yml --tags rollback --ask-vault-pass --ask-become-pass
+#
+# The vault file is loaded AUTOMATICALLY from inventory/group_vars/linux_servers/
+# because dc1-x86 is in that group — `--ask-vault-pass` supplies the passphrase
+# and nothing names the file. There is deliberately no `vars_files`: a path there
+# would be absolute or user-specific, and would work on exactly one machine.
+#
+# ⚠️ BACKUP, RESTORE AND ROLLBACK ARE `never`-TAGGED. Each one stops the stack or
+# replaces live data, so none may run as a side effect of an ordinary deploy —
+# they execute only when named explicitly on the command line.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Deploy Keel to the lab host
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    # ═══ WHY THIS IS AT PLAY SCOPE AND NOT ON THE TASKS ═══════════════════════
+    #
+    # Ansible needs a temporary directory BEFORE it executes a task — the module
+    # is staged there. Anything set in a task's own `vars:` is resolved too late
+    # to influence that, which is why a task-level `ansible_user` override looked
+    # correct and changed nothing:
+    #
+    #     fatal: [dc1-x86 -> localhost]: UNREACHABLE
+    #     Attempted controller temp directory: /Users/labadmin/.ansible/tmp
+    #
+    # The default `~/.ansible/tmp` is expanded against the connection user, and
+    # for a delegated task that user was still the REMOTE one. An absolute path
+    # is never expanded, so naming one removes the question entirely.
+    #
+    # ⚠️ IT MUST BE VALID ON BOTH ENDS, and /tmp is the only thing that is:
+    #   · the controller, under whatever Mac account is running ansible-playbook
+    #   · dc1-x86, under labadmin, and under root after become
+    # No account name and no /Users path appears, so this works for any operator
+    # on any control node.
+    ansible_remote_tmp: /tmp/ansible-keel
+
+  tasks:
+    # ⚠️ INGRESS FIRST, AND IN THE SAME PLAY.
+    #
+    # Caddy is the ONLY LAN ingress: everything Keel runs binds to loopback or
+    # to nothing at all. Without it the stack is healthy and unreachable —
+    # exactly the state a deployment ended in, with gateway and web both
+    # healthy on 127.0.0.1 and no Caddy on the host.
+    #
+    # It runs BEFORE Keel so a missing ingress prerequisite costs seconds, not a
+    # source transfer, two image builds and a stack start. The Keel role's
+    # preflight asserts the fact this role sets, so a standalone run against a
+    # host where Caddy was never provisioned stops immediately and says why.
+    - name: Provision the host's reverse proxy
+      ansible.builtin.include_role:
+        name: caddy
+      when: keel_caddy_enabled | default(true) | bool
+      tags: [deploy, caddy]
+
+    - name: Deploy
+      ansible.builtin.include_role:
+        name: keel
+      tags: [deploy]
+
+    - name: Back up persistent state
+      ansible.builtin.include_role:
+        name: keel
+        tasks_from: backup
+      # ⚠️ `--check` MUST NOT reach these. They stop the stack or replace live data,
+      # and a dry run of `docker compose down` is not a dry run of anything.
+      when: not ansible_check_mode
+      tags: [backup, never]
+
+    - name: Restore persistent state
+      ansible.builtin.include_role:
+        name: keel
+        tasks_from: restore
+      # ⚠️ `--check` MUST NOT reach these. They stop the stack or replace live data,
+      # and a dry run of `docker compose down` is not a dry run of anything.
+      when: not ansible_check_mode
+      tags: [restore, never]
+
+    - name: Roll back to the previous images
+      ansible.builtin.include_role:
+        name: keel
+        tasks_from: rollback
+      # ⚠️ `--check` MUST NOT reach these. They stop the stack or replace live data,
+      # and a dry run of `docker compose down` is not a dry run of anything.
+      when: not ansible_check_mode
+      tags: [rollback, never]

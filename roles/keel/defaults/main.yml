@@ -1,0 +1,354 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Keel lab deployment — defaults.
+#
+# ⚠️ NO SECRET VALUE APPEARS IN THIS FILE OR ANYWHERE ELSE IN THIS REPOSITORY.
+# Every credential is read from `keel_vault_*` variables that live only in
+# inventory/group_vars/linux_servers/vault.yml, which .gitignore excludes. The role
+# asserts each one is defined before it writes anything, so a missing secret
+# stops the run instead of rendering an empty password into a live stack.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── WHICH COMMIT IS BEING DEPLOYED ──────────────────────────────────────────
+#
+# The full 40-character SHA, never a branch and never a tag. It is the only
+# version identity this deployment has: the image tag, the build directory and
+# the manifest all derive from it, and the role refuses to build if the archive
+# it received does not carry this exact value.
+# ⚠️ THIS PIN AND THIS ROLE'S CONFIGURATION MOVE TOGETHER.
+#
+# It pointed at a6b2a40b (PR #10's head) while this role already rendered
+# KEEL_AUTH_METHODS=password and omitted KEEL_OIDC_*. Against that commit the
+# combination is a guaranteed outage, not a mismatch to tidy up later:
+#
+#   · a6b2a40b's validator requires OIDC unconditionally, so assertProductionSafe
+#     refuses and the gateway crash-loops
+#   · packages/core/dist/onboarding/enroll-admin-cli.js does not exist there, so
+#     the enrollment play fails with exit 127 — reproduced, not predicted
+#
+# Verified present at the commit below: the enrollment CLI, the auth-methods
+# route, password-only validator support (authMethodsOf /
+# oidcIssuerIsSelfReferential), and a compose file that declares NO KEEL_OIDC_*
+# key at all.
+#
+# ⚠️ THE SECOND PIN BUMP IS ALSO A COMPOSE FIX. a6b2a40b required OIDC; 1e04c4ad
+# made it `${VAR:-}` optional, which ALWAYS EMITS THE KEY and handed the gateway
+# three empty strings — the acceptance failure. 9b0d36f0 declares none of them, so
+# unset means absent.
+keel_commit: 9b0d36f008e726f830d96c4a3932b28d13bf68dd
+
+# Derived. `sha-9b0d36f0` — short enough to read, long enough to be unambiguous.
+keel_commit_short: "{{ keel_commit[:8] }}"
+keel_image_tag: "sha-{{ keel_commit_short }}"
+keel_gateway_image: "keel-gateway:{{ keel_image_tag }}"
+keel_web_image: "keel-web:{{ keel_image_tag }}"
+
+# ── WHERE THE SOURCE COMES FROM ─────────────────────────────────────────────
+#
+# A git checkout on the CONTROL node. The role runs `git archive` on that exact
+# SHA, so what reaches the host is the commit's tree and nothing else: no .git,
+# no node_modules, no working-tree edits, no build output, no secrets.
+#
+# `lookup()` ALWAYS evaluates on the controller, so this is the controller's own
+# HOME regardless of who the remote user is. No hostname and no /Users path is
+# written down anywhere: this works for any operator on any control node.
+keel_source_repo: "{{ lookup('env', 'HOME') }}/Projects/keel"
+
+# ── THE CONTROLLER'S OWN CONTEXT ────────────────────────────────────────────
+#
+# ⚠️ THE TEMP-DIRECTORY FIX IS NOT HERE. It is `ansible_remote_tmp` at PLAY scope
+# in playbooks/keel.yml, because Ansible needs a staging directory before it runs
+# a task and anything set per task is resolved too late to matter. A previous
+# version of this file offered `keel_controller_user` as an `ansible_user`
+# override for exactly that purpose; it was ineffective and has been removed from
+# the tasks. It survives below only for MESSAGES and for the archive filename,
+# where it is read long after any connection has been made.
+#
+# `keel_controller_python` is genuine and still applied per delegated task: it
+# keeps the controller from inheriting an interpreter path resolved for the
+# remote host.
+#
+# Nothing here names a host, an account or a /Users path; both are read from the
+# running process.
+keel_controller_user: "{{ lookup('env', 'USER') }}"
+keel_controller_python: "{{ ansible_playbook_python }}"
+
+# The staging archive, on the CONTROLLER. `/tmp` rather than a home directory so
+# no account name is assumed; the controller user is in the filename so two
+# operators deploying the same commit from the same machine cannot collide.
+keel_controller_tmp_archive: "/tmp/keel-{{ keel_commit_short }}-{{ keel_controller_user }}.tar.gz"
+
+# ── FILESYSTEM ──────────────────────────────────────────────────────────────
+#
+# Build inputs and runtime state are separated on purpose: deleting a build
+# directory must never be able to reach data.
+keel_root: /srv/data/services/keel
+keel_build_root: "{{ keel_root }}/builds"
+keel_build_dir: "{{ keel_build_root }}/{{ keel_commit_short }}"
+keel_data_root: "{{ keel_root }}/data"
+keel_secrets_dir: "{{ keel_root }}/secrets"
+keel_env_dir: "{{ keel_root }}/env"
+keel_env_file: "{{ keel_env_dir }}/keel.env"
+keel_compose_file: "{{ keel_root }}/compose.lab.yml"
+
+# ── THE OIDC OVERLAY, AND WHY PASSWORD-ONLY RENDERS NONE ────────────────────
+#
+# ⚠️ `${VAR:-}` IN A COMPOSE `environment:` MAPPING ALWAYS EMITS THE KEY.
+#
+# The acceptance deployment failed on exactly that. compose.lab.yml declared
+#
+#     KEEL_OIDC_ISSUER: ${KEEL_OIDC_ISSUER:-}
+#
+# so an UNSET variable became `KEEL_OIDC_ISSUER=` in the container. This role's env
+# template correctly omitted all three; Compose put them back as empty strings,
+# the gateway's config schema rejected an empty issuer as an invalid URL, and the
+# container crash-looped while Postgres, NATS, Temporal, MinIO and the runtime
+# worker all reported healthy. Measured: 0 keys in the rendered env file, 3 empty
+# keys in the rendered gateway container.
+#
+# ABSENT AND EMPTY ARE DIFFERENT STATES. The base stack now declares none of the
+# three, in any form — a key declared there at all still shows up in
+# `docker compose config` — so password-only renders NO overlay and the keys exist
+# nowhere.
+#
+# An `oidc` deployment gets this overlay, which declares them `:?` REQUIRED so
+# Compose refuses an incomplete profile at `config` time. Rendered only in that
+# mode; `keel_compose_cmd` adds its `-f` only in that mode.
+# (enforced: tests/run-compose-auth-profile.sh)
+keel_compose_auth_file: "{{ keel_root }}/compose.auth-profile.yml"
+
+# The services that consume the shared `x-keel-env` anchor. Listed rather than
+# globbed so adding a service is a deliberate decision here too — an overlay
+# naming a service the stack does not have makes `docker compose config` fail.
+keel_compose_auth_services:
+  - gateway
+  - bootstrap
+  - runtime-worker
+
+# True when this deployment declares `oidc`. One expression, used by the overlay's
+# install task and by the compose invocation below, so the file and the `-f` that
+# loads it can never disagree.
+keel_oidc_selected: >-
+  {{ 'oidc' in (keel_auth_methods | default('password') | split(',') | map('trim') | list) }}
+
+# ── ONE DEFINITION OF HOW THIS DEPLOYMENT INVOKES COMPOSE ───────────────────
+#
+# Fifteen call sites used to spell the invocation out. Adding a conditional `-f`
+# to each by hand is exactly the shape that produces a PARTIAL fix — one forgotten
+# site and `config` would disagree with `up`, which is the most misleading
+# possible outcome. Every site now uses this.
+# (enforced: tests/run-compose-auth-profile.sh "no compose invocation bypasses
+#  the overlay")
+keel_compose_cmd: >-
+  docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+  {{ ('-f ' ~ keel_compose_auth_file) if keel_oidc_selected | bool else '' }}
+
+# ── POSTGRES SERVER CONFIGURATION AND TLS MATERIAL ──────────────────────────
+#
+# Mounted read-only at /etc/keel-pg. Holds three files:
+#
+#   server.key    generated on this host, 0600 uid 999 — postgres REFUSES to
+#                 start on a key with looser permissions, and 999 is the
+#                 postgres uid inside pgvector/pgvector:pg16
+#   server.crt    the matching self-signed certificate, world-readable
+#   pg_hba.conf   copied from the deployed COMMIT, not written here: it is part
+#                 of the stack definition, and two hand-maintained copies of an
+#                 auth policy drift silently
+#
+# Deliberately OUTSIDE the data root. `hba_file` points here rather than into
+# PGDATA so auth policy can change on a cluster that already has applied
+# migrations, without editing or re-initialising the data directory.
+keel_pg_conf_dir: "{{ keel_root }}/pg"
+keel_pg_cert_file: "{{ keel_pg_conf_dir }}/server.crt"
+keel_pg_key_file: "{{ keel_pg_conf_dir }}/server.key"
+keel_pg_hba_file: "{{ keel_pg_conf_dir }}/pg_hba.conf"
+
+# postgres inside the image. Numeric, because a bind mount carries numbers.
+keel_pg_uid: 999
+keel_pg_gid: 999
+
+# Self-signed, regenerated only when absent. 825 days is the maximum a modern
+# client will accept for a server certificate.
+keel_pg_cert_days: 825
+keel_pg_cert_cn: postgres
+
+keel_owner: root
+keel_group: root
+
+# ── THE CONTAINER'S RUNTIME IDENTITY, AS A HOST GROUP ───────────────────────
+#
+# `packages/gateway/Dockerfile` ends with `USER keel` — uid/gid 10001 — and that
+# is not negotiable: the gateway must not run as root. But a bind-mounted file
+# is matched against the container's NUMERIC ids, not a name, so 0600 root:root
+# PEMs are unreadable to it. That is exactly what the first native startup hit:
+#
+#     cat: /secrets/jwt_private.pem: Permission denied
+#     production.insecure_config: KEEL_JWT_PRIVATE_KEY missing or empty
+#
+# The `cat` failed, the export produced an EMPTY string, and
+# `assertProductionSafe` refused to boot on it. The validator was right; the
+# provisioning was wrong.
+#
+# So the host gets a DEDICATED system group whose GID is exactly the container's
+# runtime GID, and the PEMs are group-readable to it. A dedicated group, not a
+# pre-existing one that happens to have this GID: joining a credential to some
+# unrelated group's membership would hand it to whoever is already in that
+# group. This group is created by the role and has NO members — nothing on the
+# host needs to be in it. Its only purpose is to name a GID that a container
+# already runs as.
+keel_runtime_gid: 10001
+keel_runtime_group: keel-runtime
+
+# Modes, stated once and asserted after the write. The env file and the PEMs
+# have DIFFERENT policies on purpose:
+#
+#   env file   0600 root:root   Compose reads it HOST-SIDE as root, before any
+#                               container exists. Nothing in a container ever
+#                               opens it, so group access would be pure excess.
+#   JWT PEMs   0440 root:<gid>  Read inside the container as uid 10001. Read-only
+#                               even for root: nothing should ever write them
+#                               except this role, which sets the content itself.
+keel_env_file_mode: "0600"
+keel_jwt_file_mode: "0440"
+# 0750, not 0755: the container's group may traverse in, everyone else may not.
+# A 0700 directory (the previous value) blocks uid 10001 no matter what the
+# files inside are set to — the mode on the directory is checked first.
+keel_secrets_dir_mode: "0750"
+
+# ── WHAT THE COMMIT MUST CONTAIN ────────────────────────────────────────────
+#
+# Checked against the commit's own git TREE during preflight, so `--check` can
+# prove the named commit is deployable before a real run spends a build finding
+# out. Trees count as objects, which is how the two directories are checked
+# without enumerating them.
+#
+# `packs/` and `profiles/` are here because the gateway image bakes them in and
+# the runtime resolves `<cwd>/packs`: a commit predating that change builds an
+# image with NO packs, and the only symptom is a gateway that serves an empty
+# catalogue. Better to refuse the commit than to ship that.
+
+# Where the canonical platform version is DECLARED, and the only place it is
+# read from. `COMPILED_PLATFORM_VERSION` in this file is the repository's own
+# build-time truth; preflight reads it out of the COMMIT'S BLOB so the stamp on
+# the image is the version that commit states, not whatever the control node
+# happens to have checked out.
+keel_platform_version_file: packages/core/src/platform-version/version.ts
+
+keel_required_commit_paths:
+  - infra/lab/compose.lab.yml
+  # The postgres auth policy travels with the stack definition. A commit without
+  # it would deploy a compose file whose `hba_file` points at a path this role
+  # never populated, and postgres would refuse to start.
+  - infra/lab/pg_hba.conf
+  - packages/gateway/Dockerfile
+  - apps/web/Dockerfile
+  - packs
+  - profiles
+  # The version blob preflight reads; a commit without it cannot be stamped.
+  - "{{ keel_platform_version_file }}"
+
+# Data subdirectories, each a bind target in compose.lab.yml.
+keel_data_dirs:
+  - "{{ keel_data_root }}/postgres"
+  - "{{ keel_data_root }}/nats"
+  - "{{ keel_data_root }}/minio"
+
+# ── NON-SECRET CONFIGURATION ────────────────────────────────────────────────
+#
+# The optional initial platform_admin. Left empty the instance comes up with NO
+# admin, which is the safe default: `bootstrap.js` sets no password for it —
+# production auth is OIDC and the row is linked on first login — so a guessed
+# default here would create an account nobody asked for.
+keel_bootstrap_admin_email: ""
+
+keel_blob_bucket: keel-lab
+keel_hostname: keel.dc1.lan
+keel_jwt_issuer: "https://{{ keel_hostname }}/"
+keel_jwt_audience: keel-api
+keel_cors_origins: "https://{{ keel_hostname }}"
+keel_oidc_issuer: "https://{{ keel_hostname }}/oidc/"
+keel_oidc_client_id: keel-lab
+
+# ── Sign-in methods ─────────────────────────────────────────────────────────
+#
+# A CLOSED list: `password`, `oidc`. Declaring password-only is what lets this
+# deployment boot WITHOUT the KEEL_OIDC_* variables — previously the only way
+# past the production check was a self-referential placeholder issuer, which
+# satisfied "non-empty and https" and could never complete a sign-in.
+#
+# To use real SSO: add `oidc`, point keel_oidc_issuer at an ACTUAL provider (not
+# this host), and register the redirect URI with it.
+keel_auth_methods: password
+
+# Unauthenticated self-registration on /auth/register. Closed, and rendered
+# explicitly rather than left to the code default, so the env file states the
+# posture instead of implying it by omission.
+keel_allow_public_registration: false
+
+# Loopback publishes the stack makes; Caddy is the only LAN ingress.
+keel_gateway_loopback_port: 3000
+keel_web_loopback_port: 8080
+
+# ── CADDY ───────────────────────────────────────────────────────────────────
+#
+# Caddy is owned by roles/caddy, which installs the package and owns the
+# service, the main Caddyfile and the drop-in directory. THIS role writes ONE
+# file into that directory and asks for a reload. It never installs Caddy,
+# never touches the main Caddyfile and never owns the service — a role that
+# reconfigured shared ingress would make every other site on this host a
+# hostage to a Keel deployment.
+#
+# `keel_caddy_enabled: false` deploys with NO LAN ingress at all. Preflight says
+# so out loud, because the result is healthy and unreachable — a legitimate
+# choice and a terrible surprise.
+keel_caddy_enabled: true
+keel_caddy_sites_dir: /etc/caddy/conf.d
+keel_caddy_site_file: "{{ keel_caddy_sites_dir }}/keel.caddy"
+keel_caddy_log_dir: /var/log/caddy
+
+# Where roles/caddy publishes its internal root certificate. Named here so
+# messages and the rendered route can point at one path.
+keel_caddy_internal_ca: /usr/local/share/ca-certificates/caddy-lan-root.crt
+
+# ── First-administrator enrollment (tags: enroll-admin, never) ───────────────
+#
+# The command runs INSIDE the gateway container, because the database
+# credentials live in that container's environment and nowhere else on the host.
+keel_gateway_container: keel-lab-gateway
+
+
+# ── THE BROWSER-FACING GATEWAY BASE ─────────────────────────────────────────
+#
+# ⚠️ A SAME-ORIGIN MOUNT, NOT AN ABSOLUTE ORIGIN. It is baked into the SPA
+# bundle at build time and decides the whole ingress shape.
+#
+# `apps/web/src/lib/gateway.ts` documents two supported shapes: an ABSOLUTE
+# ORIGIN, where the gateway is its own host and CORS and CSP name each other; or
+# a SAME-ORIGIN MOUNT that whatever serves the SPA proxies through.
+#
+# This deployment used `https://keel.dc1.lan` — absolute, but naming the SAME
+# host as the console. That is neither shape, and it forces the reverse proxy to
+# split ~80 gateway prefixes from the SPA's own router by path. Several collide
+# outright (/admin, /apps, /a, /records), so no split can be correct.
+#
+# With the mount, nginx inside the console image strips this prefix and proxies
+# to the gateway over the compose network, the browser names exactly one origin,
+# and Caddy needs a single rule. `configure-nginx.sh` requires a plain path.
+keel_web_gateway_mount: /__keel
+
+# ── BEHAVIOUR ───────────────────────────────────────────────────────────────
+#
+# Rebuild even when the expected tag already resolves to an image. Off by
+# default: a tag derived from an immutable commit cannot legitimately mean two
+# different images, so a present tag is a finished build.
+keel_force_rebuild: false
+
+# Bounded waits. A deployment that hangs is a deployment nobody can diagnose.
+keel_build_timeout_seconds: 3600
+keel_health_retries: 30
+keel_health_delay_seconds: 10
+
+# How much of each service's log the failure diagnostics print. `--wait` reports
+# a timeout, never a reason; the reason is in these lines. 80 is enough to carry
+# a stack trace or a config-validator listing without burying the run.
+keel_diagnostic_log_lines: 80

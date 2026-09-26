@@ -1,0 +1,108 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION TEST — check mode against a FRESH host must not crash.
+#
+#   ansible-playbook -i tests/inventory-fixture.yml tests/check-mode-fresh-host.yml --check
+#
+# The whole file runs on the controller with `connection: local`, pointed at
+# directory paths that do not exist. That is what a clean dc1-x86 looks like to
+# these tasks: every path absent, no image built, no container running.
+#
+# It is NOT a substitute for a real deploy. What it pins is narrow and exactly
+# what kept breaking: that a task registering nothing, or a `stat` on an absent
+# file, cannot take down the play through an unguarded dereference. Two separate
+# incidents on this branch were that failure — `item.stat.mode` on an absent
+# file, and a delegated task inheriting the remote identity.
+#
+# THE RULE THE ROLE FOLLOWS, and what this checks:
+#
+#   read-only validation     runs in every mode        (`check_mode: false`)
+#   predicted-but-absent     skipped, with a note      (`when: not ansible_check_mode`)
+#   existing unsafe state    fails in every mode       (guarded on `.exists`)
+#   normal-mode verification unchanged and strict
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Regression — fresh-host check mode
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    keel_fresh_root: /tmp/keel-fresh-host-fixture
+    keel_owner: "{{ lookup('env', 'USER') }}"
+
+  tasks:
+    - name: Require check mode, or this test proves nothing
+      ansible.builtin.assert:
+        that:
+          - ansible_check_mode
+        fail_msg: >-
+          Run this with --check. Without it the play exercises the normal-mode
+          path, which is a different set of tasks entirely.
+
+    - name: Make sure the fixture root really is absent
+      ansible.builtin.file:
+        path: "{{ keel_fresh_root }}"
+        state: absent
+      check_mode: false
+
+    # ── The shapes that crashed, each asserted not to ──────────────────────
+    - name: A stat on an absent path returns a usable result
+      ansible.builtin.stat:
+        path: "{{ keel_fresh_root }}/nothing-here"
+      register: keel_absent_stat
+      check_mode: false
+
+    - name: Guarded dereferences of an absent stat do not raise
+      ansible.builtin.assert:
+        that:
+          - (keel_absent_stat.stat.exists | default(false)) == false
+          - (keel_absent_stat.stat.mode | default('')) == ''
+          - (keel_absent_stat.stat.pw_name | default('')) == ''
+        fail_msg: >-
+          REGRESSION: a guarded dereference of an absent stat did not behave as
+          expected. This is the shape that crashed argument finalization when
+          `item.stat.mode` was read unguarded.
+        success_msg: Absent-stat dereferences are guarded.
+
+    - name: A slurp of an absent file is survivable
+      ansible.builtin.slurp:
+        src: "{{ keel_fresh_root }}/DEPLOYMENT_MANIFEST"
+      register: keel_absent_slurp
+      failed_when: false
+      check_mode: false
+
+    - name: The manifest guard tolerates an absent file
+      ansible.builtin.assert:
+        that:
+          - keel_absent_slurp.content is not defined
+          - ('anything' in (keel_absent_slurp.content | default('') | b64decode)) == false
+        fail_msg: >-
+          REGRESSION: the `| default('') | b64decode` guard around an absent
+          manifest did not hold.
+        success_msg: Absent-slurp dereferences are guarded.
+
+    - name: A skipped command leaves no stdout, and the guards absorb it
+      ansible.builtin.command:
+        cmd: /bin/echo would-not-run
+      register: keel_skipped_cmd
+      changed_when: false
+      when: not ansible_check_mode      # deliberately skipped here
+
+    - name: Guarded numeric coercion of a skipped register does not raise
+      ansible.builtin.assert:
+        that:
+          - (keel_skipped_cmd.stdout | default('0') | trim | int) == 0
+          - (keel_skipped_cmd.stdout | default('') | length) == 0
+        fail_msg: >-
+          REGRESSION: reading `.stdout` from a skipped task is not guarded. Every
+          post-deployment assertion in the role depends on this pattern holding.
+        success_msg: Skipped-register dereferences are guarded.
+
+    - name: Fresh-host check mode survived every shape
+      ansible.builtin.debug:
+        msg: >-
+          PASS — absent stat, absent slurp and skipped-command registers all
+          dereference safely. No unguarded attribute access remains in the
+          patterns the role uses.

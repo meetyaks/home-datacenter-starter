@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# {{ ansible_managed }}
+#
+# THE MAIN CADDYFILE. Owned by roles/caddy, and by nothing else.
+#
+# ⚠️ NO SITE IS DEFINED HERE. Every site is a separate file under
+# {{ caddy_conf_d }}, owned by whichever role deploys that application. The
+# import below is the entire contract between this file and them:
+#
+#   · an application adds, changes or removes ONE file in that directory
+#   · it never edits this file, so it can never take another site down
+#   · removing an application's file removes its ingress completely
+#
+# If this file listed sites directly, every deployment would be a change to
+# shared ingress, and a syntax error in one application's route would stop every
+# other site on this host.
+# ─────────────────────────────────────────────────────────────────────────────
+
+{
+	# The admin API binds to loopback only. It can load arbitrary configuration,
+	# so exposing it on the LAN would hand ingress control to anything that can
+	# reach this host.
+	admin {{ caddy_admin_listen }}
+
+	# Ansible publishes the root to {{ caddy_internal_ca_dest }} and runs
+	# `update-ca-certificates` as root, so the host trust store is managed from
+	# the play. Caddy must therefore not ALSO try to install it: the service
+	# runs unprivileged, so the attempt fails on every start with
+	#
+	#   failed to install root certificate: failed to execute sudo
+	#
+	# The alternative to this one line is granting the caddy service sudo — a
+	# real privilege, to silence a log line about work already done. This sets
+	# `install_trust: false` in the adapted config and changes nothing else;
+	# the CA is still generated, published and trusted.
+	# (enforced: tests/run-caddy-handler-order.sh "no sudo trust error")
+	skip_install_trust
+
+	# ⚠️ DECLARED SO THE ROOT CA EXISTS AFTER THIS ROLE RUNS, not whenever some
+	# application later happens to ask for a certificate.
+	#
+	# Caddy creates the local CA lazily, on the first site that needs one. With
+	# no `pki` block, a host with no sites yet has no root certificate — so this
+	# role's "publish the root to a stable path" step found nothing on a first
+	# deploy, and the file the README tells operators to `scp` did not exist
+	# until some later run. Measured: without this block, no root.crt after a
+	# restart; with it, one is written at load.
+	#
+	# It is the same CA and the same name Caddy would have generated on its own;
+	# declaring it only fixes WHEN.
+	pki {
+		ca local {
+			name "Caddy Local Authority"
+		}
+	}
+{% for opt in caddy_global_options %}
+	{{ opt }}
+{% endfor %}
+}
+
+# Drop-ins, one per application.
+#
+# A glob that matches nothing is not an error, so this file stays valid on a
+# host with no applications deployed yet — which is exactly the state a first
+# run leaves it in.
+import {{ caddy_conf_d }}/*.caddy

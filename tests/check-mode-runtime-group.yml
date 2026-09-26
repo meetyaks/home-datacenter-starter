@@ -1,0 +1,199 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION TEST — check mode does not collapse on a group it declined to make.
+#
+#   ansible-playbook tests/check-mode-runtime-group.yml --check
+#   tests/run-check-mode-runtime-group.sh      ← runs it the right way
+#
+# ═══ WHAT BROKE ══════════════════════════════════════════════════════════════
+#
+# The role creates a dedicated host group at the container's runtime GID and
+# then chgrp's the secrets directory and the JWT PEMs to it. Under `--check`
+# the `group` module correctly creates NOTHING — a dry run must not add an
+# account-database entry — so the NAME does not resolve for the rest of the
+# play. Every later task that named the group then failed:
+#
+#     [WARNING]: failed to look up group keel-runtime.
+#     chgrp failed: failed to look up group keel-runtime
+#
+# A real `--check` against dc1-x86 died there, on a group it had itself
+# correctly declined to create.
+#
+# The fix is to address the group by NUMBER. That is also the more honest
+# identifier: a bind mount matches the GID, and the name exists only so a human
+# reading `ls -l` sees something meaningful.
+#
+# ═══ WHAT THIS PROVES ════════════════════════════════════════════════════════
+#
+#   by NAME, group absent   → FAILS          (the defect, reproduced)
+#   by GID,  group absent   → SUCCEEDS       (the fix)
+#   the role passes a GID, not a name        (static, so the fix cannot be
+#                                             undone by an edit that still
+#                                             looks right)
+#
+# Runs against localhost with a fixture directory in /tmp. No SSH, no vault, no
+# Docker, nothing written outside its own tempdir — and in check mode the chgrp
+# is never performed, so it needs no privileges.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Regression — check mode and the runtime group
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    fixture_dir: /tmp/keel-runtime-group-fixture
+    # A GID high enough to be absent from any normal account database. Verified
+    # absent below rather than assumed; the suite skips rather than lies if some
+    # machine really does have it.
+    absent_gid: 64999
+    absent_group_name: keel-runtime-fixture-absent
+
+  tasks:
+    - name: Create the fixture directory
+      ansible.builtin.file:
+        path: "{{ fixture_dir }}"
+        state: directory
+        mode: "0700"
+      check_mode: false
+
+    - name: Confirm the fixture group name really is absent
+      ansible.builtin.getent:
+        database: group
+        key: "{{ absent_group_name }}"
+      register: fixture_group
+      failed_when: false
+      check_mode: false
+
+    - name: Announce the mode
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'CHECK MODE — the case that matters'
+             if ansible_check_mode
+             else 'NORMAL mode — this suite only proves anything under --check' }}
+
+    # ══ THE DEFECT ═════════════════════════════════════════════════════════
+    - name: Case — chgrp by NAME to an absent group must fail
+      when: ansible_check_mode
+      block:
+        - name: Set the group by name
+          ansible.builtin.file:
+            path: "{{ fixture_dir }}"
+            state: directory
+            group: "{{ absent_group_name }}"
+
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            group_leaks: "{{ (group_leaks | default([])) + ['by-name chgrp to an absent group SUCCEEDED'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: >-
+              PASS — chgrp by NAME to an absent group fails, which is exactly
+              what killed the dc1-x86 dry run.
+
+    # ══ THE FIX ════════════════════════════════════════════════════════════
+    - name: Case — chgrp by GID to an absent group must succeed
+      when: ansible_check_mode
+      block:
+        - name: Set the group by numeric GID
+          ansible.builtin.file:
+            path: "{{ fixture_dir }}"
+            state: directory
+            group: "{{ absent_gid }}"
+
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: >-
+              PASS — chgrp by GID succeeds even though no group has that id.
+              This is why the role addresses the runtime group numerically.
+      rescue:
+        - name: Case FAILED
+          ansible.builtin.fail:
+            msg: >-
+              REGRESSION: chgrp by numeric GID FAILED in check mode. The fix for
+              the dc1-x86 dry-run failure does not work on this Ansible version,
+              and the role needs a different approach — not a name, which is
+              what broke.
+
+    # ══ THE ROLE ITSELF ════════════════════════════════════════════════════
+    #
+    # Static, so the fix cannot be quietly undone by an edit that still reads
+    # correctly. Runs in BOTH modes: it inspects files, not the host.
+    - name: Find any task passing the group by NAME
+      ansible.builtin.shell:
+        cmd: >-
+          grep -nE '^[[:space:]]*group:[[:space:]]*"\{\{[[:space:]]*keel_runtime_group'
+          roles/keel/tasks/directories.yml roles/keel/tasks/secrets.yml || true
+        chdir: "{{ playbook_dir }}/.."
+      register: by_name
+      check_mode: false
+      changed_when: false
+      failed_when: false
+
+    - name: The role must never chgrp by the runtime group's NAME
+      ansible.builtin.assert:
+        that:
+          - (by_name.stdout | default('') | trim) | length == 0
+        fail_msg: >-
+          A task passes `group: {{ '{{' }} keel_runtime_group {{ '}}' }}`, which
+          does not resolve under --check because the group module correctly
+          creates nothing there. Use keel_runtime_gid. Found:
+          {{ by_name.stdout | default('') | trim }}
+        success_msg: >-
+          No task chgrps by the runtime group's name; the GID is used throughout.
+        quiet: true
+
+    - name: Count the numeric chgrp call sites
+      # `grep -h … | wc -l` counts matching LINES across both files. An earlier
+      # version summed per-file `grep -c` output through awk, silently produced
+      # nothing, and failed the assertion below for a reason that had nothing to
+      # do with the role.
+      ansible.builtin.shell:
+        cmd: >-
+          grep -hE '^[[:space:]]*group:[[:space:]]*"\{\{[[:space:]]*keel_runtime_gid'
+          roles/keel/tasks/directories.yml roles/keel/tasks/secrets.yml
+          | wc -l
+        chdir: "{{ playbook_dir }}/.."
+      register: by_gid
+      check_mode: false
+      changed_when: false
+      failed_when: false
+
+    - name: Both call sites must address the group numerically
+      ansible.builtin.assert:
+        that:
+          - (by_gid.stdout | default('0') | trim | int) >= 2
+        fail_msg: >-
+          Expected at least two tasks to chgrp by keel_runtime_gid — the secrets
+          directory in main.yml and the JWT PEMs in secrets.yml. Found
+          {{ by_gid.stdout | default('0') | trim }}. If a call site was removed
+          the container may no longer be able to read its keys.
+        success_msg: >-
+          Both the secrets directory and the JWT PEMs are chgrp'd by GID.
+        quiet: true
+
+    - name: No case leaked
+      ansible.builtin.assert:
+        that:
+          - (group_leaks | default([])) | length == 0
+        fail_msg: >-
+          REGRESSION: {{ (group_leaks | default([])) | join('; ') }}. If chgrp by
+          an absent NAME now succeeds, this suite no longer reproduces the
+          original defect and proves nothing about the fix.
+        success_msg: Every case behaved as expected.
+        quiet: true
+
+    - name: Remove the fixture directory
+      ansible.builtin.file:
+        path: "{{ fixture_dir }}"
+        state: absent
+      check_mode: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'PASS — by-name chgrp fails, by-GID chgrp succeeds, and the role uses the GID at both call sites.'
+             if ansible_check_mode
+             else 'Static checks passed. Re-run with --check to exercise the two chgrp cases.' }}

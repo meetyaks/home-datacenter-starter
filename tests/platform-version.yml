@@ -1,0 +1,177 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION TEST — an empty or malformed platform version cannot reach docker build.
+#
+#   ansible-playbook tests/platform-version.yml
+#
+# ═══ WHAT THIS IS ABOUT ══════════════════════════════════════════════════════
+#
+# The role used to pass `--build-arg KEEL_PLATFORM_VERSION=` — literally empty.
+# That is NOT invalid to the platform (`resolvePlatformVersion` returns
+# `COMPILED_PLATFORM_VERSION` for an empty stamp), but it is indefensible for a
+# deployment: the image's release identity would come from whatever the source
+# tree happened to compile rather than from the commit being deployed, and every
+# compatibility decision the instance makes depends on that number.
+#
+# The version is now read from the COMMIT'S OWN BLOB and validated twice — in
+# preflight, and again immediately before the build where it is spent.
+#
+# ═══ THE FOUR CASES ══════════════════════════════════════════════════════════
+#
+#   empty      → refused      the exact value that used to be passed
+#   malformed  → refused      the platform is fail-closed on this; the gateway
+#                             would refuse to BOOT, so the build is wasted
+#   undefined  → refused      a probe that returned nothing must not be silently
+#                             treated as "use the compiled default"
+#   valid      → accepted     the control; without it a gate that refused
+#                             everything would pass the three negatives
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Regression — platform version gate
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    keel_gateway_image: keel-gateway:sha-testfixt
+    # The repository's own SEMVER_RE, from packages/core/src/platform-version/version.ts.
+    keel_version_pattern: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+  tasks:
+    # ⚠️ HOW A NEGATIVE CASE REPORTS FAILURE. Not with a `fail` inside the
+    # `block` — the rescue catches that too, prints "PASS", and the case becomes
+    # incapable of failing. All three negatives below were written that way and
+    # were silently inert. A case that WRONGLY PASSES now records itself with
+    # `set_fact` (which does not raise, so the rescue is not entered) and one
+    # assertion at the end fails on a non-empty list.
+    - name: Start with no recorded leaks
+      ansible.builtin.set_fact:
+        version_leaks: []
+
+    - name: Case — an EMPTY version is refused
+      block:
+        - name: Gate with an empty version
+          ansible.builtin.assert:
+            that:
+              - keel_platform_version is defined
+              - keel_platform_version | length > 0
+              - keel_platform_version is match(keel_version_pattern)
+            quiet: true
+          vars:
+            keel_platform_version: ""
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            version_leaks: "{{ version_leaks + ['empty — the exact value the role used to hand to docker build'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — an empty version is refused.
+
+    - name: Case — a MALFORMED version is refused
+      block:
+        - name: Gate with a malformed version
+          ansible.builtin.assert:
+            that:
+              - keel_platform_version is defined
+              - keel_platform_version | length > 0
+              - keel_platform_version is match(keel_version_pattern)
+          vars:
+            keel_platform_version: "v0.1.2"     # leading v — the platform rejects it
+
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            version_leaks: "{{ version_leaks + ['malformed v0.1.2 — SEMVER_RE has no leading v, and the gateway is fail-closed on it'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — a malformed version is refused.
+
+    - name: Case — an UNDEFINED version is refused
+      block:
+        - name: Gate with no version at all
+          ansible.builtin.assert:
+            that:
+              - keel_platform_version is defined
+              - keel_platform_version | length > 0
+              - keel_platform_version is match(keel_version_pattern)
+
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            version_leaks: "{{ version_leaks + ['undefined — a probe that returned nothing must stop the build, not fall through'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — an undefined version is refused.
+
+    - name: Case — a VALID version is accepted
+      block:
+        - name: Gate with the version this commit declares
+          ansible.builtin.assert:
+            that:
+              - keel_platform_version is defined
+              - keel_platform_version | length > 0
+              - keel_platform_version is match(keel_version_pattern)
+          vars:
+            keel_platform_version: "0.1.2"
+
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — a valid version is accepted.
+      rescue:
+        - name: Case FAILED
+          ansible.builtin.fail:
+            msg: >-
+              REGRESSION: "0.1.2" was REJECTED. Without this control a gate that
+              refused everything would pass the three negative cases and look
+              correct.
+
+    - name: No invalid version may have been accepted
+      # The single place a negative case can fail this play.
+      ansible.builtin.assert:
+        that:
+          - (version_leaks | default([])) | length == 0
+        fail_msg: >-
+          REGRESSION: {{ (version_leaks | default([])) | length }} invalid
+          version(s) were ACCEPTED by the gate —
+          {{ (version_leaks | default([])) | join('; ') }}. The stamp is baked
+          into the image and cannot be corrected afterwards.
+        success_msg: Every invalid version was refused.
+        quiet: true
+
+    # ── And the derivation itself, against the real repository ──────────────
+    - name: Derive the version from the deployment commit, as preflight does
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          git show {{ keel_test_commit }}:packages/core/src/platform-version/version.ts
+          | grep -E "^export const COMPILED_PLATFORM_VERSION"
+          | sed -E "s/.*'([^']+)'.*/\1/"
+        executable: /bin/bash
+        chdir: "{{ lookup('env', 'HOME') }}/Projects/keel"
+      register: keel_derived
+      changed_when: false
+      failed_when: false
+      when: keel_test_commit is defined
+
+    - name: The derivation must yield a version the gate accepts
+      ansible.builtin.assert:
+        that:
+          - (keel_derived.stdout | default('') | trim) | length > 0
+          - (keel_derived.stdout | default('') | trim) is match(keel_version_pattern)
+        fail_msg: >-
+          REGRESSION: reading the version from commit {{ keel_test_commit }} gave
+          "{{ keel_derived.stdout | default('(nothing)') | trim }}", which the gate
+          would refuse. The extraction and the repository have diverged.
+        success_msg: >-
+          Commit {{ keel_test_commit[:8] }} declares platform version
+          {{ keel_derived.stdout | default('') | trim }}.
+      when:
+        - keel_test_commit is defined
+        - (keel_derived.rc | default(1)) == 0
+
+    - name: All platform-version cases passed
+      ansible.builtin.debug:
+        msg: >-
+          PASS — empty, malformed and undefined versions are all refused; a valid
+          one is accepted; and the commit-blob derivation yields an accepted value.

@@ -3,5 +3,15 @@
 .env
 *.key
 *.pem
+# The real, encrypted vault. Ansible loads EVERY file in a group_vars/<group>/
+# directory, which is what makes this path work where the old one silently did not.
+inventory/group_vars/linux_servers/vault.yml
+
+# ⚠️ THE OLD PATH STAYS IGNORED, deliberately rather than by oversight.
+# This repo previously told operators to create their vault at
+# `inventory/group_vars/vault.yml`, and at least one already did — it decrypted
+# successfully on dc1-arm-1. Dropping this line would leave a file of real
+# credentials newly committable on those machines. Safe to delete once every
+# operator has moved theirs to the linux_servers directory above.
 inventory/group_vars/vault.yml
 

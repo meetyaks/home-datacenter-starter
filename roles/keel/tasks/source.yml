@@ -1,0 +1,174 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Source transfer — reproducible by construction.
+#
+# ⚠️ NORMAL MODE ONLY. main.yml includes this behind `when: not ansible_check_mode`,
+# so nothing here needs a check-mode guard of its own — and nothing here should
+# grow one. The controller-side validation that USED to live at the top of this
+# file (does the repo exist, is the commit real, does it carry what we need) has
+# moved to preflight.yml, which runs in BOTH modes. One owner per check: a copy
+# here would drift from the one `--check` actually exercises.
+#
+# `git archive <sha>` on the control node emits the COMMIT'S TREE and nothing
+# else: no .git, no node_modules, no working-tree edits, no build output, no
+# untracked secrets. That is stronger than an rsync with exclude patterns, where
+# a forgotten pattern silently ships whatever happens to be lying around — and it
+# is what makes "the thing built on the host" equal "the thing in the commit".
+#
+# The manifest then closes the loop at the far end: the host verifies the SHA it
+# was told to deploy against the SHA the archive actually carries.
+#
+# ═══ WHY EACH DELEGATED TASK REPEATS TWO LINES ════════════════════════════════
+#
+# `delegate_to` changes WHERE a task runs; it does not reset the connection
+# variables the play resolved for the TARGET. `ansible_connection: local` stops
+# an ssh-to-self, and `ansible_python_interpreter` stops the controller
+# inheriting an interpreter path resolved for the remote host. `become: false`
+# keeps controller work out of the remote privilege-escalation context.
+#
+# The TEMP DIRECTORY is not fixed here and cannot be: Ansible stages a module
+# before the task runs, so a task-level variable is resolved too late. That is
+# `ansible_remote_tmp` at play scope in playbooks/keel.yml.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Check whether this build directory is already present and verified
+  ansible.builtin.slurp:
+    src: "{{ keel_build_dir }}/DEPLOYMENT_MANIFEST"
+  register: keel_existing_manifest
+  failed_when: false
+
+- name: Record whether the source is already in place
+  ansible.builtin.set_fact:
+    keel_source_present: >-
+      {{ (keel_existing_manifest.content is defined)
+         and (keel_commit in (keel_existing_manifest.content | b64decode)) }}
+
+- name: Report the transfer decision
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Source for ' ~ keel_commit_short ~ ' is already unpacked and verified; skipping transfer.'
+         if keel_source_present
+         else 'Creating and transferring an archive of ' ~ keel_commit_short ~ '.' }}
+
+- name: Create the archive from the exact commit
+  ansible.builtin.command:
+    cmd: >-
+      git archive --format=tar.gz
+      --prefix=keel-{{ keel_commit_short }}/
+      -o {{ keel_controller_tmp_archive }}
+      {{ keel_commit }}
+    chdir: "{{ keel_source_repo }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: true
+  when: not keel_source_present
+
+- name: Confirm the archive was actually produced
+  # The task above is a `command`, which reports `changed` from its own exit
+  # status. This asserts the FILE, so a transfer can never be attempted against
+  # an archive that does not exist — the failure that reached the host when the
+  # archive step was silently not executed.
+  ansible.builtin.stat:
+    path: "{{ keel_controller_tmp_archive }}"
+  register: keel_archive_stat
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  when: not keel_source_present
+
+- name: Require the archive before transferring it
+  ansible.builtin.assert:
+    that:
+      - keel_archive_stat.stat.exists | default(false)
+      - (keel_archive_stat.stat.size | default(0)) > 0
+    fail_msg: >-
+      {{ keel_controller_tmp_archive }} was not produced on the controller, so
+      there is nothing to transfer. git archive reported success but left no
+      file — check disk space and permissions under /tmp on the control node.
+  when: not keel_source_present
+
+- name: Create the build directory
+  ansible.builtin.file:
+    path: "{{ keel_build_dir }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0755"
+  when: not keel_source_present
+
+- name: Transfer and unpack the archive
+  ansible.builtin.unarchive:
+    src: "{{ keel_controller_tmp_archive }}"
+    dest: "{{ keel_build_dir }}"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    extra_opts: ['--strip-components=1']
+  when: not keel_source_present
+
+- name: Remove the local archive
+  ansible.builtin.file:
+    path: "{{ keel_controller_tmp_archive }}"
+    state: absent
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  when: not keel_source_present
+
+- name: Write the deployment manifest
+  ansible.builtin.copy:
+    content: |
+      # Generated by roles/keel. Do not edit.
+      # This file is the host's record of WHICH COMMIT the tree beside it is.
+      keel_commit={{ keel_commit }}
+      keel_image_tag={{ keel_image_tag }}
+      deployed_from={{ inventory_hostname }}
+      deployed_at={{ ansible_date_time.iso8601 }}
+    dest: "{{ keel_build_dir }}/DEPLOYMENT_MANIFEST"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  when: not keel_source_present
+
+# ── Verification of what actually landed. Strict: this is the only run where a
+#    wrong tree can be built, so nothing here is conditional on anything.
+
+- name: Read back the deployment manifest
+  ansible.builtin.slurp:
+    src: "{{ keel_build_dir }}/DEPLOYMENT_MANIFEST"
+  register: keel_manifest
+  failed_when: false
+
+- name: Fail when the manifest names a different commit
+  ansible.builtin.assert:
+    that:
+      - keel_manifest.content is defined
+      - keel_commit in (keel_manifest.content | default('') | b64decode)
+    fail_msg: >-
+      {{ keel_build_dir }}/DEPLOYMENT_MANIFEST does not name {{ keel_commit }}.
+      Refusing to build: a build directory whose provenance cannot be proven is
+      exactly the thing an immutable image tag is supposed to rule out.
+    success_msg: "Build source verified at commit {{ keel_commit }}."
+
+- name: Confirm the stack definition arrived with the source
+  ansible.builtin.stat:
+    path: "{{ keel_build_dir }}/infra/lab/compose.lab.yml"
+  register: keel_compose_stat
+
+- name: Fail when the unpacked tree carries no lab stack
+  # Preflight already proved the COMMIT contains this path. Asserting it again
+  # here checks something different: that the transfer and unpack actually
+  # delivered it.
+  ansible.builtin.assert:
+    that:
+      - keel_compose_stat.stat.exists | default(false)
+    fail_msg: >-
+      infra/lab/compose.lab.yml is missing from {{ keel_build_dir }}, although
+      commit {{ keel_commit_short }} contains it. The transfer or unpack did not
+      deliver the whole tree.
