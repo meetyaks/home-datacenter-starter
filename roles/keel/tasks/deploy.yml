@@ -165,10 +165,15 @@
         msg: "{{ (keel_diag_ps.stdout | default('(docker compose ps produced nothing)')).split('\n') }}"
 
     - name: Report each service's log
+      # `stdout_lines`, not `stdout.split('\n')`. In a FOLDED (`>-`) scalar `\n`
+      # is a literal backslash-n, not a newline, so that split returns ONE
+      # element and the whole log renders as a single unreadable blob — in the
+      # diagnostics that exist precisely to be read when a deploy has failed.
+      # The same mistake in preflight silently reduced a five-image list to one.
       ansible.builtin.debug:
         msg: >-
           {{ ['══ ' ~ item.item ~ ' ══'] +
-             (item.stdout | default('(no output)')).split('\n') }}
+             (item.stdout_lines | default(['(no output)'])) }}
       loop: "{{ keel_diag_logs.results | default([]) }}"
       loop_control:
         label: "{{ item.item }}"

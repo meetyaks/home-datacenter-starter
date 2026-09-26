@@ -29,6 +29,11 @@ echo "══ check-mode runtime group (chgrp by GID, not name) ═════�
 tests/run-check-mode-runtime-group.sh
 
 echo
+echo "══ argv passing (16 cases; references are data, not shell) ════════"
+# The checker is only as good as how it is called. This covers the invocation.
+tests/run-argv-passing.sh
+
+echo
 echo "══ anonymous pullability (7 cases, against real registries) ═══════"
 # Network-dependent by nature: "can this be fetched right now, with no
 # credentials and no cache" is only answerable by asking a registry.

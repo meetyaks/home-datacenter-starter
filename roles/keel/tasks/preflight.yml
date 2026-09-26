@@ -290,27 +290,62 @@
   check_mode: false
 
 - name: Require the commit to pin at least one external image
+  # `stdout_lines`, not `stdout.split('\n')` — the same mistake as below, and it
+  # reported "1 external image(s) to verify" for a five-image list while looking
+  # entirely correct.
   ansible.builtin.assert:
     that:
-      - (keel_external_images.stdout | default('') | trim) | length > 0
+      - (keel_external_images.stdout_lines | default([])) | length > 0
     fail_msg: >-
       No digest-pinned image was found in commit {{ keel_commit_short }}'s
       compose file. Either the pins were removed or this extraction is broken;
       both mean the anonymous-pullability check below would silently verify
       nothing.
     success_msg: >-
-      {{ (keel_external_images.stdout | default('') | trim).split('\n') | length }}
-      external image(s) to verify.
+      {{ (keel_external_images.stdout_lines | default([])) | length }}
+      external image(s) to verify:
+      {{ (keel_external_images.stdout_lines | default([])) | join(', ') }}
     quiet: true
 
-- name: Confirm every external image is anonymously pullable from this host
+- name: Confirm every external image is anonymously pullable
   # Runs ON THE TARGET, because that is the machine that will pull, and its
   # network path and any registry blocking are what matter. Read-only: it issues
   # registry HEAD/GET requests and changes nothing, so it runs in both modes.
-  ansible.builtin.script:
-    cmd: >-
-      files/check-anonymous-pull.sh
-      {{ (keel_external_images.stdout | default('') | trim).split('\n') | map('trim') | join(' ') }}
+  # ⚠️ ARGV, NOT A COMMAND STRING. This previously used `ansible.builtin.script`
+  # with the image list interpolated into the command text. Two things made that
+  # fail on a real run:
+  #
+  #   `.split('\n')` inside a YAML folded scalar splits on a LITERAL backslash-n,
+  #   not a newline, so it returned ONE element rather than five;
+  #
+  #   `script` hands its `cmd` to a shell, so the five-line string arrived as a
+  #   PROGRAM — line 1 ran the checker with one reference and lines 2..5 were
+  #   executed as commands:
+  #
+  #       /bin/sh: 2: ghcr.io/meetyaks/minio...: not found
+  #       /bin/sh: 3: nats...: not found
+  #
+  # The checker then verified its single argument and printed PASS. A green
+  # check that had examined a fifth of its input.
+  #
+  # `stdout_lines` is already a LIST — no splitting, no filter that can silently
+  # return the wrong shape — and `command: argv:` passes each element as one
+  # opaque argument with no shell between here and the script. There is no
+  # command string left to get wrong.
+  #
+  # Delegated to the CONTROLLER because that is where the role's files live, so
+  # the checker needs no copy onto the target and preflight writes nothing
+  # anywhere. The trade-off is honest and worth stating: this proves the
+  # REGISTRY serves these images anonymously, not that this particular target's
+  # network path to it is clear. A target-specific block would still surface at
+  # `docker compose pull`, loudly and before anything is started.
+  ansible.builtin.command:
+    argv: "{{ [ role_path ~ '/files/check-anonymous-pull.sh' ] + keel_external_images.stdout_lines }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
   register: keel_anon_pull
   changed_when: false
   failed_when: false
