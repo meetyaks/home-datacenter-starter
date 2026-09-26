@@ -29,6 +29,12 @@ echo "══ check-mode runtime group (chgrp by GID, not name) ═════�
 tests/run-check-mode-runtime-group.sh
 
 echo
+echo "══ anonymous pullability (7 cases, against real registries) ═══════"
+# Network-dependent by nature: "can this be fetched right now, with no
+# credentials and no cache" is only answerable by asking a registry.
+tests/run-anonymous-pull.sh
+
+echo
 echo "══ runtime group scenarios (7, on a disposable Linux host) ═════════"
 # The only suite here that is NOT controller-only: creating and colliding system
 # groups, and proving a real run is idempotent, need root on a throwaway Linux

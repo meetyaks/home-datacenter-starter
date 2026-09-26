@@ -250,6 +250,93 @@
 # instance's release identity: every compatibility decision it makes depends on
 # it being right.
 
+# ── Every external image must be anonymously pullable, right now ────────────
+#
+# ⚠️ THIS IS THE CHECK THAT WAS MISSING, AND IT COST A DEPLOYMENT.
+#
+# A run stopped mid-deploy on `HEAD …/minio/minio/manifests/sha256:7d80… → 401`.
+# The digest had been verified a short time earlier — resolved, pulled, and the
+# container actually run. Nothing local changed. MinIO withdrew the repository
+# from public registries, and every existing check stayed green while it
+# happened: they asked whether a digest is pinned, whether a tag resolves to it,
+# and whether the image runs, and all three are answerable from a local cache.
+#
+# The only question a deploy depends on is whether a machine with no credentials
+# and no cached copy can fetch the image NOW. It is asked here, in preflight, so
+# `--check` answers it before a real run spends a source transfer and a build
+# finding out.
+#
+# Refs come from the COMMIT'S OWN compose file, so this validates what will
+# actually be deployed rather than a list maintained beside it.
+- name: Read the external image references from the commit's compose file
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      git show {{ keel_commit }}:infra/lab/compose.lab.yml
+      | grep -E '^[[:space:]]*image:'
+      | sed -E 's/^[[:space:]]*image:[[:space:]]*//'
+      | grep '@sha256:'
+      | sort -u
+    executable: /bin/bash
+    chdir: "{{ keel_source_repo }}"
+  register: keel_external_images
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require the commit to pin at least one external image
+  ansible.builtin.assert:
+    that:
+      - (keel_external_images.stdout | default('') | trim) | length > 0
+    fail_msg: >-
+      No digest-pinned image was found in commit {{ keel_commit_short }}'s
+      compose file. Either the pins were removed or this extraction is broken;
+      both mean the anonymous-pullability check below would silently verify
+      nothing.
+    success_msg: >-
+      {{ (keel_external_images.stdout | default('') | trim).split('\n') | length }}
+      external image(s) to verify.
+    quiet: true
+
+- name: Confirm every external image is anonymously pullable from this host
+  # Runs ON THE TARGET, because that is the machine that will pull, and its
+  # network path and any registry blocking are what matter. Read-only: it issues
+  # registry HEAD/GET requests and changes nothing, so it runs in both modes.
+  ansible.builtin.script:
+    cmd: >-
+      files/check-anonymous-pull.sh
+      {{ (keel_external_images.stdout | default('') | trim).split('\n') | map('trim') | join(' ') }}
+  register: keel_anon_pull
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Show the anonymous-pullability result
+  ansible.builtin.debug:
+    msg: "{{ (keel_anon_pull.stdout | default('(no output)')).split('\n') }}"
+
+- name: Fail when an external image cannot be pulled without credentials
+  ansible.builtin.assert:
+    that:
+      - (keel_anon_pull.rc | default(1)) == 0
+    fail_msg: >-
+      One or more pinned images are not anonymously pullable from
+      {{ inventory_hostname }} — see the per-image results above. This is a
+      property of the REGISTRY, not of this host's cache: the check speaks HTTP
+      to the registry and sends no credentials. Do not add registry credentials
+      to this host; find a source that serves the image anonymously, or mirror
+      it somewhere that does. A deploy started now would stop at
+      `docker compose pull`.
+    success_msg: >-
+      Every pinned external image resolves anonymously, by digest, with a
+      linux/amd64 manifest.
+    quiet: true
+
 - name: Read the platform version declared by this commit
   ansible.builtin.shell:
     cmd: >-
