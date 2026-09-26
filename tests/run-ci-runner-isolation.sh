@@ -412,6 +412,22 @@ else
   bad "the dangerous entry points are never-tagged" "one could run as a side effect of a deploy"
 fi
 
+# ⚠️ AND EVERY TAGGED INCLUDE MUST CARRY `apply:`. A tag on a dynamic
+# `include_role` applies to the include task alone; the tasks it pulls in
+# inherit nothing and are filtered out under `--tags`. `--tags rebuild`
+# reported "ok=2 changed=0" against a VM it never touched. On `--tags register`
+# the same defect would consume a one-time GitHub token, report success, and
+# leave no runner registered — a failure whose cost is a trip back to the
+# repository settings for another token.
+includes=$(grep -c 'include_role:' playbooks/ci-runner.yml)
+applies=$(grep -c '^\s*apply:' playbooks/ci-runner.yml)
+if [ "$includes" -eq "$applies" ] && [ "$includes" -gt 0 ]; then
+  ok "every include_role applies its tag to the tasks it includes ($applies/$includes)"
+else
+  bad "every tagged include carries apply:" \
+      "$applies of $includes includes — the others run nothing under --tags"
+fi
+
 # ── 8. Reversibility ───────────────────────────────────────────────────────
 echo
 echo "── 8. the runner can be removed and the VM rebuilt ──"

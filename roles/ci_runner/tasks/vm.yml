@@ -49,18 +49,33 @@
   when: ci_vm_check.rc != 0
   changed_when: true
 
-- name: Apply the resource limits on an existing VM too
-  # So a re-run with changed limits converges rather than silently keeping the
-  # values from first launch.
+- name: Read the VM's current settings
+  # ⚠️ READ BEFORE WRITING, or the role can never report a converged run. The
+  # first version simply set all three every time with `changed_when: true`, so
+  # a re-run against a correctly configured VM reported changes it had not made.
+  # `lxc config set` is silent and cannot tell us whether it did anything, so
+  # the comparison has to happen here.
   ansible.builtin.command:
-    argv: [lxc, config, set, "{{ ci_vm_name }}", "{{ item.k }}", "{{ item.v }}"]
-  loop:
-    - { k: "limits.cpu", v: "{{ ci_vm_cpu }}" }
-    - { k: "limits.memory", v: "{{ ci_vm_memory }}" }
-    # Restart on host boot, so a power cut does not silently leave CI offline.
-    - { k: "boot.autostart", v: "true" }
+    argv: [lxc, config, get, "{{ ci_vm_name }}", "{{ item.k }}"]
+  loop: "{{ ci_vm_settings }}"
   loop_control:
-    label: "{{ item.k }}={{ item.v }}"
+    label: "{{ item.k }}"
+  register: ci_vm_current
+  when: ci_vm_inspectable
+  changed_when: false
+  check_mode: false
+
+- name: Apply the settings that differ
+  # So a re-run with a changed limit converges rather than silently keeping the
+  # value from first launch — and a re-run with no change says nothing.
+  ansible.builtin.command:
+    argv: [lxc, config, set, "{{ ci_vm_name }}", "{{ item.item.k }}", "{{ item.item.v }}"]
+  loop: "{{ ci_vm_current.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.k }}={{ item.item.v }}"
+  when:
+    - ci_vm_inspectable
+    - (item.stdout | default('') | trim) != (item.item.v | string)
   changed_when: true
 
 - name: Wait for the guest agent to answer

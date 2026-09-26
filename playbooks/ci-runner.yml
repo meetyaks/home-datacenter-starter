@@ -22,6 +22,15 @@
 # token that a human mints in the repository's settings, so neither may happen
 # as a side effect of provisioning. REBUILD is `never`-tagged because it
 # destroys the VM.
+#
+# ⚠️ AND EVERY INCLUDE CARRIES `apply:`, WHICH IS NOT DECORATION. A tag on a
+# dynamic `include_role` applies to the INCLUDE TASK ONLY — the tasks it pulls
+# in inherit nothing, so under `--tags <x>` they are filtered out and the play
+# runs the include and then nothing at all. `--tags rebuild` reported
+# "ok=2 changed=0" against a VM it had not touched. The same defect on
+# `--tags register` is worse: it would consume a one-time registration token,
+# report success, and leave no runner. `apply:` pushes the tag onto the included
+# tasks so they actually run.
 # ─────────────────────────────────────────────────────────────────────────────
 
 - name: Provision and manage the CI runner VM
@@ -33,22 +42,30 @@
     - name: Build the CI VM and install the runner
       ansible.builtin.include_role:
         name: ci_runner
+        apply:
+          tags: [provision]
       tags: [provision]
 
     - name: Register the runner with GitHub
       ansible.builtin.include_role:
         name: ci_runner
         tasks_from: register.yml
+        apply:
+          tags: [register]
       tags: [register, never]
 
     - name: Remove the runner from GitHub
       ansible.builtin.include_role:
         name: ci_runner
         tasks_from: unregister.yml
+        apply:
+          tags: [unregister]
       tags: [unregister, never]
 
     - name: Destroy and rebuild the CI VM
       ansible.builtin.include_role:
         name: ci_runner
         tasks_from: rebuild.yml
+        apply:
+          tags: [rebuild]
       tags: [rebuild, never]

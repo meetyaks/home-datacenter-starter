@@ -39,6 +39,13 @@ ci_runner_scope_url: "https://github.com/meetyaks/keel"
 ci_vm_cpu: 8
 ci_vm_memory: 14GiB
 
+# What `lxc config set` must hold on the instance, checked before it is written.
+# `boot.autostart` is here so a power cut does not silently leave CI offline.
+ci_vm_settings:
+  - { k: "limits.cpu", v: "{{ ci_vm_cpu }}" }
+  - { k: "limits.memory", v: "{{ ci_vm_memory }}" }
+  - { k: "boot.autostart", v: "true" }
+
 # ⚠️ 180 GiB, NOT 250. `ubuntu-vg` had 254.68 GiB free, so a 250 GiB volume
 # would have left 4.68 GiB — no capacity to ever extend `/` or `/srv/data`
 # again, and no LVM snapshot headroom, on a host running production. 180 leaves
@@ -90,6 +97,20 @@ ci_runner_home: /home/ghrunner
 ci_runner_dir: /home/ghrunner/actions-runner
 ci_runner_work: /home/ghrunner/_work
 ci_runner_hook_dir: /opt/ci-hooks
+
+# The scripts that are rendered on the host and pushed into the guest, with
+# where each one lands. One list so the render, the checksum comparison and the
+# push cannot disagree about what the set is.
+ci_guest_files:
+  - src: guest-provision.sh.j2
+    dest: provision.sh
+    guest: /root/provision.sh
+  - src: job-hook-started.sh.j2
+    dest: job-started.sh
+    guest: "{{ ci_runner_hook_dir }}/job-started.sh"
+  - src: job-hook-completed.sh.j2
+    dest: job-completed.sh
+    guest: "{{ ci_runner_hook_dir }}/job-completed.sh"
 
 # Where the host renders the guest scripts before pushing them in. Removed at
 # the end of the run — see the last task in tasks/guest.yml.

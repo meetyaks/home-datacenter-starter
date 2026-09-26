@@ -11,6 +11,12 @@
 #
 # The scripts are rendered on the HOST and pushed in. The guest never fetches
 # its own configuration, so nothing inside the VM decides what the VM may be.
+#
+# ⚠️ AND IT CONVERGES. The first version pushed every file on every run and
+# reported eight changes against a machine it had just finished building. That
+# is the "permanent yellow" that teaches an operator to stop reading the output
+# — and then a real change goes past unread. Each push below compares the
+# guest's SHA-256 with the host's and does nothing when they agree.
 # ─────────────────────────────────────────────────────────────────────────────
 
 - name: A staging directory for the guest scripts
@@ -20,6 +26,10 @@
     owner: root
     group: root
     mode: "0700"
+  # Scratch space under /run for the duration of the play. Creating and removing
+  # it is a transport detail, not a change to the host, and reporting it as one
+  # would mean this role could never report a converged run.
+  changed_when: false
 
 - name: Stage the guest scripts on the host
   ansible.builtin.template:
@@ -31,18 +41,54 @@
     # quote would otherwise surface as every future job failing in its first
     # second, with the cause three layers away.
     validate: /bin/bash -n %s
-  loop:
-    - { src: guest-provision.sh.j2,    dest: provision.sh }
-    - { src: job-hook-started.sh.j2,   dest: job-started.sh }
-    - { src: job-hook-completed.sh.j2, dest: job-completed.sh }
+  loop: "{{ ci_guest_files }}"
   loop_control:
     label: "{{ item.dest }}"
+  changed_when: false
 
 - name: Stage the runner environment file
   ansible.builtin.template:
     src: runner.env.j2
     dest: "{{ ci_stage_dir }}/runner.env"
     mode: "0600"
+  changed_when: false
+
+# ── What the guest already has ──────────────────────────────────────────────
+- name: Read the staged files' checksums
+  ansible.builtin.stat:
+    path: "{{ ci_stage_dir }}/{{ item.dest }}"
+    checksum_algorithm: sha256
+  loop: "{{ ci_guest_files + [{'dest': 'runner.env'}] }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  register: ci_staged_sums
+  changed_when: false
+
+- name: Read the guest's copies
+  # `sha256sum` of a path that does not exist fails; `failed_when: false` makes
+  # "absent" just another mismatch rather than an error to special-case.
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", sha256sum, "{{ item.guest }}"]
+  loop: "{{ ci_guest_files + [{'dest': 'runner.env', 'guest': ci_runner_dir ~ '/.env'}] }}"
+  loop_control:
+    label: "{{ item.guest }}"
+  register: ci_guest_sums
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Work out which files the guest is missing or holds stale
+  # A file the guest does not have makes `sha256sum` fail, so its stdout is
+  # empty and the comparison is a mismatch — "absent" needs no special case.
+  ansible.builtin.set_fact:
+    ci_file_differs: >-
+      {{ ci_file_differs | default({}) | combine({
+           item.0.item.dest:
+             item.0.stat.checksum != (item.1.stdout | default('') | trim | regex_replace('\s.*$', ''))
+         }) }}
+  loop: "{{ ci_staged_sums.results | zip(ci_guest_sums.results) | list }}"
+  loop_control:
+    label: "{{ item.0.item.dest }}"
 
 - name: Push the provisioning script into the guest
   ansible.builtin.command:
@@ -55,15 +101,21 @@
       - --mode=0700
       - --uid=0
       - --gid=0
+  when: ci_file_differs['provision.sh']
   changed_when: true
 
 - name: Provision the guest
+  # ⚠️ RUNS EVERY TIME, EVEN WHEN THE SCRIPT IS UNCHANGED. The script is not the
+  # state; the guest is. A run that skipped this because the file matched would
+  # never notice Docker being removed, the runner user being deleted, or an
+  # upgrade that changed ci_runner_version without changing anything else about
+  # the script's rendered text. It is idempotent by construction and cheap when
+  # there is nothing to do.
   ansible.builtin.command:
     argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", /root/provision.sh]
   register: ci_provision
   # The script prints `CHANGED: <what>` for what it altered and nothing
-  # otherwise, so a converged re-run reports ok instead of the permanent yellow
-  # that trains an operator to stop reading the output.
+  # otherwise, so a converged re-run reports ok.
   changed_when: "'CHANGED:' in ci_provision.stdout"
 
 - name: What provisioning did
@@ -71,7 +123,7 @@
     var: ci_provision.stdout_lines
 
 - name: Push the per-job hooks into the guest
-  # root:root 0755 — see the hook-directory comment in the provisioning script.
+  # root:root 0755 — see the hook-directory note in the provisioning script.
   # The runner executes these; it must not be able to edit them.
   ansible.builtin.command:
     argv:
@@ -86,6 +138,7 @@
   loop:
     - job-started.sh
     - job-completed.sh
+  when: ci_file_differs[item]
   changed_when: true
 
 - name: Push the runner environment file into the guest
@@ -102,16 +155,18 @@
       - --mode=0644
       - --uid=0
       - --gid=0
+  when: ci_file_differs['runner.env']
   changed_when: true
 
 - name: Give the runner its environment file back
   # Pushed as root, then handed over — `lxc file push --uid` wants a numeric id
-  # the controller does not know, and looking it up to pass it back in is a
-  # round trip to learn something the guest already knows.
+  # the controller does not know, and looking it up would be a round trip to
+  # learn something the guest already knows.
   ansible.builtin.command:
     argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--",
            chown, "{{ ci_runner_user }}:{{ ci_runner_user }}", "{{ ci_runner_dir }}/.env"]
-  changed_when: false
+  when: ci_file_differs['runner.env']
+  changed_when: true
 
 - name: Remove the staged copies from the host
   # They are rendered configuration, not state. Leaving them on dc1-x86 gives a
@@ -119,3 +174,4 @@
   ansible.builtin.file:
     path: "{{ ci_stage_dir }}"
     state: absent
+  changed_when: false
