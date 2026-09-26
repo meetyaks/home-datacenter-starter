@@ -125,7 +125,7 @@
       ansible.builtin.shell:
         cmd: >-
           grep -nE '^[[:space:]]*group:[[:space:]]*"\{\{[[:space:]]*keel_runtime_group'
-          roles/keel/tasks/main.yml roles/keel/tasks/secrets.yml || true
+          roles/keel/tasks/directories.yml roles/keel/tasks/secrets.yml || true
         chdir: "{{ playbook_dir }}/.."
       register: by_name
       check_mode: false
@@ -153,7 +153,7 @@
       ansible.builtin.shell:
         cmd: >-
           grep -hE '^[[:space:]]*group:[[:space:]]*"\{\{[[:space:]]*keel_runtime_gid'
-          roles/keel/tasks/main.yml roles/keel/tasks/secrets.yml
+          roles/keel/tasks/directories.yml roles/keel/tasks/secrets.yml
           | wc -l
         chdir: "{{ playbook_dir }}/.."
       register: by_gid

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Every regression suite for roles/keel. Controller-only: no SSH, no vault, no
-# secrets, no Docker, nothing written outside /tmp fixtures.
+# Every regression suite for roles/keel. Controller-only — no SSH, no vault, no
+# secrets, nothing written outside /tmp fixtures — with ONE exception, noted at
+# the runtime-group scenarios, which need a disposable Linux container.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -26,6 +27,13 @@ tests/run-check-mode-handlers.sh
 echo
 echo "══ check-mode runtime group (chgrp by GID, not name) ═══════════════"
 tests/run-check-mode-runtime-group.sh
+
+echo
+echo "══ runtime group scenarios (7, on a disposable Linux host) ═════════"
+# The only suite here that is NOT controller-only: creating and colliding system
+# groups, and proving a real run is idempotent, need root on a throwaway Linux
+# machine. It skips loudly when Docker is absent rather than passing silently.
+tests/run-runtime-group-scenarios.sh
 
 echo
 echo "══ platform version gate ═══════════════════════════════════════════"

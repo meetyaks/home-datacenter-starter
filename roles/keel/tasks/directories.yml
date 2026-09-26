@@ -1,0 +1,81 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# The persistent directory tree.
+#
+# Split into two tasks, not one loop, because they have different preconditions:
+# all but one are root-owned and can be evaluated on any host in any mode, while
+# the secrets directory is group-owned by the container's runtime GID and cannot
+# be evaluated until that group exists.
+#
+# Build inputs and runtime state are deliberately separate — removing a build
+# directory must never be able to reach data.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Create the root-owned directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ keel_root }}", mode: "0755" }
+    - { path: "{{ keel_build_root }}", mode: "0755" }
+    - { path: "{{ keel_data_root }}", mode: "0755" }
+    # Stays 0700 root:root. Compose reads the env file HOST-SIDE as root; no
+    # container ever opens it, so there is nothing to grant.
+    - { path: "{{ keel_env_dir }}", mode: "0700" }
+    # Postgres server config and TLS material. 0755 is fine: the certificate is
+    # public, and the private key beside it is protected by its own 0600 uid-999
+    # ownership rather than by the directory.
+    - { path: "{{ keel_pg_conf_dir }}", mode: "0755" }
+  loop_control:
+    label: "{{ item.path }}"
+
+# ── The one directory that depends on the runtime group ─────────────────────
+#
+# ⚠️ 0750 root:<runtime group>, NOT 0700. The container's group must be able to
+# TRAVERSE this directory to reach the PEMs inside it: a 0700 directory denies
+# uid 10001 before the files' own 0440 mode is ever consulted. `other` still
+# gets nothing.
+#
+# GATED ON THE GROUP EXISTING. Under `--check` on a fresh host the group was
+# correctly not created, so this is skipped and reported instead. Attempting it
+# is what failed a real dry run against dc1-x86:
+#
+#     chgrp failed: failed to look up group keel-runtime
+#
+# In a real run `runtime-group.yml` has already created the group and set
+# `keel_runtime_group_present`, so this always executes.
+#
+# The GID rather than the name, even here: it is what the container actually
+# matches through the bind mount, and it cannot be defeated by a name that
+# resolves to something unexpected — which the group file has already refused,
+# but defence at the point of use costs nothing.
+# (enforced: tests/runtime-group-scenarios — fresh-host check mode)
+- name: Create the secrets directory owned by the runtime group
+  ansible.builtin.file:
+    path: "{{ keel_secrets_dir }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_runtime_gid }}"
+    mode: "{{ keel_secrets_dir_mode }}"
+  when: keel_runtime_group_present | default(false)
+
+- name: Report the secrets directory that would be created
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: {{ keel_secrets_dir }} would be created
+      {{ keel_secrets_dir_mode }} {{ keel_owner }}:{{ keel_runtime_group }}
+      (GID {{ keel_runtime_gid }}). It is not evaluated now because that group
+      does not exist yet on this host and this run is correctly not creating it.
+  when: not (keel_runtime_group_present | default(false))
+
+- name: Create the data subdirectories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0755"
+  loop: "{{ keel_data_dirs }}"
