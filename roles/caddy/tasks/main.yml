@@ -1,0 +1,181 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Install and own Caddy: the package, the service, the main Caddyfile and the
+# drop-in directory.
+#
+# Applications get ONE file each under conf.d. Nothing here reads or writes
+# those files; nothing there touches anything here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Create the APT keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install Caddy's official repository signing key
+  # Fetched to a keyring file that the repository below is Signed-By, so apt
+  # verifies every package against it. The alternative on offer upstream is
+  # `curl | sh`, which runs unaudited shell as root and leaves no package
+  # record to upgrade or remove.
+  ansible.builtin.get_url:
+    url: "{{ caddy_apt_key_url }}"
+    dest: "{{ caddy_apt_keyring }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure Caddy's official repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/caddy-stable.sources
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      Types: deb
+      URIs: {{ caddy_apt_repo_url }}
+      Suites: any-version
+      Components: main
+      Architectures: {{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}
+      Signed-By: {{ caddy_apt_keyring }}
+  register: caddy_repository
+
+- name: Refresh package metadata after repository changes
+  ansible.builtin.apt:
+    update_cache: true
+  when: caddy_repository.changed
+
+- name: Install Caddy
+  # `state: present`, never `latest`: apt installs it once and does not move the
+  # version under a running service on later runs. Upgrading is an explicit act
+  # (`caddy_upgrade=true`), not a side effect of deploying an application.
+  ansible.builtin.apt:
+    name: "caddy{{ ('=' ~ caddy_version) if caddy_version | length > 0 else '' }}"
+    state: "{{ 'latest' if caddy_upgrade | bool else 'present' }}"
+  notify: Restart Caddy
+
+- name: Record the installed version
+  ansible.builtin.command:
+    cmd: caddy version
+  register: caddy_installed_version
+  changed_when: false
+  check_mode: false
+
+- name: Report the installed version
+  ansible.builtin.debug:
+    msg: >-
+      Caddy {{ (caddy_installed_version.stdout | default('(unknown)')).split('\n')[0] }}
+      ({{ 'pinned to ' ~ caddy_version if caddy_version | length > 0
+          else 'version policy: install-once from stable, never auto-upgraded' }})
+
+# ── Filesystem the role owns ────────────────────────────────────────────────
+
+- name: Create the Caddy configuration directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/caddy
+    # The drop-in directory is created HERE, by the owner of Caddy — not by the
+    # first application that happens to want a route. An application that had to
+    # create it would also be deciding its permissions.
+    - "{{ caddy_conf_d }}"
+
+- name: Create the Caddy log directory
+  # Owned by the service account, because Caddy writes here as itself.
+  ansible.builtin.file:
+    path: "{{ caddy_log_dir }}"
+    state: directory
+    owner: "{{ caddy_user }}"
+    group: "{{ caddy_group }}"
+    mode: "0750"
+
+- name: Install the main Caddyfile
+  # ATOMIC: `template` writes a temporary file, validates it, and only then
+  # moves it into place. A failed validation leaves the previous file untouched
+  # and the running service unaffected.
+  #
+  # The validation here composes the WHOLE configuration — this file imports
+  # conf.d/*.caddy — so a broken drop-in is caught before this file is replaced.
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ caddy_config_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: caddy validate --adapter caddyfile --config %s
+  notify: Reload Caddy
+
+- name: Enable and start Caddy
+  ansible.builtin.systemd_service:
+    name: caddy
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ── The internal CA, so private hostnames get a real certificate chain ──────
+
+- name: Flush handlers so Caddy is running with the current config
+  # The CA below does not exist until Caddy has started and issued at least
+  # once. Reading it before the reload would find nothing on a first run.
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for Caddy's internal CA to exist
+  ansible.builtin.wait_for:
+    path: "{{ caddy_internal_ca_src }}"
+    timeout: 60
+  register: caddy_ca_wait
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Publish the internal root certificate to a stable path
+  # Caddy keeps it under its own data directory, which is 0700 and versioned by
+  # an implementation detail of its PKI layout. Copying it somewhere readable
+  # gives operators one path to trust and to hand to clients.
+  ansible.builtin.copy:
+    src: "{{ caddy_internal_ca_src }}"
+    dest: "{{ caddy_internal_ca_dest }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  register: caddy_ca_published
+  when:
+    - not ansible_check_mode
+    - (caddy_ca_wait.state | default('')) == 'file'
+
+- name: Trust the internal root on this host
+  # So health checks made ON this host verify the chain properly. The
+  # alternative — passing --insecure or validate_certs: false — makes every
+  # check pass, including the ones that should not.
+  ansible.builtin.command:
+    cmd: update-ca-certificates
+  register: caddy_ca_trusted
+  changed_when: "'added' in (caddy_ca_trusted.stdout | default(''))"
+  when:
+    - caddy_trust_internal_ca_locally | bool
+    - not ansible_check_mode
+    - caddy_ca_published is defined and (caddy_ca_published.changed | default(false))
+
+- name: Report where the internal root certificate lives
+  ansible.builtin.debug:
+    msg:
+      - "Caddy internal root CA: {{ caddy_internal_ca_dest }}"
+      - "(Caddy's own copy: {{ caddy_internal_ca_src }})"
+      - "Clients on the LAN must trust this certificate to reach https://<name>.lan"
+      - "without a warning. See roles/caddy/README.md for the macOS procedure."
+
+# ── The fact the Keel role's preflight looks for ────────────────────────────
+#
+# Set LAST, so it means "Caddy was provisioned successfully in this play" rather
+# than "this role started". An application role asserts it before spending a
+# build on a host whose ingress was never set up.
+- name: Record that Caddy was provisioned in this play
+  ansible.builtin.set_fact:
+    caddy_role_applied: true
+    caddy_conf_d_path: "{{ caddy_conf_d }}"

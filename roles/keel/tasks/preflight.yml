@@ -17,6 +17,43 @@
 
 # ── The target ──────────────────────────────────────────────────────────────
 
+# ── Ingress ownership, asserted BEFORE anything is spent ────────────────────
+#
+# ⚠️ THE FAILURE THIS PREVENTS. A deployment transferred the source, built two
+# images, started the whole stack, brought every service to healthy — and only
+# then discovered there was no Caddy on the host at all. The application was
+# fine and unreachable, and the run had spent everything before finding out.
+#
+# `caddy_role_applied` is set by roles/caddy at the END of its own run, so it
+# means "ingress was provisioned successfully in this play" rather than "someone
+# intended it". A standalone invocation of this role against a host nobody
+# manages ingress for stops here, in seconds, naming the fix.
+- name: Require ingress to be provisioned in this play
+  ansible.builtin.assert:
+    that:
+      - caddy_role_applied | default(false) | bool
+    fail_msg: >-
+      keel_caddy_enabled is true, but the caddy role has not run in this play.
+      Keel publishes nothing to the LAN — gateway and web bind to 127.0.0.1 and
+      every dependency binds to nothing — so without Caddy this deployment ends
+      healthy and unreachable.
+      Run playbooks/keel.yml, which provisions Caddy first. If you are invoking
+      this role directly, include the `caddy` role before it. To deploy with no
+      ingress on purpose, set keel_caddy_enabled=false and wire the route
+      yourself afterwards.
+    success_msg: Ingress is owned by the caddy role and was provisioned in this play.
+    quiet: true
+  when: keel_caddy_enabled | bool
+
+- name: Note that ingress is deliberately not managed
+  ansible.builtin.debug:
+    msg: >-
+      keel_caddy_enabled is false. Nothing will be published to the LAN: the
+      gateway and console stay on 127.0.0.1 and no route is written. This is a
+      deliberate choice, not a default — reaching Keel afterwards needs a
+      reverse proxy configured by hand.
+  when: not (keel_caddy_enabled | bool)
+
 - name: Confirm the target is the expected architecture
   ansible.builtin.assert:
     that:

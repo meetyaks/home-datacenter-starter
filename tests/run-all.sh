@@ -40,6 +40,18 @@ echo "══ remote image check (runs on the managed host, list as data) ══�
 tests/run-remote-image-check.sh
 
 echo
+echo "══ ingress ownership (23 static checks) ═══════════════════════════"
+# One owner for Caddy, provisioned before Keel, and a route that does not try
+# to split ~80 gateway prefixes from the SPA's router by path.
+tests/run-ingress-ownership.sh
+
+echo
+echo "══ caddy role (16 checks, on a disposable systemd host) ═══════════"
+# Installing a package, enabling a unit and reloading a service need root on a
+# throwaway Linux machine. Skips loudly when Docker is absent.
+tests/run-caddy-role.sh
+
+echo
 echo "══ runtime group scenarios (7, on a disposable Linux host) ═════════"
 # The only suite here that is NOT controller-only: creating and colliding system
 # groups, and proving a real run is idempotent, need root on a throwaway Linux

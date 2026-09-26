@@ -1,38 +1,55 @@
 ---
 # ─────────────────────────────────────────────────────────────────────────────
-# Caddy route. Caddy is SEPARATELY MANAGED shared infrastructure: this role
-# writes one drop-in file and asks Caddy to reload it. It does not install
-# Caddy, does not touch the main Caddyfile, and does not own the service — a
-# role that reconfigured shared ingress would make every other site on this host
-# a hostage to a Keel deployment.
+# The Keel route. ONE FILE, AND ONLY THIS ONE.
+#
+# Caddy is owned by roles/caddy: the package, the service, the main Caddyfile
+# and the drop-in directory. This role writes `keel.caddy` into that directory
+# and asks for a reload. It does not create the directory, does not read or
+# write anyone else's drop-in, and never touches the main Caddyfile — a role
+# that reconfigured shared ingress would make every other site on this host a
+# hostage to a Keel deployment.
+#
+# The prerequisite is checked in PREFLIGHT, not here: by the time this runs the
+# source has been transferred, two images built and the stack started, and
+# discovering a missing ingress now would mean having spent all of it first.
+# That is exactly how a deployment ended healthy and unreachable.
 # ─────────────────────────────────────────────────────────────────────────────
 
 - name: Confirm Caddy's drop-in directory exists
   ansible.builtin.stat:
     path: "{{ keel_caddy_sites_dir }}"
   register: keel_caddy_dir
-  # Read-only precondition: it runs in check mode, because "is Caddy even here"
-  # is answerable without changing anything and is exactly what a dry run is for.
+  # Read-only, so it runs in every mode.
   check_mode: false
 
-- name: Fail when Caddy is not present as expected
+- name: Fail when the drop-in directory is missing
+  # Preflight already required the caddy role to have run in this play, so
+  # reaching here means it ran and the directory still is not there — a
+  # different and more surprising fault than "Caddy was never installed".
   ansible.builtin.assert:
     that:
       - keel_caddy_dir.stat.exists | default(false)
       - keel_caddy_dir.stat.isdir | default(false)
     fail_msg: >-
-      {{ keel_caddy_sites_dir }} does not exist. Caddy is managed separately and
-      is expected to import that directory. Set keel_caddy_enabled=false to
-      deploy without touching ingress, then wire the route by hand.
+      {{ keel_caddy_sites_dir }} does not exist even though the caddy role
+      reported success in this play. Investigate roles/caddy — it owns that
+      directory — rather than working around it here.
+    quiet: true
 
-- name: Install the Keel site file
+- name: Install the Keel route
+  # ATOMIC AND VALIDATED: `template` renders to a temporary file, runs
+  # `caddy validate` against it, and only moves it into place if that passes.
+  # A syntax error therefore never reaches the directory, so the next reload —
+  # by anyone, for any site — cannot trip over it.
+  #
+  # The handler validates the COMPOSED configuration again before reloading,
+  # because a file can be valid alone and still break the whole. Both checks
+  # leave the running service untouched when they fail.
   ansible.builtin.template:
     src: keel.caddy.j2
     dest: "{{ keel_caddy_site_file }}"
     owner: root
     group: root
     mode: "0644"
-    # Refuse to install a file Caddy cannot parse. Without this a syntax error
-    # takes down every OTHER site on this host at the next reload.
     validate: caddy validate --adapter caddyfile --config %s
   notify: Reload Caddy

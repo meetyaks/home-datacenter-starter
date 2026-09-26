@@ -1,0 +1,72 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Caddy — the host's reverse proxy and the ONLY LAN ingress.
+#
+# This role OWNS Caddy: the package, the service, the main Caddyfile and the
+# drop-in directory. Applications own one file each under conf.d and nothing
+# else. That boundary is the point — a role that rewrote the main Caddyfile
+# would make every other site on the host a hostage to its own deployment.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Package source ──────────────────────────────────────────────────────────
+#
+# Caddy's official Debian/Ubuntu repository, hosted on Cloudsmith. The signing
+# key is fetched to a keyring file and the repository is Signed-By that file, so
+# apt verifies every package against it. No `curl | sh`: an installer that runs
+# arbitrary downloaded shell as root is not a supply chain anyone can audit, and
+# it leaves no package manager record to upgrade or remove.
+caddy_apt_key_url: https://dl.cloudsmith.io/public/caddy/stable/gpg.key
+caddy_apt_keyring: /etc/apt/keyrings/caddy-stable.asc
+caddy_apt_repo_url: https://dl.cloudsmith.io/public/caddy/stable/deb/debian
+
+# ── Version policy ──────────────────────────────────────────────────────────
+#
+# EMPTY MEANS "whatever stable currently offers", pinned only by the apt state
+# below. That is a deliberate, documented choice rather than an oversight:
+#
+#   · Caddy is ingress, not application code. A security fix in its TLS stack
+#     is one we want, and the lab has no change window to schedule around.
+#   · `state: present` (not `latest`) means apt installs it once and NEVER
+#     upgrades it on a subsequent run. So a deploy is still reproducible in the
+#     sense that matters — re-running this role does not silently move the
+#     version under a running service.
+#
+# To pin, set a full apt version here, e.g. "2.8.4". The role then requests
+# exactly that and apt refuses rather than substituting a different one.
+caddy_version: ""
+
+# Upgrading is an explicit act, never a side effect of a deploy.
+caddy_upgrade: false
+
+# ── Filesystem ──────────────────────────────────────────────────────────────
+caddy_config_file: /etc/caddy/Caddyfile
+caddy_conf_d: /etc/caddy/conf.d
+caddy_log_dir: /var/log/caddy
+
+# The package creates these; named here so the role can assert rather than hope.
+caddy_user: caddy
+caddy_group: caddy
+
+# ── Internal TLS for private hostnames ──────────────────────────────────────
+#
+# `.lan` names cannot get a public certificate — no ACME CA will validate a name
+# that resolves only inside this network. Caddy's own internal CA issues for
+# them instead, which is a real certificate chain, verified normally, rather
+# than the self-signed-and-ignore-the-warning shape.
+#
+# The root certificate lives under Caddy's data directory. The role copies it to
+# a stable, readable path so it can be trusted on this host and distributed to
+# clients.
+caddy_internal_ca_src: /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt
+caddy_internal_ca_dest: /usr/local/share/ca-certificates/caddy-lan-root.crt
+
+# Trust the internal root on the host itself, so health checks made here verify
+# the certificate properly instead of being told to skip verification. Turning
+# verification off to make a check pass is how a broken chain goes unnoticed.
+caddy_trust_internal_ca_locally: true
+
+# ── Global Caddyfile options ────────────────────────────────────────────────
+#
+# Deliberately minimal. Anything site-specific belongs in that site's drop-in.
+caddy_admin_listen: "localhost:2019"
+caddy_global_options: []

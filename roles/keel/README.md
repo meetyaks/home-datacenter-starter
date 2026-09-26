@@ -274,9 +274,12 @@ encrypted or not, is loaded with it.
 7. **Migrates** once; the gateway waits on it completing successfully, and a
    non-zero exit fails the play.
 8. **Configures** one Caddy drop-in, `caddy validate`-checked before install and
-   applied with a *reload*, never a restart — Caddy is shared infrastructure.
-9. **Verifies** `/healthz`, `/readyz`, the console, container state, and that the
-   running image actually contains its baked packs.
+   applied with a *reload*, never a restart. Caddy itself is installed and owned
+   by roles/caddy, which runs first.
+9. **Verifies** `/healthz`, `/readyz`, the console, container state, the baked
+   packs — and then INGRESS: name resolution, the console and the API through
+   https://keel.dc1.lan with certificates verified, and that no stack port is
+   bound beyond loopback. The deployment is not complete until those pass.
 
 ## Idempotence
 
@@ -308,6 +311,54 @@ Caddy only. The gateway publishes `127.0.0.1:3000` and the console
 Temporal and MinIO publish nothing at all. The role *asserts* this from the
 rendered Compose config on every run, because a `3000:3000` slipping in is the
 most likely way this stack would accidentally become reachable.
+
+**Caddy itself is owned by [`roles/caddy`](../caddy/README.md)** — the package,
+the service, `/etc/caddy/Caddyfile` and `/etc/caddy/conf.d`. This role writes
+exactly one file, `conf.d/keel.caddy`, and notifies the owner's reload handler.
+
+> This boundary used to have no owner on the other side of it. A deployment
+> finished with every service healthy and was completely unreachable: there was
+> no Caddy on the host at all — no binary, no package, no unit, nothing on 80 or
+> 443. The role had always deferred to "separately managed shared
+> infrastructure" that nothing in this repository ever managed.
+>
+> The playbook now provisions Caddy **first**, and this role's **preflight**
+> refuses to continue without it. That ordering is the point: the failure above
+> was discovered *after* a source transfer, two image builds and a full stack
+> start.
+
+### One upstream, not two
+
+The route sends everything to the console on `127.0.0.1:8080`. It does **not**
+split API paths off to the gateway, and that is deliberate — the console's own
+source explains why:
+
+> The gateway registers ~80 top-level prefixes and has no shared `/api` root,
+> and several of them — `/records`, `/admin`, `/apps`, `/a` — are ALSO
+> react-router paths in this SPA.
+
+So no prefix list can be correct. The console is built with
+`VITE_KEEL_GATEWAY_URL=/__keel`, a same-origin mount that nginx inside that
+image strips and proxies to the gateway over the Compose network. The browser
+names one origin, and Caddy needs one rule.
+
+Changing `keel_web_gateway_mount` forces the console image to rebuild even
+though its tag is unchanged — the value is baked into the bundle, and the tag is
+the commit. The last-used value is recorded at
+`{{ keel_build_root }}/WEB_GATEWAY_BASE`.
+
+### TLS and DNS
+
+`tls internal` — Caddy's own CA issues for `keel.dc1.lan`, because no public CA
+will validate a name that resolves only on this LAN. It is a real chain, not a
+warning to click through, and nothing here disables verification. The root
+certificate and the macOS trust procedure are in
+[`roles/caddy/README.md`](../caddy/README.md).
+
+Caddy answers for the name; it does not make it resolve. That needs an A record
+on the LAN resolver. Post-deploy verification fails with an explicit
+`INGRESS (DNS)` message when it is missing, rather than leaving it to be found
+from a browser.
 
 ## Rollback
 

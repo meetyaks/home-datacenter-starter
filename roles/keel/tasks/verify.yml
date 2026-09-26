@@ -202,6 +202,133 @@
           {{ keel_pg_ssl_conns.stdout | trim }} encrypted connection(s) open to
           the keel database.
 
+    # ── INGRESS, VERIFIED LAST AND REPORTED AS ITSELF ───────────────────────
+    #
+    # ⚠️ EVERYTHING ABOVE PASSING IS NOT A SUCCESSFUL DEPLOYMENT. A run once
+    # reached exactly this point — gateway healthy, console healthy, bootstrap
+    # exit 0, every dependency up, 296 migrations applied — on a host with no
+    # reverse proxy installed at all. The application was perfect and
+    # unreachable.
+    #
+    # So these checks are part of "done", and each is reported as an INGRESS
+    # result. An ingress fault described as an application failure sends the
+    # next person to debug a stack that is already working.
+    - name: Resolve the ingress hostname from this host
+      ansible.builtin.command:
+        cmd: getent hosts {{ keel_hostname }}
+      register: keel_dns
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the ingress hostname does not resolve
+      # A DNS fault, named as one. Reaching Keel by name is the deliverable, and
+      # an /etc/hosts entry on one machine is not it.
+      ansible.builtin.assert:
+        that:
+          - (keel_dns.rc | default(1)) == 0
+        fail_msg: >-
+          INGRESS (DNS): {{ keel_hostname }} does not resolve from
+          {{ inventory_hostname }}. The Keel stack itself is healthy — this is a
+          name-resolution gap, not an application fault. Add an A record for
+          {{ keel_hostname }} pointing at this host on the LAN's DNS resolver
+          (the router, or whatever serves the dc1.lan zone). Do not paper over it
+          with /etc/hosts on one machine: every client that needs the console
+          would need the same edit, and none of them would agree afterwards.
+        success_msg: >-
+          {{ keel_hostname }} resolves to
+          {{ (keel_dns.stdout | default('') | trim).split() | first | default('?') }}.
+        quiet: true
+
+    - name: Confirm the ingress serves the console over HTTPS
+      # ⚠️ CERTIFICATES ARE VERIFIED. roles/caddy publishes its internal root
+      # into this host's trust store precisely so this check can be honest;
+      # `validate_certs: false` would make it pass against a chain nobody can
+      # actually trust, which is the opposite of what it is for.
+      ansible.builtin.uri:
+        url: "https://{{ keel_hostname }}/"
+        method: GET
+        status_code: [200]
+      register: keel_ingress_root
+      retries: "{{ keel_health_retries }}"
+      delay: "{{ keel_health_delay_seconds }}"
+      until: (keel_ingress_root.status | default(0)) == 200
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the console is not served through the ingress
+      ansible.builtin.assert:
+        that:
+          - (keel_ingress_root.status | default(0)) == 200
+        fail_msg: >-
+          INGRESS: https://{{ keel_hostname }}/ returned
+          {{ keel_ingress_root.status | default('no response') }}
+          ({{ keel_ingress_root.msg | default('') }}). The Keel stack is healthy
+          — the console answers on 127.0.0.1:{{ keel_web_loopback_port }} and the
+          gateway on :{{ keel_gateway_loopback_port }} — so this is the reverse
+          proxy or its certificate, not the application. Check
+          `systemctl status caddy` and {{ keel_caddy_site_file }}.
+        success_msg: "https://{{ keel_hostname }}/ serves the console (200)."
+        quiet: true
+
+    - name: Confirm the gateway is reachable through the SAME origin
+      # The API must work through the mount on the console's own origin. If this
+      # fails while the root succeeds, the console image was built against a
+      # different browser-facing base than this deployment expects — exactly the
+      # mismatch keel_web_gateway_mount exists to pin down.
+      ansible.builtin.uri:
+        url: "https://{{ keel_hostname }}{{ keel_web_gateway_mount }}/healthz"
+        method: GET
+        status_code: [200]
+      register: keel_ingress_api
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the API is not reachable through the ingress
+      ansible.builtin.assert:
+        that:
+          - (keel_ingress_api.status | default(0)) == 200
+        fail_msg: >-
+          INGRESS (API): https://{{ keel_hostname }}{{ keel_web_gateway_mount }}/healthz
+          returned {{ keel_ingress_api.status | default('no response') }}. The
+          console is served but its same-origin gateway mount is not answering,
+          so a browser would load the page and every API call would fail. The
+          console image is built with
+          VITE_KEEL_GATEWAY_URL={{ keel_web_gateway_mount }}; a different baked-in
+          value is exactly this symptom. Check
+          {{ keel_build_root }}/WEB_GATEWAY_BASE.
+        success_msg: >-
+          The gateway answers through the same origin at
+          {{ keel_web_gateway_mount }}/healthz.
+        quiet: true
+
+    - name: Confirm the stack ports are still loopback-only
+      # Caddy must be the only way in. If either port answers on a LAN address,
+      # the compose file has been changed and the ingress is no longer the
+      # single door.
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          ss -ltnH | awk '{print $4}'
+          | grep -E ':({{ keel_gateway_loopback_port }}|{{ keel_web_loopback_port }})$'
+          | grep -vE '^(127\.0\.0\.1|\[::1\]):' | wc -l
+        executable: /bin/bash
+      register: keel_nonloopback
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when a stack port is published beyond loopback
+      ansible.builtin.assert:
+        that:
+          - (keel_nonloopback.stdout | default('0') | trim | int) == 0
+        fail_msg: >-
+          INGRESS (exposure): {{ keel_nonloopback.stdout | trim }} listener(s) on
+          ports {{ keel_gateway_loopback_port }}/{{ keel_web_loopback_port }} are
+          bound beyond loopback. Caddy must be the only LAN ingress.
+        success_msg: >-
+          Ports {{ keel_gateway_loopback_port }} and {{ keel_web_loopback_port }}
+          are bound to loopback only; Caddy is the sole LAN ingress.
+        quiet: true
+
     - name: Summarise the deployment
       ansible.builtin.debug:
         msg:

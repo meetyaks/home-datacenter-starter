@@ -48,6 +48,14 @@
     - name: Import the role's handlers
       ansible.builtin.import_tasks: ../roles/keel/handlers/main.yml
 
+    # `Reload Caddy` now lives in roles/caddy, which OWNS the service — the Keel
+    # role notifies it but no longer defines it, because two handlers sharing a
+    # name resolve ambiguously. Imported here as well, since the guard matters
+    # wherever the handler lives: a reload applying configuration that check
+    # mode never wrote is not a dry run of anything.
+    - name: Import the ingress owner's handlers
+      ansible.builtin.import_tasks: ../roles/caddy/handlers/main.yml
+
   tasks:
     - name: Require check mode
       ansible.builtin.assert:

@@ -46,6 +46,23 @@
     ansible_remote_tmp: /tmp/ansible-keel
 
   tasks:
+    # ⚠️ INGRESS FIRST, AND IN THE SAME PLAY.
+    #
+    # Caddy is the ONLY LAN ingress: everything Keel runs binds to loopback or
+    # to nothing at all. Without it the stack is healthy and unreachable —
+    # exactly the state a deployment ended in, with gateway and web both
+    # healthy on 127.0.0.1 and no Caddy on the host.
+    #
+    # It runs BEFORE Keel so a missing ingress prerequisite costs seconds, not a
+    # source transfer, two image builds and a stack start. The Keel role's
+    # preflight asserts the fact this role sets, so a standalone run against a
+    # host where Caddy was never provisioned stops immediately and says why.
+    - name: Provision the host's reverse proxy
+      ansible.builtin.include_role:
+        name: caddy
+      when: keel_caddy_enabled | default(true) | bool
+      tags: [deploy, caddy]
+
     - name: Deploy
       ansible.builtin.include_role:
         name: keel

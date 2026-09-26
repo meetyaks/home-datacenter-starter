@@ -94,16 +94,54 @@
   poll: 15
   when: keel_force_rebuild | bool or not keel_gateway_present
 
+# ── The web image's baked-in gateway base ───────────────────────────────────
+#
+# ⚠️ A BUILD ARG CHANGE DOES NOT CHANGE THE IMAGE TAG, so the "tag exists →
+# skip" rule above would keep serving an image built against a DIFFERENT
+# browser-facing origin, indefinitely, with nothing to show for it. The value is
+# recorded beside the image and compared; a mismatch forces exactly this one
+# image to rebuild.
+#
+# That matters here because the value changed: from `https://keel.dc1.lan` (an
+# absolute origin naming the console's own host, which forces the reverse proxy
+# into a path split that cannot be correct) to the `/__keel` same-origin mount
+# the application is designed around. See keel_web_gateway_mount in defaults.
+- name: Read the gateway base the existing web image was built with
+  ansible.builtin.slurp:
+    src: "{{ keel_build_root }}/WEB_GATEWAY_BASE"
+  register: keel_web_base_recorded
+  failed_when: false
+  check_mode: false
+
+- name: Decide whether the web image must be rebuilt
+  ansible.builtin.set_fact:
+    keel_web_base_changed: >-
+      {{ ((keel_web_base_recorded.content | default('') | b64decode) | trim)
+         != (keel_web_gateway_mount | trim) }}
+
+- name: Report why the web image will be rebuilt
+  ansible.builtin.debug:
+    msg: >-
+      The console image was built for
+      "{{ (keel_web_base_recorded.content | default('') | b64decode) | trim | default('(unrecorded)', true) }}"
+      but this deployment wants "{{ keel_web_gateway_mount }}". Rebuilding it —
+      the value is baked into the bundle and the image tag does not change with
+      it, so nothing else would notice.
+  when:
+    - keel_web_base_changed | bool
+    - keel_web_present | default(false)
+
 - name: Build the web image
   # VITE_KEEL_GATEWAY_URL is baked into the SPA bundle at build time, so the
-  # browser-facing origin has to be known here — it is the Caddy hostname, not
-  # the loopback address the container is published on.
+  # browser-facing base has to be known here. KEEL_GATEWAY_INTERNAL_URL is the
+  # address nginx inside this image dials over the compose network; it never
+  # leaves the container.
   ansible.builtin.command:
     cmd: >-
       docker build
       --file apps/web/Dockerfile
       --tag {{ keel_web_image }}
-      --build-arg VITE_KEEL_GATEWAY_URL=https://{{ keel_hostname }}
+      --build-arg VITE_KEEL_GATEWAY_URL={{ keel_web_gateway_mount }}
       --build-arg KEEL_GATEWAY_INTERNAL_URL=http://gateway:3000
       .
     chdir: "{{ keel_build_dir }}"
@@ -111,7 +149,16 @@
   changed_when: keel_web_build.rc == 0
   async: "{{ keel_build_timeout_seconds }}"
   poll: 15
-  when: keel_force_rebuild | bool or not keel_web_present
+  when: keel_force_rebuild | bool or not keel_web_present or keel_web_base_changed | bool
+
+- name: Record the gateway base this web image was built with
+  ansible.builtin.copy:
+    content: "{{ keel_web_gateway_mount }}\n"
+    dest: "{{ keel_build_root }}/WEB_GATEWAY_BASE"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  when: not ansible_check_mode
 
 - name: Read back the built image IDs
   ansible.builtin.command:

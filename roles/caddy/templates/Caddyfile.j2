@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# {{ ansible_managed }}
+#
+# THE MAIN CADDYFILE. Owned by roles/caddy, and by nothing else.
+#
+# ⚠️ NO SITE IS DEFINED HERE. Every site is a separate file under
+# {{ caddy_conf_d }}, owned by whichever role deploys that application. The
+# import below is the entire contract between this file and them:
+#
+#   · an application adds, changes or removes ONE file in that directory
+#   · it never edits this file, so it can never take another site down
+#   · removing an application's file removes its ingress completely
+#
+# If this file listed sites directly, every deployment would be a change to
+# shared ingress, and a syntax error in one application's route would stop every
+# other site on this host.
+# ─────────────────────────────────────────────────────────────────────────────
+
+{
+	# The admin API binds to loopback only. It can load arbitrary configuration,
+	# so exposing it on the LAN would hand ingress control to anything that can
+	# reach this host.
+	admin {{ caddy_admin_listen }}
+{% for opt in caddy_global_options %}
+	{{ opt }}
+{% endfor %}
+}
+
+# Drop-ins, one per application.
+#
+# A glob that matches nothing is not an error, so this file stays valid on a
+# host with no applications deployed yet — which is exactly the state a first
+# run leaves it in.
+import {{ caddy_conf_d }}/*.caddy

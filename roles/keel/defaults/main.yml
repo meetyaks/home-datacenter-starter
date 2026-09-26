@@ -203,12 +203,43 @@ keel_web_loopback_port: 8080
 
 # ── CADDY ───────────────────────────────────────────────────────────────────
 #
-# Caddy is separately managed shared infrastructure. This role writes ONE file
-# into its drop-in directory and reloads it; it never installs or reconfigures
-# Caddy itself.
+# Caddy is owned by roles/caddy, which installs the package and owns the
+# service, the main Caddyfile and the drop-in directory. THIS role writes ONE
+# file into that directory and asks for a reload. It never installs Caddy,
+# never touches the main Caddyfile and never owns the service — a role that
+# reconfigured shared ingress would make every other site on this host a
+# hostage to a Keel deployment.
+#
+# `keel_caddy_enabled: false` deploys with NO LAN ingress at all. Preflight says
+# so out loud, because the result is healthy and unreachable — a legitimate
+# choice and a terrible surprise.
 keel_caddy_enabled: true
 keel_caddy_sites_dir: /etc/caddy/conf.d
 keel_caddy_site_file: "{{ keel_caddy_sites_dir }}/keel.caddy"
+keel_caddy_log_dir: /var/log/caddy
+
+# Where roles/caddy publishes its internal root certificate. Named here so
+# messages and the rendered route can point at one path.
+keel_caddy_internal_ca: /usr/local/share/ca-certificates/caddy-lan-root.crt
+
+# ── THE BROWSER-FACING GATEWAY BASE ─────────────────────────────────────────
+#
+# ⚠️ A SAME-ORIGIN MOUNT, NOT AN ABSOLUTE ORIGIN. It is baked into the SPA
+# bundle at build time and decides the whole ingress shape.
+#
+# `apps/web/src/lib/gateway.ts` documents two supported shapes: an ABSOLUTE
+# ORIGIN, where the gateway is its own host and CORS and CSP name each other; or
+# a SAME-ORIGIN MOUNT that whatever serves the SPA proxies through.
+#
+# This deployment used `https://keel.dc1.lan` — absolute, but naming the SAME
+# host as the console. That is neither shape, and it forces the reverse proxy to
+# split ~80 gateway prefixes from the SPA's own router by path. Several collide
+# outright (/admin, /apps, /a, /records), so no split can be correct.
+#
+# With the mount, nginx inside the console image strips this prefix and proxies
+# to the gateway over the compose network, the browser names exactly one origin,
+# and Caddy needs a single rule. `configure-nginx.sh` requires a plain path.
+keel_web_gateway_mount: /__keel
 
 # ── BEHAVIOUR ───────────────────────────────────────────────────────────────
 #
