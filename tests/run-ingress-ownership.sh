@@ -201,6 +201,27 @@ else
   ok "no task disables TLS verification (comments about it do not count)"
 fi
 
+# ── 5. Every "enforced:" citation names a test that exists ─────────────────
+#
+# A claim that cites its enforcer is only worth anything while the enforcer is
+# real. This template shipped citing `tests/run-ingress-routing.sh`, a file that
+# was never written — the reader is told the behaviour is verified and no
+# verification exists, which is strictly worse than an uncited comment.
+echo
+echo "── 5. every 'enforced:' citation resolves to a real test ──"
+
+dangling=0
+for cited in $(grep -rhoE 'tests/[A-Za-z0-9._-]+\.(sh|yml)' \
+                 roles/ playbooks/ 2>/dev/null | sort -u); do
+  if [ ! -e "$cited" ]; then
+    bad "cited enforcer exists: $cited" "no such file — the claim is unverified"
+    grep -rn --include='*.yml' --include='*.j2' --include='*.py' --include='*.md' \
+      -F "$cited" roles/ playbooks/ 2>/dev/null | head -2 | sed 's/^/           /'
+    dangling=$((dangling + 1))
+  fi
+done
+[ "$dangling" -eq 0 ] && ok "every cited test file exists"
+
 echo
 if [ "$fail" -gt 0 ]; then
   echo "FAILED: $fail of $((pass + fail)) checks." >&2

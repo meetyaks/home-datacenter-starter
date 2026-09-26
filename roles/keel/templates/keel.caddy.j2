@@ -35,7 +35,7 @@
 #
 # So Caddy's job here is exactly one rule, and there is no prefix list to get
 # wrong or to keep in step with ~80 gateway routes.
-# (enforced: tests/run-ingress-routing.sh)
+# (enforced: tests/run-ingress-ownership.sh "the Keel route does not split gateway prefixes by path")
 
 {{ keel_hostname }} {
 	encode zstd gzip
