@@ -50,6 +50,18 @@ for ref in "$@"; do
 
   digest="${ref##*@}"
   before_at="${ref%@*}"
+
+  # ⚠️ STRIP THE TAG FIRST. Compose pins look like `repo:TAG@sha256:…`, so
+  # removing only the digest leaves the tag inside the repository path and every
+  # lookup 404s. For `nats:2-alpine@…` it is worse: the first path component
+  # then contains a colon and is mistaken for a registry host. Both happened.
+  #
+  # Only a colon AFTER the last slash is a tag; a colon before one is a port.
+  last="${before_at##*/}"
+  case "$last" in
+    *:*) before_at="${before_at%:*}" ;;
+  esac
+
   # A leading component containing a dot or a colon is a registry host;
   # otherwise the reference is an implicit Docker Hub one.
   first="${before_at%%/*}"
@@ -154,6 +166,44 @@ else:
     *)       echo "   FAIL  ${arch_result#ERR }"
              fails=$((fails + 1)); continue ;;
   esac
+
+  # ── 4. can the BLOBS be fetched, not just the manifest? ──────────────────
+  #
+  # A manifest is metadata. A registry can serve it and still refuse the layers,
+  # and then `docker pull` fails on an image this check just called fine. One
+  # HEAD against a real layer closes that, and costs a single request because
+  # it never downloads the body.
+  sub=$(printf '%s' "$body" | python3 -c '
+import json,sys
+m=json.load(sys.stdin)
+for e in (m.get("manifests") or []):
+    p=e.get("platform") or {}
+    if p.get("architecture")=="amd64" and p.get("os")=="linux":
+        print(e["digest"]); break
+' 2>/dev/null)
+
+  if [ -n "$sub" ]; then
+    layer=$(curl -sS --max-time 30 "${auth_hdr[@]}" \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://${registry}/v2/${repo}/manifests/${sub}" 2>/dev/null \
+            | python3 -c '
+import json,sys
+m=json.load(sys.stdin)
+ls=m.get("layers") or []
+print(ls[0]["digest"] if ls else "")
+' 2>/dev/null)
+    if [ -n "$layer" ]; then
+      bcode=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -L -X HEAD \
+                "${auth_hdr[@]}" "https://${registry}/v2/${repo}/blobs/${layer}" 2>/dev/null)
+      if [ "$bcode" = "200" ]; then
+        echo "   layer fetchable      HTTP 200 (${layer:7:16}…)"
+      else
+        echo "   FAIL  manifest is served but its layers are not (blob HTTP ${bcode})."
+        echo "         A pull would fail on an image whose metadata looks fine."
+        fails=$((fails + 1)); continue
+      fi
+    fi
+  fi
 
   echo "   OK"
 done

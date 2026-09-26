@@ -247,3 +247,114 @@ jobs:
             echo "ghcr.io/meetyaks/${{ matrix.image }}:${{ matrix.release }}@${{ steps.build.outputs.digest }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The functional smoke, on linux/amd64, from a CLEAN Docker config.
+  #
+  # This runner is amd64, which is the point: these are amd64-only images and
+  # the Go binaries inside them cannot execute under emulation on an arm64
+  # workstation — they die in the Go runtime, not in their own code. So the
+  # functional check has to happen somewhere native, and here it does.
+  #
+  # It exercises the object-storage pair exactly as the deployment wires them:
+  # the same server command and credentials env, the same `mc ready local`
+  # healthcheck that runs INSIDE the server image, and the same bucket-init
+  # command the compose file issues — then a real object round-trip.
+  #
+  # `docker logout` first, and a fresh empty DOCKER_CONFIG: the build jobs above
+  # logged in, and a smoke that quietly relies on that would not be testing
+  # anonymous pullability at all.
+  # ───────────────────────────────────────────────────────────────────────────
+  smoke:
+    name: Functional smoke (linux/amd64, anonymous)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      MINIO: ghcr.io/meetyaks/minio:RELEASE.2024-09-22T00-33-43Z
+      MC: ghcr.io/meetyaks/minio-mc:RELEASE.2024-09-16T17-43-14Z
+      ACCESS_KEY: smokeaccesskey
+      SECRET_KEY: smokesecretkey123
+      BUCKET: keel-lab
+
+    steps:
+      - name: Prove the config is clean, then pull anonymously
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io || true
+          export DOCKER_CONFIG="$RUNNER_TEMP/clean-docker"
+          mkdir -p "$DOCKER_CONFIG"; printf '{}\n' > "$DOCKER_CONFIG/config.json"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "config: $(cat "$DOCKER_CONFIG/config.json")"
+
+          docker pull -q "$MINIO"
+          docker pull -q "$MC"
+          echo "both pulled with no credentials"
+          docker image inspect "$MINIO" --format '  minio  {{.Os}}/{{.Architecture}}'
+          docker image inspect "$MC"    --format '  mc     {{.Os}}/{{.Architecture}}'
+
+      - name: Runtime identity
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /usr/bin/minio "$MINIO" --version
+          docker run --rm --entrypoint /usr/bin/mc    "$MINIO" --version
+          docker run --rm --entrypoint /usr/bin/mc    "$MC"    --version
+
+      - name: MinIO health, via the deployment's own healthcheck command
+        run: |
+          set -euo pipefail
+          docker network create keel-smoke
+          docker run -d --name minio --network keel-smoke --network-alias minio \
+            -e MINIO_ROOT_USER="$ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$SECRET_KEY" \
+            "$MINIO" server /data
+
+          # The compose healthcheck verbatim: `mc ready local`, run INSIDE the
+          # server container. It is why the server image must carry mc.
+          for i in $(seq 1 30); do
+            if docker exec minio /bin/sh -c 'mc ready local' >/dev/null 2>&1; then
+              echo "mc ready local: healthy after ${i} attempt(s)"; break
+            fi
+            [ "$i" = 30 ] && { echo "never became healthy"; docker logs minio | tail -30; exit 1; }
+            sleep 2
+          done
+
+      - name: mc creates the configured bucket and exits 0
+        run: |
+          set -euo pipefail
+          # The compose one-shot's command, unchanged.
+          docker run --name bucket-init --network keel-smoke \
+            -e MINIO_ROOT_USER="$ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$SECRET_KEY" \
+            -e KEEL_BLOB_BUCKET="$BUCKET" \
+            --entrypoint /bin/sh "$MC" -c '
+              mc alias set lab http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" &&
+              mc mb --ignore-existing "lab/$KEEL_BLOB_BUCKET" &&
+              echo "bucket ready: $KEEL_BLOB_BUCKET"'
+          rc=$(docker inspect --format '{{.State.ExitCode}}' bucket-init)
+          echo "bucket-init exit code: $rc"
+          [ "$rc" = 0 ] || exit 1
+
+      - name: Independent put / list / get / delete
+        run: |
+          set -euo pipefail
+          docker run --rm --network keel-smoke \
+            -e MC_HOST_lab="http://${ACCESS_KEY}:${SECRET_KEY}@minio:9000" \
+            --entrypoint /bin/sh "$MC" -c '
+              set -e
+              echo "keel-smoke-payload" > /tmp/o.txt
+              mc ls lab
+              mc cp /tmp/o.txt "lab/'"$BUCKET"'/smoke.txt"   >/dev/null && echo "put:    ok"
+              mc stat "lab/'"$BUCKET"'/smoke.txt"            >/dev/null && echo "stat:   ok"
+              got=$(mc cat "lab/'"$BUCKET"'/smoke.txt")
+              [ "$got" = "keel-smoke-payload" ] || { echo "get: CONTENT MISMATCH: $got"; exit 1; }
+              echo "get:    ok (content verified)"
+              mc rm "lab/'"$BUCKET"'/smoke.txt"              >/dev/null && echo "delete: ok"
+              mc stat "lab/'"$BUCKET"'/smoke.txt" >/dev/null 2>&1 && { echo "delete did not remove it"; exit 1; }
+              echo "absent after delete: ok"'
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker rm -f minio bucket-init >/dev/null 2>&1 || true
+          docker network rm keel-smoke   >/dev/null 2>&1 || true
