@@ -65,7 +65,7 @@
     - name: Collect the container state
       ansible.builtin.command:
         cmd: >-
-          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          {{ keel_compose_cmd }}
           ps --format '{{ '{{' }}.Name{{ '}}' }}\t{{ '{{' }}.State{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}'
         chdir: "{{ keel_root }}"
       register: keel_ps
@@ -82,7 +82,7 @@
       ansible.builtin.shell:
         cmd: >-
           set -o pipefail &&
-          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          {{ keel_compose_cmd }}
           ps --format '{{ '{{' }}.Service{{ '}}' }} {{ '{{' }}.State{{ '}}' }}'
           | grep -vE '^(bootstrap|minio-bucket) ' | grep -vc ' running'
         executable: /bin/bash

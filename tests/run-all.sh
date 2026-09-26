@@ -73,6 +73,15 @@ echo "══ runtime group scenarios (7, on a disposable Linux host) ═══�
 tests/run-runtime-group-scenarios.sh
 
 echo
+echo "══ compose auth profile (22 checks, rendered + container) ═════════"
+# THE ACCEPTANCE FAILURE. `${VAR:-}` in a compose `environment:` mapping always
+# emits the key, so an unset KEEL_OIDC_ISSUER became `KEEL_OIDC_ISSUER=` and the
+# gateway crash-looped on an invalid URL while everything around it was healthy.
+# Reads the RENDERED config and a container Compose actually started — absent and
+# empty are different states, and only one of them used to be tested.
+tests/run-compose-auth-profile.sh
+
+echo
 echo "══ rendered auth posture (password-only, registration closed) ═════"
 # Renders roles/keel/templates/keel.env.j2 with the role's OWN defaults and
 # asserts the posture it produces. Grepping the template would prove the lines

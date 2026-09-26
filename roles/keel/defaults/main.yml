@@ -28,11 +28,16 @@
 #
 # Verified present at the commit below: the enrollment CLI, the auth-methods
 # route, password-only validator support (authMethodsOf /
-# oidcIssuerIsSelfReferential), and a compose file that no longer hard-requires
-# the KEEL_OIDC_* variables.
-keel_commit: 1e04c4ad93047ae5ac9606f5bd0593729ac6417e
+# oidcIssuerIsSelfReferential), and a compose file that declares NO KEEL_OIDC_*
+# key at all.
+#
+# ⚠️ THE SECOND PIN BUMP IS ALSO A COMPOSE FIX. a6b2a40b required OIDC; 1e04c4ad
+# made it `${VAR:-}` optional, which ALWAYS EMITS THE KEY and handed the gateway
+# three empty strings — the acceptance failure. 9b0d36f0 declares none of them, so
+# unset means absent.
+keel_commit: 9b0d36f008e726f830d96c4a3932b28d13bf68dd
 
-# Derived. `sha-1e04c4ad` — short enough to read, long enough to be unambiguous.
+# Derived. `sha-9b0d36f0` — short enough to read, long enough to be unambiguous.
 keel_commit_short: "{{ keel_commit[:8] }}"
 keel_image_tag: "sha-{{ keel_commit_short }}"
 keel_gateway_image: "keel-gateway:{{ keel_image_tag }}"
@@ -85,6 +90,58 @@ keel_secrets_dir: "{{ keel_root }}/secrets"
 keel_env_dir: "{{ keel_root }}/env"
 keel_env_file: "{{ keel_env_dir }}/keel.env"
 keel_compose_file: "{{ keel_root }}/compose.lab.yml"
+
+# ── THE OIDC OVERLAY, AND WHY PASSWORD-ONLY RENDERS NONE ────────────────────
+#
+# ⚠️ `${VAR:-}` IN A COMPOSE `environment:` MAPPING ALWAYS EMITS THE KEY.
+#
+# The acceptance deployment failed on exactly that. compose.lab.yml declared
+#
+#     KEEL_OIDC_ISSUER: ${KEEL_OIDC_ISSUER:-}
+#
+# so an UNSET variable became `KEEL_OIDC_ISSUER=` in the container. This role's env
+# template correctly omitted all three; Compose put them back as empty strings,
+# the gateway's config schema rejected an empty issuer as an invalid URL, and the
+# container crash-looped while Postgres, NATS, Temporal, MinIO and the runtime
+# worker all reported healthy. Measured: 0 keys in the rendered env file, 3 empty
+# keys in the rendered gateway container.
+#
+# ABSENT AND EMPTY ARE DIFFERENT STATES. The base stack now declares none of the
+# three, in any form — a key declared there at all still shows up in
+# `docker compose config` — so password-only renders NO overlay and the keys exist
+# nowhere.
+#
+# An `oidc` deployment gets this overlay, which declares them `:?` REQUIRED so
+# Compose refuses an incomplete profile at `config` time. Rendered only in that
+# mode; `keel_compose_cmd` adds its `-f` only in that mode.
+# (enforced: tests/run-compose-auth-profile.sh)
+keel_compose_auth_file: "{{ keel_root }}/compose.auth-profile.yml"
+
+# The services that consume the shared `x-keel-env` anchor. Listed rather than
+# globbed so adding a service is a deliberate decision here too — an overlay
+# naming a service the stack does not have makes `docker compose config` fail.
+keel_compose_auth_services:
+  - gateway
+  - bootstrap
+  - runtime-worker
+
+# True when this deployment declares `oidc`. One expression, used by the overlay's
+# install task and by the compose invocation below, so the file and the `-f` that
+# loads it can never disagree.
+keel_oidc_selected: >-
+  {{ 'oidc' in (keel_auth_methods | default('password') | split(',') | map('trim') | list) }}
+
+# ── ONE DEFINITION OF HOW THIS DEPLOYMENT INVOKES COMPOSE ───────────────────
+#
+# Fifteen call sites used to spell the invocation out. Adding a conditional `-f`
+# to each by hand is exactly the shape that produces a PARTIAL fix — one forgotten
+# site and `config` would disagree with `up`, which is the most misleading
+# possible outcome. Every site now uses this.
+# (enforced: tests/run-compose-auth-profile.sh "no compose invocation bypasses
+#  the overlay")
+keel_compose_cmd: >-
+  docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+  {{ ('-f ' ~ keel_compose_auth_file) if keel_oidc_selected | bool else '' }}
 
 # ── POSTGRES SERVER CONFIGURATION AND TLS MATERIAL ──────────────────────────
 #

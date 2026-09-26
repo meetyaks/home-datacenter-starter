@@ -49,7 +49,7 @@
 - name: Report the migrations applied by the current deployment
   ansible.builtin.command:
     cmd: >-
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      {{ keel_compose_cmd }}
       logs --no-color bootstrap
     chdir: "{{ keel_root }}"
   register: keel_rollback_migrations
@@ -76,7 +76,7 @@
 - name: Recreate the stack on the previous images
   ansible.builtin.command:
     cmd: >-
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      {{ keel_compose_cmd }}
       up -d --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
     chdir: "{{ keel_root }}"
   changed_when: true

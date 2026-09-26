@@ -19,7 +19,7 @@
 
 - name: Stop the stack
   ansible.builtin.command:
-    cmd: docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }} down
+    cmd: {{ keel_compose_cmd }} down
     chdir: "{{ keel_root }}"
   changed_when: true
 
@@ -49,7 +49,7 @@
 - name: Start the stack again
   ansible.builtin.command:
     cmd: >-
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      {{ keel_compose_cmd }}
       up -d --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
     chdir: "{{ keel_root }}"
   changed_when: true

@@ -54,6 +54,12 @@
       reverse proxy configured by hand.
   when: not (keel_caddy_enabled | bool)
 
+- name: Validate the declared auth profile
+  # Before the architecture check and everything after it: an incomplete auth
+  # profile is a configuration fault that no amount of host inspection fixes, and
+  # discovering it after a build means discovering it as a crash-looping gateway.
+  ansible.builtin.include_tasks: assert-auth-profile.yml
+
 - name: Confirm the target is the expected architecture
   ansible.builtin.assert:
     that:

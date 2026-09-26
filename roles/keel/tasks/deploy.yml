@@ -18,6 +18,35 @@
   # nothing to copy and `remote_src` would fail on a missing file.
   when: not ansible_check_mode
 
+- name: Install the OIDC overlay
+  # ⚠️ RENDERED HERE, NOT TAKEN FROM THE COMMIT, and ONLY in oidc mode. Unlike the
+  # compose file and the pg_hba policy, this expresses THIS DEPLOYMENT'S choice of
+  # sign-in methods — an infrastructure decision, the same reasoning that puts
+  # `keel_auth_methods` in this role's defaults rather than in the stack.
+  #
+  # Password-only renders NOTHING, which is the whole point: the base stack
+  # declares no KEEL_OIDC_* key, so with no overlay the three exist neither in
+  # `docker compose config` nor in any container. `${KEEL_OIDC_*:-}` used to put
+  # them there as empty strings and crash-looped the gateway.
+  ansible.builtin.template:
+    src: compose.auth-profile.yml.j2
+    dest: "{{ keel_compose_auth_file }}"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  notify: Restart Keel stack
+  when: keel_oidc_selected | bool
+
+- name: Remove a stale OIDC overlay when the deployment is password-only
+  # A leftover from a previous oidc run would still be loaded by any invocation
+  # that names it, so switching a deployment BACK to password-only has to take the
+  # file away rather than merely stop rendering it.
+  ansible.builtin.file:
+    path: "{{ keel_compose_auth_file }}"
+    state: absent
+  notify: Restart Keel stack
+  when: not (keel_oidc_selected | bool)
+
 - name: Install the PostgreSQL auth policy from the built commit
   # ALSO FROM THE COMMIT, for the same reason as the compose file above: the
   # auth policy is part of the stack definition, and a copy maintained here
@@ -54,7 +83,7 @@
   ansible.builtin.shell:
     cmd: >-
       set -o pipefail &&
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }} config
+      {{ keel_compose_cmd }} config
       | grep -E '^\s+host_ip:' | grep -v '127\.0\.0\.1' | wc -l
     executable: /bin/bash
     chdir: "{{ keel_root }}"
@@ -95,7 +124,7 @@
   # problem. Naming the services instead is explicit about which are external.
   ansible.builtin.command:
     cmd: >-
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      {{ keel_compose_cmd }}
       pull postgres nats temporal minio minio-bucket
     chdir: "{{ keel_root }}"
   register: keel_pull
@@ -124,7 +153,7 @@
       # deploy here rather than leaving a gateway serving a half-migrated schema.
       ansible.builtin.command:
         cmd: >-
-          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          {{ keel_compose_cmd }}
           up -d --remove-orphans --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
         chdir: "{{ keel_root }}"
       register: keel_up
@@ -134,7 +163,7 @@
     - name: Capture what compose reports about every container
       ansible.builtin.command:
         cmd: >-
-          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          {{ keel_compose_cmd }}
           ps -a
         chdir: "{{ keel_root }}"
       register: keel_diag_ps
@@ -147,7 +176,7 @@
       # follow but still holds the reason the gateway never started.
       ansible.builtin.command:
         cmd: >-
-          docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+          {{ keel_compose_cmd }}
           logs --no-color --tail {{ keel_diagnostic_log_lines }} {{ item }}
         chdir: "{{ keel_root }}"
       register: keel_diag_logs
@@ -191,7 +220,7 @@
 - name: Report the bootstrap result
   ansible.builtin.command:
     cmd: >-
-      docker compose --env-file {{ keel_env_file }} -f {{ keel_compose_file }}
+      {{ keel_compose_cmd }}
       logs --no-color --tail 40 bootstrap
     chdir: "{{ keel_root }}"
   register: keel_bootstrap_logs
