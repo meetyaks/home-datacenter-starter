@@ -19,7 +19,7 @@
       No removal token. Open the runner at
       {{ ci_runner_scope_url }}/settings/actions/runners, choose Remove, and
       copy the token from the command it shows:
-      ansible-playbook playbooks/ci-runner.yml --tags unregister -e ci_runner_removal_token=<token>
+      ansible-playbook {{ ci_runner_playbook }} --tags unregister -e ci_runner_removal_token=<token>
     quiet: true
 
 - name: A staging directory for the removal script

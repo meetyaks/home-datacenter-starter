@@ -27,7 +27,7 @@
       No registration token. Generate a one-time token at
       {{ ci_runner_scope_url }}/settings/actions/runners/new?arch=x64&os=linux
       and pass it for this run only:
-      ansible-playbook playbooks/ci-runner.yml --tags register -e ci_runner_token=<token>
+      ansible-playbook {{ ci_runner_playbook }} --tags register -e ci_runner_token=<token>
     # ⚠️ `quiet` AND the length-only condition together are what keep the token
     # out of the output. An assertion that printed the value it checked would
     # defeat the entire stdin-only discipline in its error path.

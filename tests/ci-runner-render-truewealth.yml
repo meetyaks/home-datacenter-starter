@@ -1,0 +1,113 @@
+---
+# Render the ci_runner artefacts for the TrueWealth instance into
+# `render_dir`, for tests/run-ci-runner-truewealth.sh to inspect.
+#
+# Same rule as tests/ci-runner-render.yml: the ROLE'S defaults and templates,
+# overlaid with the SAME vars file playbooks/ci-runner-truewealth.yml loads —
+# nothing restated here. `include_vars` for both, in the order Ansible would
+# apply them (role defaults, then play vars), so the instance values win.
+- name: Render the TrueWealth ci_runner artefacts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/ci_runner/defaults/main.yml
+
+    - name: Overlay the TrueWealth instance's play vars
+      ansible.builtin.include_vars:
+        file: ../playbooks/vars/ci-runner-truewealth.yml
+
+    - name: Stand in for the host's LAN address (an obvious fake)
+      ansible.builtin.set_fact:
+        ci_tw_host_lan_ip: "10.0.0.254"
+
+    - name: Render the guest scripts
+      ansible.builtin.template:
+        src: "../roles/ci_runner/templates/{{ item.src }}"
+        dest: "{{ render_dir }}/{{ item.dest }}"
+        mode: "0755"
+        validate: /bin/bash -n %s
+      loop:
+        - { src: guest-provision.sh.j2,    dest: provision.sh }
+        - { src: job-hook-started.sh.j2,   dest: job-started.sh }
+        - { src: job-hook-completed.sh.j2, dest: job-completed.sh }
+        - { src: guest-register.sh.j2,     dest: register.sh }
+        - { src: guest-unregister.sh.j2,   dest: unregister.sh }
+        - { src: ci-egress-apply.sh.j2,    dest: ci-egress-apply.sh }
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: Render the runner environment file
+      ansible.builtin.template:
+        src: ../roles/ci_runner/templates/runner.env.j2
+        dest: "{{ render_dir }}/runner.env"
+        mode: "0644"
+
+    - name: Render the host egress policy
+      ansible.builtin.template:
+        src: ../roles/ci_runner/templates/ci-egress.nft.j2
+        dest: "{{ render_dir }}/ci-egress.nft"
+        mode: "0644"
+
+    - name: Record the host-side names this instance would create
+      ansible.builtin.copy:
+        dest: "{{ render_dir }}/host-names.txt"
+        mode: "0644"
+        content: |
+          vm {{ ci_vm_name }}
+          runner {{ ci_runner_name }}
+          scope {{ ci_runner_scope_url }}
+          labels {{ ci_runner_labels }}
+          lv {{ ci_vg_name }}/{{ ci_lv_name }} {{ ci_lv_size }} reserve {{ ci_vg_reserve_g }}
+          mount {{ ci_lv_mount }}
+          pool {{ ci_lxd_pool }}
+          bridge {{ ci_lxd_bridge }}
+          subnet {{ ci_lxd_subnet_cidr }}
+          gateway {{ ci_lxd_gateway }}
+          table {{ ci_egress_table }}
+          policy {{ ci_egress_policy_file }}
+          applier {{ ci_egress_applier }}
+          unit {{ ci_egress_unit }}
+          stage {{ ci_stage_dir }}
+          cpu {{ ci_vm_cpu }}
+          memory {{ ci_vm_memory }} ({{ ci_vm_memory_mib }} MiB)
+          root {{ ci_vm_root_size }}
+          probes {{ ci_isolation_denied_probes | join(' ') }}
+          settings {{ ci_vm_settings | map(attribute='k') | join(' ') }}
+
+# Keel's instance, from the role defaults alone, so the suite can prove the two
+# instances share no host-side name. A separate play keeps the TrueWealth
+# overlay from leaking into it.
+- name: Record the default (Keel) instance's host-side names
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/ci_runner/defaults/main.yml
+
+    - name: Record them
+      ansible.builtin.copy:
+        dest: "{{ render_dir }}/host-names-keel.txt"
+        mode: "0644"
+        content: |
+          vm {{ ci_vm_name }}
+          lv {{ ci_vg_name }}/{{ ci_lv_name }}
+          mount {{ ci_lv_mount }}
+          pool {{ ci_lxd_pool }}
+          bridge {{ ci_lxd_bridge }}
+          subnet {{ ci_lxd_subnet_cidr }}
+          table {{ ci_egress_table }}
+          policy {{ ci_egress_policy_file }}
+          applier {{ ci_egress_applier }}
+          unit {{ ci_egress_unit }}
+          stage {{ ci_stage_dir }}
+          scope {{ ci_runner_scope_url }}
+          labels {{ ci_runner_labels }}

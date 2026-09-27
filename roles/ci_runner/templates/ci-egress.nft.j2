@@ -12,7 +12,7 @@
 # ⚠️ ITS OWN TABLE, deliberately. dc1-x86 already has an `ip filter` ruleset that
 # belongs to TAILSCALE (ts-input, tailscale0, udp/41641). Adding rules to a table
 # somebody else owns is how one of these gets flushed by the other's next
-# reload. `inet ci_egress` is only ever written by this role.
+# reload. `inet {{ ci_egress_table }}` is only ever written by this role.
 #
 # ⚠️ AND IT IS A SUBNET DENY, NOT A DOMAIN ALLOW-LIST. nftables cannot match
 # hostnames. The honest statement of policy is:
@@ -37,10 +37,10 @@
 # exist, the delete then always succeeds, and nft applies the entire file as ONE
 # ATOMIC TRANSACTION — so the ruleset goes from the old policy to the new one
 # with no moment in between.
-table inet ci_egress {}
-delete table inet ci_egress
+table inet {{ ci_egress_table }} {}
+delete table inet {{ ci_egress_table }}
 
-table inet ci_egress {
+table inet {{ ci_egress_table }} {
 
   # ═══ TRAFFIC ADDRESSED TO THE HOST ITSELF ═══════════════════════════════
   #
@@ -66,8 +66,17 @@ table inet ci_egress {
 
     # The two services the guest legitimately needs FROM the host: LXD's
     # resolver and its DHCP server.
+{% if ci_egress_sibling_isolation | bool %}
+    # Sibling isolation: DNS only from THIS bridge's own resolver. Another CI
+    # bridge's resolver is also a host address, and answering from it would
+    # hand this VM a view of the sibling's network.
+    ip saddr {{ ci_lxd_subnet_cidr }} ip daddr {{ ci_lxd_gateway }} udp dport 53 counter accept
+    ip saddr {{ ci_lxd_subnet_cidr }} ip daddr {{ ci_lxd_gateway }} tcp dport 53 counter accept
+    ip saddr {{ ci_lxd_subnet_cidr }} udp dport 67 counter accept
+{% else %}
     ip saddr {{ ci_lxd_subnet_cidr }} udp dport { 53, 67 } counter accept
     ip saddr {{ ci_lxd_subnet_cidr }} tcp dport 53 counter accept
+{% endif %}
 
     # Everything else the CI VM aims at this host — every other port, on every
     # address the host owns — is refused.
@@ -82,6 +91,15 @@ table inet ci_egress {
     # Replies to connections the VM opened. Without this, every allowed outbound
     # connection would stall on its first response packet.
     ct state established,related accept
+{% if ci_egress_sibling_isolation | bool %}
+
+    # Sibling isolation: nothing may OPEN a connection into this bridge — not
+    # the LAN, not another CI VM on this host (the host forwards between its
+    # own bridges, and a sibling's policy may permit 80/443 to any address it
+    # does not list). Replies were accepted just above; a drop is terminal
+    # across tables, so no other chain can re-admit it.
+    oifname "{{ ci_lxd_bridge }}" ct state new counter drop
+{% endif %}
 
     # ── Everything below concerns traffic ORIGINATING in the CI VM ──────────
 {% for cidr in ci_egress_denied_cidrs %}

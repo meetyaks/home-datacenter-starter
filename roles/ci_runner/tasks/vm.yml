@@ -139,5 +139,5 @@
     msg: >-
       {{ ci_vm_name }} does not exist yet, so the device list and the
       privileged-mode check were NOT verified in this dry run. They run for
-      real on the next `ansible-playbook playbooks/ci-runner.yml`.
+      real on the next `ansible-playbook {{ ci_runner_playbook }}`.
   when: not ci_vm_inspectable

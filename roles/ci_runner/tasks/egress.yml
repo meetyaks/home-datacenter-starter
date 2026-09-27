@@ -32,7 +32,7 @@
   # malformed rule set can never be the thing that is loaded. `-c` is check-only.
   ansible.builtin.template:
     src: ci-egress.nft.j2
-    dest: /etc/nftables.d/ci-egress.nft
+    dest: "{{ ci_egress_policy_file }}"
     owner: root
     group: root
     mode: "0600"
@@ -49,7 +49,7 @@
   # anything actually does.
   ansible.builtin.template:
     src: ci-egress-apply.sh.j2
-    dest: /usr/local/sbin/ci-egress-apply
+    dest: "{{ ci_egress_applier }}"
     owner: root
     group: root
     mode: "0700"
@@ -64,7 +64,7 @@
   # green through the exact failure it exists to catch.
   ansible.builtin.shell:
     cmd: >-
-      nft list table inet ci_egress >/dev/null 2>&1 &&
+      nft list table inet {{ ci_egress_table }} >/dev/null 2>&1 &&
       iptables -C DOCKER-USER -i {{ ci_lxd_bridge }} -j ACCEPT 2>/dev/null
   register: ci_egress_loaded
   changed_when: false
@@ -73,7 +73,7 @@
 
 - name: Apply the policy
   ansible.builtin.command:
-    argv: [/usr/local/sbin/ci-egress-apply]
+    argv: ["{{ ci_egress_applier }}"]
   when: ci_egress_loaded.rc != 0
   changed_when: true
 
@@ -81,7 +81,7 @@
   # A one-shot unit rather than editing /etc/nftables.conf, which belongs to the
   # distribution and may already be carrying Tailscale's rules.
   ansible.builtin.copy:
-    dest: /etc/systemd/system/ci-egress.service
+    dest: "/etc/systemd/system/{{ ci_egress_unit }}.service"
     owner: root
     group: root
     mode: "0644"
@@ -110,8 +110,8 @@
       [Service]
       Type=oneshot
       RemainAfterExit=yes
-      ExecStart=/usr/local/sbin/ci-egress-apply
-      ExecStop=/usr/sbin/nft delete table inet ci_egress
+      ExecStart={{ ci_egress_applier }}
+      ExecStop=/usr/sbin/nft delete table inet {{ ci_egress_table }}
 
       [Install]
       WantedBy=multi-user.target
@@ -124,13 +124,13 @@
   # PREDICTS the unit under --check, so enabling it is gated on the file being
   # real.
   ansible.builtin.stat:
-    path: /etc/systemd/system/ci-egress.service
+    path: "/etc/systemd/system/{{ ci_egress_unit }}.service"
   register: ci_egress_unit
   check_mode: false
 
 - name: Enable the egress unit
   ansible.builtin.systemd_service:
-    name: ci-egress
+    name: "{{ ci_egress_unit }}"
     enabled: true
     daemon_reload: true
   when: ci_egress_unit.stat.exists or not ansible_check_mode
