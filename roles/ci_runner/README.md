@@ -259,3 +259,84 @@ The same probes run again before **every job**, in the started hook: if
 `/srv/data` becomes visible, if a production container appears, or if the host
 answers on 443 or 5432, the job fails before the first step instead of quietly
 succeeding with a path to production.
+
+## A second instance: TrueWealth's runner (dc1-ci-tw-1)
+
+`playbooks/ci-runner-truewealth.yml` builds a **second, independent** runner VM
+from this role for `meetyaks/truewealth`. Every value that differs from
+dc1-ci-1 lives in `playbooks/vars/ci-runner-truewealth.yml` — play vars, not
+inventory, so `playbooks/ci-runner.yml` renders and behaves exactly as before
+(`tests/run-ci-runner-truewealth.sh` proves Keel's artefacts are
+byte-identical to 934ca20).
+
+**Why a VM and not a second runner in dc1-ci-1.** Keel's completed hook removes
+every container and volume on its daemon after each job; a TrueWealth job on
+that daemon would be destroyed by Keel's cleanup, and vice versa. A second
+user or work directory does not change that. The boundary is the hypervisor.
+
+| | dc1-ci-1 (Keel) | dc1-ci-tw-1 (TrueWealth) |
+|---|---|---|
+| scope | `meetyaks/keel` | `meetyaks/truewealth` |
+| labels | `self-hosted,linux,x64,keel-ci` | `self-hosted,linux,x64,local-dc-ci` |
+| vCPU / memory | 8 / 14 GiB | **4 / 6 GiB** (proposed) |
+| logical volume | `ubuntu-vg/ci-lxd` 180g | `ubuntu-vg/ci-tw-lxd` **50g** (+20g VG reserve kept) |
+| root disk | 170 GiB | 45 GiB |
+| LXD pool / bridge | `ci-pool` / `lxdbr0` | `ci-tw-pool` / `citwbr0` |
+| subnet | 10.71.0.0/24 | 10.72.0.0/24 |
+| egress table / unit | `inet ci_egress` / `ci-egress` | `inet ci_egress_tw` / `ci-egress-tw` |
+| denies | LAN /24, CGNAT, 172.16/12, 192.168/16, link-local | **all of 10/8** (LAN and dc1-ci-1), CGNAT, 172.16/12, 192.168/16, link-local |
+| sibling isolation | off (unchanged) | on: no NEW connection into `citwbr0`; DNS only from its own gateway |
+
+Isolation contract it meets: repository-scoped registration; its own kernel,
+Docker daemon, disk, bridge, egress table and runner state; the role's
+job hooks clean only this VM; no host device, production mount, Docker socket,
+secret, SSH key or route to production/administration services; one job at a
+time (one non-ephemeral registration); outbound 80/443 (+NTP) to the public
+internet only.
+
+### Capacity — measure it live before provisioning (read-only, from dc1-arm-1)
+
+The figures above are **proposals**. The host facts in this repository (16
+vCPU, 27 GiB, `ubuntu-vg` 74.68 GiB free after dc1-ci-1) were recorded when
+dc1-ci-1 was built and are **not re-verified**. Collect them read-only:
+
+```bash
+ssh dc1-x86 'nproc; free -m; sudo vgs --units g ubuntu-vg; sudo lvs --units g ubuntu-vg;
+  lxc list --format csv -c n,s; for i in $(lxc list --format csv -c n); do
+    echo "$i cpu=$(lxc config get "$i" limits.cpu) mem=$(lxc config get "$i" limits.memory)"; done;
+  docker stats --no-stream --format "{{.Name}} {{.MemUsage}}"; df -h / /srv/data;
+  ip -4 route; ip -4 -br addr; lxc network list --format csv'
+```
+
+Acceptance (the same arithmetic preflight enforces, on live values):
+`MemTotal − Σ other instances' limits.memory − 6 GiB ≥ 6 GiB reserve`,
+`vCPUs − Σ other limits.cpu − 4 ≥ 4`, `VG free ≥ 50g + 20g`, no route or
+address in 10.72.0.0/24, and production's observed memory well inside the
+reserve. If any fails, lower `ci_vm_memory` / `ci_lv_size` (not the
+reserves) or free capacity first. The play also needs the host's LAN IPv4
+for the isolation probes: `ssh dc1-x86 'ip -4 -br addr'`.
+
+### Provisioning and registration (each step a separate authorisation)
+
+```bash
+# 1. dry run (no VM is created; preflight capacity runs on live values)
+ansible-playbook playbooks/ci-runner-truewealth.yml --check --diff \
+  --ask-become-pass -e ci_tw_host_lan_ip=<dc1-x86 LAN IPv4>
+# 2. provision the VM, volume, bridge, egress policy and runner binaries
+ansible-playbook playbooks/ci-runner-truewealth.yml \
+  --ask-become-pass -e ci_tw_host_lan_ip=<…>
+# 3. prove isolation from inside the VM (probes run again before every job)
+CI_RUNNER_LIVE=dc1-x86 CI_RUNNER_VM=dc1-ci-tw-1 tests/run-ci-runner-isolation.sh
+# 4. register: mint a ONE-TIME token in
+#    https://github.com/meetyaks/truewealth/settings/actions/runners/new
+#    (expires in 1 h; never paste it into chat or a file), then immediately:
+ansible-playbook playbooks/ci-runner-truewealth.yml --tags register \
+  --ask-become-pass -e ci_tw_host_lan_ip=<…> -e ci_runner_token=<token>
+# 5. confirm: runner "dc1-ci-tw-1", labels self-hosted,linux,x64,local-dc-ci,
+#    status Idle, in the TrueWealth repository ONLY:
+gh api repos/meetyaks/truewealth/actions/runners --jq '.runners[] | {name,status,labels:[.labels[].name]}'
+gh api repos/meetyaks/keel/actions/runners --jq '.runners[].name'   # unchanged: dc1-ci-1
+```
+
+Removal: `--tags unregister -e ci_runner_removal_token=<token>`; rebuild:
+`--tags rebuild -e ci_rebuild_confirm=dc1-ci-tw-1`.
