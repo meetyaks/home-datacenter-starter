@@ -111,11 +111,60 @@
       Type=oneshot
       RemainAfterExit=yes
       ExecStart={{ ci_egress_applier }}
+      {% if not (ci_isolation_hardening | bool) %}
       ExecStop=/usr/sbin/nft delete table inet {{ ci_egress_table }}
+      {% endif %}
 
       [Install]
       WantedBy=multi-user.target
   notify: Reload systemd for the egress unit
+
+- name: Load the nftables half before LXD can start the VM (hardening)
+  # The unit above runs after Docker (it must: DOCKER-USER only exists once
+  # Docker has started). An autostarted VM would otherwise boot with no host
+  # policy: forwarded traffic still meets Docker's FORWARD DROP, but INPUT to
+  # the host — every host service on the bridge address — is open until then.
+  # This unit loads only the nftables file, ordered before LXD; it has no
+  # ExecStop, so nothing but an explicit role change removes the policy.
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ ci_egress_unit }}-early.service"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by roles/ci_runner (home-datacenter-starter). Do not edit here.
+      [Unit]
+      Description=CI egress policy for {{ ci_vm_name }}, loaded before LXD (nftables only)
+      DefaultDependencies=no
+      After=local-fs.target
+      Before={{ (ci_lxd_service_units + ['network-pre.target']) | join(' ') }}
+      Wants=network-pre.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f {{ ci_egress_policy_file }}
+
+      [Install]
+      WantedBy=sysinit.target
+  when: ci_isolation_hardening | bool
+  notify: Reload systemd for the egress unit
+
+- name: Observe whether the early unit file is on disk
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ ci_egress_unit }}-early.service"
+  register: ci_egress_early_file
+  check_mode: false
+  when: ci_isolation_hardening | bool
+
+- name: Enable the early unit
+  ansible.builtin.systemd_service:
+    name: "{{ ci_egress_unit }}-early"
+    enabled: true
+    daemon_reload: true
+  when:
+    - ci_isolation_hardening | bool
+    - ci_egress_early_file.stat.exists or not ansible_check_mode
 
 - name: Observe whether the unit file is on disk
   # ⚠️ `systemd_service` FAILS IN CHECK MODE ON A UNIT THAT DOES NOT EXIST YET —
@@ -125,7 +174,7 @@
   # real.
   ansible.builtin.stat:
     path: "/etc/systemd/system/{{ ci_egress_unit }}.service"
-  register: ci_egress_unit
+  register: ci_egress_unit_file
   check_mode: false
 
 - name: Enable the egress unit
@@ -133,4 +182,4 @@
     name: "{{ ci_egress_unit }}"
     enabled: true
     daemon_reload: true
-  when: ci_egress_unit.stat.exists or not ansible_check_mode
+  when: ci_egress_unit_file.stat.exists or not ansible_check_mode

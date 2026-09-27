@@ -1,0 +1,126 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# READ-ONLY capacity and network preflight for dc1-ci-tw-1. Run it from the
+# admin plane (dc1-arm-1) BEFORE the provisioning dry run; it changes nothing
+# on the host:
+#
+#   ansible-playbook playbooks/ci-runner-truewealth-preflight.yml --ask-become-pass
+#
+# 1. tools/ci-preflight/collect.sh runs on the host (Ansible `script` module,
+#    root, because vgs/lvs/nft need it). It only reads: CPU and memory, every
+#    LXD instance's EFFECTIVE limits (profiles included), production
+#    containers' observed memory and limits, the volume group and volumes,
+#    LXD networks/pools, every IPv4/IPv6 address and route in every table,
+#    nftables table names, Docker's FORWARD policy, unit names.
+# 2. The facts and the plan (from playbooks/vars/ci-runner-truewealth.yml)
+#    are written on the controller under preflight_out (0700), and
+#    tools/ci-preflight/evaluate.py decides. Anything unreadable is UNKNOWN,
+#    and UNKNOWN fails: nothing is assumed about the host.
+#
+# If it reports NOT READY, change the proposal in the vars file (smaller
+# memory/volume) or free capacity — never the reserves — and run it again.
+# The provisioning play's own preflight repeats the core arithmetic on the
+# day it runs.
+#
+# Tests (no host contact): -e preflight_host=localhost -e ansible_connection=local
+#   -e preflight_facts_file=<fixture.json>   (tests/run-ci-runner-truewealth.sh)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: TrueWealth CI runner — read-only capacity and network preflight
+  hosts: "{{ preflight_host | default('dc1-x86') }}"
+  gather_facts: false
+  become: "{{ preflight_facts_file is not defined }}"
+  vars_files:
+    - ../roles/ci_runner/defaults/main.yml
+    - vars/ci-runner-truewealth.yml
+  vars:
+    # The probes in the vars file need the host's LAN address; the preflight
+    # does not use them.
+    ci_tw_host_lan_ip: "not-used-by-the-preflight"
+    preflight_out: "{{ lookup('env', 'HOME') }}/ci-preflight/{{ ci_vm_name }}"
+    preflight_production_headroom_factor: 1.5
+    preflight_plan:
+      vm_name: "{{ ci_vm_name }}"
+      cpu: "{{ ci_vm_cpu | int }}"
+      memory_mib: "{{ ci_vm_memory_mib | int }}"
+      reserve_cpu: "{{ ci_capacity_reserve_cpu | int }}"
+      reserve_memory_mib: "{{ ci_capacity_reserve_memory_mib | int }}"
+      production_headroom_factor: "{{ preflight_production_headroom_factor | float }}"
+      vg_name: "{{ ci_vg_name }}"
+      lv_name: "{{ ci_lv_name }}"
+      lv_size_bytes: "{{ (ci_lv_size | regex_replace('g$', '') | int) * 1073741824 }}"
+      vg_reserve_bytes: "{{ (ci_vg_reserve_g | int) * 1073741824 }}"
+      bridge: "{{ ci_lxd_bridge }}"
+      subnet: "{{ ci_lxd_subnet_cidr }}"
+      pool: "{{ ci_lxd_pool }}"
+      egress_table: "{{ ci_egress_table }}"
+      egress_unit: "{{ ci_egress_unit }}"
+      siblings: "{{ ci_lxd_sibling_instances }}"
+      lan_cidrs: "{{ ci_preflight_lan_cidrs }}"
+  tasks:
+    - name: The proposal must be well-formed before anything is read
+      ansible.builtin.assert:
+        that:
+          - ci_lv_size is match('^[0-9]+g$')
+          - ci_vm_memory_mib | int > 0
+          - ci_vm_cpu | int > 0
+        fail_msg: "ci_lv_size must be <N>g, ci_vm_memory <N>GiB|MiB, ci_vm_cpu a positive integer."
+        quiet: true
+
+    - name: Collect the host's facts (read-only; tools/ci-preflight/collect.sh)
+      ansible.builtin.script: ../tools/ci-preflight/collect.sh
+      register: preflight_collected
+      changed_when: false
+      check_mode: false
+      when: preflight_facts_file is not defined
+
+    - name: A directory for the report on the controller
+      ansible.builtin.file:
+        path: "{{ preflight_out }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Write the facts and the plan on the controller
+      ansible.builtin.copy:
+        dest: "{{ preflight_out }}/{{ item.name }}"
+        content: "{{ item.content }}"
+        mode: "0600"
+      loop:
+        - name: facts.json
+          content: "{{ lookup('file', preflight_facts_file) if preflight_facts_file is defined else preflight_collected.stdout }}"
+        - name: plan.json
+          content: "{{ preflight_plan | to_nice_json }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Evaluate (fails closed on anything unknown)
+      ansible.builtin.command:
+        argv: [python3, "{{ playbook_dir }}/../tools/ci-preflight/evaluate.py",
+               "{{ preflight_out }}/facts.json", "{{ preflight_out }}/plan.json"]
+      environment:
+        PYTHONDONTWRITEBYTECODE: "1"
+      register: preflight_eval
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      delegate_to: localhost
+      become: false
+
+    - name: The report
+      ansible.builtin.debug:
+        var: preflight_eval.stdout_lines
+
+    - name: Ready to provision
+      ansible.builtin.assert:
+        that:
+          - preflight_eval.rc == 0
+        fail_msg: >-
+          NOT READY (see the report above; facts and plan are in {{ preflight_out }}).
+          Adjust the proposal in playbooks/vars/ci-runner-truewealth.yml or free
+          capacity, never the reserves, and run this again.
+        success_msg: "Preflight PASSED for {{ ci_vm_name }}; the provisioning dry run is next."
+        quiet: true

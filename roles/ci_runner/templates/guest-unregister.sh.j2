@@ -35,7 +35,9 @@ if [ -f ./svc.sh ]; then
   ./svc.sh uninstall || true
 fi
 
-runuser -u "$RUNNER_USER" -- ./config.sh remove --token "$TOKEN"
+export ACTIONS_RUNNER_INPUT_TOKEN="$TOKEN"
 unset TOKEN
+runuser -u "$RUNNER_USER" -- ./config.sh remove
+unset ACTIONS_RUNNER_INPUT_TOKEN
 
 echo "CHANGED: removed {{ ci_runner_name }} from {{ ci_runner_scope_url }}"

@@ -77,6 +77,10 @@ ci_lxd_pool: ci-tw-pool
 # 10.0.0.0/24, dc1-ci-1 10.71.0.0/24, Docker 172.16/12, Tailscale
 # 100.64/10). The live host's routes have NOT been checked; see the
 # activation checklist.
+# LAN ranges this repository records (NOT verified live); the read-only
+# preflight (playbooks/ci-runner-truewealth-preflight.yml) also checks every
+# live address and route in every table.
+ci_preflight_lan_cidrs: [10.0.0.0/24]
 ci_lxd_bridge: citwbr0
 ci_lxd_subnet: 10.72.0.1/24
 ci_lxd_subnet_cidr: 10.72.0.0/24
@@ -89,6 +93,10 @@ ci_egress_unit: ci-egress-tw
 # Drop NEW connections into this bridge and answer DNS only from its own
 # gateway — the two paths a sibling CI VM on the same host would otherwise have.
 ci_egress_sibling_isolation: true
+# Interface-keyed rules (no spoofed-source bypass), IPv6 dropped, the bridge's
+# configuration verified, and the policy loaded before LXD and kept when Docker
+# stops. See roles/ci_runner/defaults/main.yml.
+ci_isolation_hardening: true
 # Wider than Keel's list: ALL of 10.0.0.0/8, which covers the lab LAN AND
 # dc1-ci-1's subnet, so this VM cannot open a connection to the sibling.
 ci_egress_denied_cidrs:

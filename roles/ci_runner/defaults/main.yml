@@ -110,6 +110,31 @@ ci_egress_unit: ci-egress
 ci_egress_sibling_isolation: false
 ci_lxd_gateway: "{{ ci_lxd_subnet | regex_replace('/.*$', '') }}"
 
+# ⚠️ OPT-IN HARDENING, OFF BY DEFAULT ONLY SO AN EXISTING INSTANCE'S RENDERED
+# POLICY AND UNITS STAY BYTE-IDENTICAL. Enabling it for dc1-ci-1 as well is
+# recommended; it is a separate, reviewed change to that runner. When true:
+#
+#   - EVERY packet from the CI bridge is judged by the interface it arrived on,
+#     not by its source address. The default rules match `ip saddr <subnet>`;
+#     a guest that sends from a spoofed source matches none of them and falls
+#     through to the chains' `accept` policy (forwarded to the LAN one-way, or
+#     delivered to host services).
+#   - IPv6 from or into the bridge is dropped outright. The bridge is created
+#     with ipv6.address=none, but the IPv4-only rules would pass any IPv6 that
+#     appeared later (a hand-edited bridge, a link-local address) untouched.
+#   - A pre-existing bridge must have exactly the configuration this role
+#     creates (no IPv6, NAT, this subnet); it is never silently adopted.
+#   - The nftables policy is also loaded by an early unit ordered BEFORE LXD,
+#     so an autostarted VM never runs before the host policy exists, and
+#     stopping Docker no longer deletes the policy (the default unit's
+#     ExecStop removes the table, and `PartOf=docker.service` stops the unit
+#     whenever Docker stops, leaving host services open to the VM for as long
+#     as Docker is down).
+ci_isolation_hardening: false
+# The unit names LXD may run under (snap or deb); ordering against a unit that
+# does not exist is a no-op, so both are listed.
+ci_lxd_service_units: [snap.lxd.daemon.service, lxd.service, lxd.socket]
+
 # ── Other runner instances on the same hypervisor ──────────────────────────
 #
 # Preflight refuses to touch LXD if it holds an instance this role did not
@@ -246,8 +271,9 @@ ci_runner_sha256: "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816
 # ── Registration ───────────────────────────────────────────────────────────
 #
 # ⚠️ NEVER COMMITTED, NEVER PRINTED, NEVER DEFAULTED. The registration token is
-# single-use and short-lived; it is supplied on the command line for one run and
-# the only task that touches it is `no_log`.
+# single-use and short-lived; it is supplied through the controller environment
+# (CI_RUNNER_TOKEN, set with `read -rs`) or a hidden prompt, never on the command
+# line — see tasks/token-input.yml for where it travels.
 #
 # ⚠️ EPHEMERAL IS OFF, AND THAT IS A DELIBERATE REVERSAL OF THE OBVIOUS ANSWER.
 #

@@ -126,9 +126,23 @@ if [ -f "$nft" ]; then
   else
     bad "DNS is limited to the own gateway" "the VM could query dc1-ci-1's bridge resolver"
   fi
-  grep -qE 'ip saddr 10\.72\.0\.0/24 counter drop' "$nft" \
-    && ok "every other host service is denied to the TrueWealth subnet" \
-    || bad "host services are denied" "no catch-all drop in the input chain"
+  input=$(awk '/chain input/{p=1} p&&/^  }/{exit} p' "$nft")
+  echo "$input" | grep -qE '^\s+counter drop$' \
+    && ok "every other host service is denied to anything on the bridge (catch-all keyed on the interface)" \
+    || bad "host services are denied" "no interface-keyed catch-all drop in the input chain"
+  # Hardening (ci_isolation_hardening): IPv6 and spoofed sources.
+  [ "$(grep -cE 'meta nfproto ipv6 counter drop' "$nft")" -eq 3 ] \
+    && ok "IPv6 is dropped from the bridge (input) and through it in both directions (forward)" \
+    || bad "IPv6 dropped" "$(grep -n 'nfproto' "$nft")"
+  grep -qE 'iifname "citwbr0" ip saddr != 10\.72\.0\.0/24 counter drop' "$nft" \
+    && ok "a spoofed source address is dropped before any other forward rule" \
+    || bad "spoofed sources dropped" "no saddr != subnet drop"
+  grep -qE '^\s+iifname "citwbr0" counter drop$' "$nft" \
+    && ok "the forward catch-all is keyed on the interface, not the source address" \
+    || bad "interface-keyed forward catch-all" "missing"
+  echo "$input" | grep -qE 'udp sport 68 udp dport 67 counter accept' \
+    && ok "DHCP is admitted by its ports (a DISCOVER comes from 0.0.0.0)" \
+    || bad "DHCP admitted" "missing"
   last=$(awk '/counter/{l=$0} END{print l}' "$nft")
   case "$last" in *drop*) ok "the last rule from the bridge is a drop" ;; *) bad "the last rule is a drop" "$last" ;; esac
   grep -q 'POLICY=/etc/nftables.d/ci-egress-tw.nft' "$R/tw/ci-egress-apply.sh" \
@@ -182,11 +196,26 @@ if git cat-file -e "$BASE^{commit}" 2>/dev/null; then
   if (cd "$R/keel-base" && ansible-playbook tests/ci-runner-render.yml -e render_dir="$R/keel-base/out" \
         > "$R/keel-base.log" 2>&1 || { mkdir -p out && ansible-playbook tests/ci-runner-render.yml -e render_dir="$R/keel-base/out" > "$R/keel-base.log" 2>&1; }) \
      && ansible-playbook tests/ci-runner-render.yml -e render_dir="$R/keel-now" > "$R/keel-now.log" 2>&1; then
-    if diff -r "$R/keel-base/out" "$R/keel-now" > "$R/keel.diff"; then
-      ok "every Keel artefact renders byte-identically to $BASE ($(ls "$R/keel-now" | wc -l | tr -d ' ') files)"
+    # ONE reviewed exception: the guest registration/removal scripts now hand
+    # the token to the runner as ACTIONS_RUNNER_INPUT_TOKEN instead of
+    # --token (it was a process argument inside the guest). Everything else
+    # must be byte-identical; for those three files, only comment lines and
+    # lines naming the token may differ.
+    if diff -r -x 'register.sh' -x 'register-ephemeral.sh' -x 'unregister.sh' "$R/keel-base/out" "$R/keel-now" > "$R/keel.diff"; then
+      ok "every other Keel artefact renders byte-identically to $BASE ($(ls "$R/keel-now" | wc -l | tr -d ' ') files)"
     else
       bad "Keel renders identically" "$(head -20 "$R/keel.diff")"
     fi
+    norm() { sed -E 's/ --token "\$TOKEN"//' "$1" | grep -vE '^\s*#|TOKEN|^\s*\\$'; }
+    tokdiff=""
+    for g in register.sh register-ephemeral.sh unregister.sh; do
+      diff <(norm "$R/keel-base/out/$g") <(norm "$R/keel-now/$g") >/dev/null || tokdiff="$tokdiff $g"
+      grep -vE '^\s*#' "$R/keel-now/$g" | grep -q -- '--token' && tokdiff="$tokdiff $g(--token)"
+      grep -q 'export ACTIONS_RUNNER_INPUT_TOKEN="\$TOKEN"' "$R/keel-now/$g" || tokdiff="$tokdiff $g(no env)"
+    done
+    [ -z "$tokdiff" ] \
+      && ok "Keel's guest register/unregister scripts differ ONLY in token transport (env, not --token)" \
+      || bad "Keel token-transport change is the only difference" "$tokdiff"
   else
     bad "Keel renders at both commits" "$(tail -3 "$R/keel-base.log" "$R/keel-now.log")"
   fi
@@ -227,6 +256,95 @@ else
   bad "preflight scenarios" "$(grep -E 'FAILED|msg' "$R/multi.log" | head -3)"
 fi
 
+
+# Sections 9 and 10 need real Linux behaviour (runuser, /proc, network
+# namespaces, nftables). They run in a throwaway container built from
+# tests/tools/test-tools.Dockerfile (pinned base), labelled for exact cleanup.
+TOOLS_IMAGE=""
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  if docker build -q --label twtask=hds-test-tools -t hds-test-tools:local \
+       -f tests/tools/test-tools.Dockerfile tests/tools > "$R/tools.log" 2>&1; then
+    TOOLS_IMAGE=hds-test-tools:local
+  fi
+fi
+
+echo
+echo "── 9. runner tokens never become process arguments (synthetic tokens) ──"
+if [ -n "$TOOLS_IMAGE" ]; then
+  if docker run --rm --label twtask=hds-token-test -v "$PWD:/repo:ro" "$TOOLS_IMAGE" \
+       bash /repo/tests/ci-runner-token-harness.sh > "$R/token.log" 2>&1; then
+    ok "register/unregister token handling: $(grep -o '[0-9]* passed' "$R/token.log" | tail -1) (tests/ci-runner-token-harness.sh)"
+  else
+    bad "token handling" "$(grep -A1 FAIL "$R/token.log" | head -8)"
+  fi
+else
+  skip "token handling" "needs Docker to build the Linux test toolbox"
+fi
+
+echo
+echo "── 10. the rendered policies, with real packets (network namespaces) ──"
+if [ -n "$TOOLS_IMAGE" ]; then
+  if docker run --rm --privileged --label twtask=hds-egress-test -v "$R/tw:/p:ro" -v "$PWD/tests:/t:ro" "$TOOLS_IMAGE" \
+       bash /t/ci-egress-netns.sh /p/ci-egress.nft citwbr0 10.72.0.1/24 10.72.0.50 hardened > "$R/netns-tw.log" 2>&1; then
+    ok "TrueWealth (hardened): $(grep -o '[0-9]* passed' "$R/netns-tw.log" | tail -1) packet-level expectations — IPv6, spoofed sources, host services, LAN and inbound refused; 443 out allowed"
+  else
+    bad "TrueWealth policy with real packets" "$(grep -A1 FAIL "$R/netns-tw.log" | head -8)"
+  fi
+  # Keel's policy is unchanged by this work. The same probes RECORD its
+  # behaviour: its IPv4 denies hold, and the IPv6 and spoofed-source paths are
+  # open (a finding for Keel's instance, not changed here).
+  if docker run --rm --privileged --label twtask=hds-egress-test -v "$R/keel-now:/p:ro" -v "$PWD/tests:/t:ro" "$TOOLS_IMAGE" \
+       bash /t/ci-egress-netns.sh /p/ci-egress.nft lxdbr0 10.71.0.1/24 10.71.0.50 default > "$R/netns-keel.log" 2>&1; then
+    ok "Keel (unchanged) behaves as documented: IPv4 denies hold; IPv6 to host services and spoofed sources pass (recorded finding)"
+  else
+    bad "Keel policy behaves as documented" "$(grep -A1 FAIL "$R/netns-keel.log" | head -8)"
+  fi
+else
+  skip "policies with real packets" "needs Docker (privileged, network namespaces)"
+fi
+
+
+echo
+echo "── 11. the read-only capacity/network preflight (fixtures; no host contact) ──"
+if PYTHONDONTWRITEBYTECODE=1 python3 tests/ci-preflight/test_evaluate.py > "$R/pf-unit.log" 2>&1; then
+  ok "evaluator decisions: $(grep -o 'Ran [0-9]* tests' "$R/pf-unit.log") (limits incl. inherited/percent/pinned, headroom, storage, names, subnet in addresses/routes/LXD/LAN, unknowns fail closed)"
+else
+  bad "evaluator fixture tests" "$(tail -8 "$R/pf-unit.log")"
+fi
+PYTHONDONTWRITEBYTECODE=1 python3 tests/ci-preflight/test_evaluate.py --dump-fixture "$R/pf-ready.json"
+PYTHONDONTWRITEBYTECODE=1 python3 tests/ci-preflight/test_evaluate.py --dump-overlap-fixture "$R/pf-overlap.json"
+if HOME="$R/pfhome" ansible-playbook playbooks/ci-runner-truewealth-preflight.yml -e preflight_host=localhost \
+     -e ansible_connection=local -e preflight_facts_file="$R/pf-ready.json" > "$R/pf-play.log" 2>&1 \
+   && grep -q 'preflight: PASS' "$R/pf-play.log" \
+   && [ "$(stat -f %Lp "$R/pfhome/ci-preflight/dc1-ci-tw-1" 2>/dev/null || stat -c %a "$R/pfhome/ci-preflight/dc1-ci-tw-1")" = 700 ]; then
+  ok "the playbook renders the plan from the vars and passes a host with room (report dir 0700)"
+else
+  bad "preflight playbook (ready fixture)" "$(grep -E 'FAIL|UNKNOWN|fatal|msg' "$R/pf-play.log" | head -4)"
+fi
+if ! HOME="$R/pfhome2" ansible-playbook playbooks/ci-runner-truewealth-preflight.yml -e preflight_host=localhost \
+       -e ansible_connection=local -e preflight_facts_file="$R/pf-overlap.json" > "$R/pf-play2.log" 2>&1 \
+   && grep -q 'NOT READY' "$R/pf-play2.log" && grep -q 'FAIL    subnet vs routes' "$R/pf-play2.log"; then
+  ok "the playbook refuses a host whose routing tables already use the subnet"
+else
+  bad "preflight playbook (overlap fixture)" "$(tail -5 "$R/pf-play2.log")"
+fi
+if [ -n "$TOOLS_IMAGE" ]; then
+  # The REAL collector on a Linux box that has none of LXD, Docker or LVM:
+  # it must still emit a complete document, and the evaluator must refuse.
+  if docker run --rm --label twtask=hds-preflight-test -v "$PWD:/repo:ro" "$TOOLS_IMAGE" \
+       bash /repo/tools/ci-preflight/collect.sh > "$R/pf-collected.json" 2> "$R/pf-collect.err"; then
+    python3 tools/ci-preflight/evaluate.py "$R/pf-collected.json" "$R/pfhome/ci-preflight/dc1-ci-tw-1/plan.json" > "$R/pf-eval.log" 2>&1; erc=$?
+    if [ "$erc" -ne 0 ] && grep -q 'UNKNOWN cpu' "$R/pf-eval.log" && grep -q 'not installed: lxc' "$R/pf-eval.log"; then
+      ok "the real collect.sh runs and missing tools are UNKNOWN, so the verdict is NOT READY"
+    else
+      bad "collector + evaluator fail closed" "rc=$erc $(tail -3 "$R/pf-eval.log")"
+    fi
+  else
+    bad "collect.sh runs" "$(tail -3 "$R/pf-collect.err")"
+  fi
+else
+  skip "real collector" "needs Docker"
+fi
 echo
 printf '── %d passed, %d failed ──\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

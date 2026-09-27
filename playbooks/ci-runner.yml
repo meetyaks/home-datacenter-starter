@@ -6,9 +6,9 @@
 #   check       ansible-playbook playbooks/ci-runner.yml --check --diff --ask-become-pass
 #   provision   ansible-playbook playbooks/ci-runner.yml --ask-become-pass
 #   register    ansible-playbook playbooks/ci-runner.yml --tags register \
-#                 --ask-become-pass -e ci_runner_token=<one-time token>
+#                 --ask-become-pass     (token: exported CI_RUNNER_TOKEN, or prompt)
 #   remove      ansible-playbook playbooks/ci-runner.yml --tags unregister \
-#                 --ask-become-pass -e ci_runner_removal_token=<one-time token>
+#                 --ask-become-pass     (token: exported CI_RUNNER_REMOVAL_TOKEN, or prompt)
 #   rebuild     ansible-playbook playbooks/ci-runner.yml --tags rebuild \
 #                 --ask-become-pass -e ci_rebuild_confirm=dc1-ci-1
 #

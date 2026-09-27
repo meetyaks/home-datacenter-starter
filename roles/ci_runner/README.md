@@ -146,13 +146,17 @@ ansible-playbook playbooks/ci-runner.yml --ask-become-pass
 # dry run
 ansible-playbook playbooks/ci-runner.yml --check --diff --ask-become-pass
 
-# register — needs a one-time token you generate in the repository settings
-ansible-playbook playbooks/ci-runner.yml --tags register \
-  --ask-become-pass -e ci_runner_token=<token>
+# register — needs a one-time token you generate in the repository settings.
+# Never pass it with -e (argv and shell history; the role refuses it): export it
+# from a hidden read, or leave it unset and answer the hidden prompt.
+read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN
+ansible-playbook playbooks/ci-runner.yml --tags register --ask-become-pass
+unset CI_RUNNER_TOKEN
 
 # remove — needs a one-time removal token from the runner's Remove button
-ansible-playbook playbooks/ci-runner.yml --tags unregister \
-  --ask-become-pass -e ci_runner_removal_token=<token>
+read -rs CI_RUNNER_REMOVAL_TOKEN && export CI_RUNNER_REMOVAL_TOKEN
+ansible-playbook playbooks/ci-runner.yml --tags unregister --ask-become-pass
+unset CI_RUNNER_REMOVAL_TOKEN
 
 # destroy and rebuild the VM (refuses while a runner is registered)
 ansible-playbook playbooks/ci-runner.yml --tags rebuild \
@@ -283,42 +287,62 @@ user or work directory does not change that. The boundary is the hypervisor.
 | root disk | 170 GiB | 45 GiB |
 | LXD pool / bridge | `ci-pool` / `lxdbr0` | `ci-tw-pool` / `citwbr0` |
 | subnet | 10.71.0.0/24 | 10.72.0.0/24 |
-| egress table / unit | `inet ci_egress` / `ci-egress` | `inet ci_egress_tw` / `ci-egress-tw` |
+| egress table / unit | `inet ci_egress` / `ci-egress` | `inet ci_egress_tw` / `ci-egress-tw` (+ `ci-egress-tw-early`) |
 | denies | LAN /24, CGNAT, 172.16/12, 192.168/16, link-local | **all of 10/8** (LAN and dc1-ci-1), CGNAT, 172.16/12, 192.168/16, link-local |
 | sibling isolation | off (unchanged) | on: no NEW connection into `citwbr0`; DNS only from its own gateway |
+| hardening (`ci_isolation_hardening`) | off (unchanged) | on: rules keyed on the interface (spoofed sources refused), IPv6 dropped both ways, existing bridge verified, policy loaded before LXD and kept when Docker stops |
 
 Isolation contract it meets: repository-scoped registration; its own kernel,
 Docker daemon, disk, bridge, egress table and runner state; the role's
 job hooks clean only this VM; no host device, production mount, Docker socket,
 secret, SSH key or route to production/administration services; one job at a
 time (one non-ephemeral registration); outbound 80/443 (+NTP) to the public
-internet only.
+internet only, over IPv4 only.
+
+`tests/run-ci-runner-truewealth.sh` section 10 sends real packets through both
+rendered policies in network namespaces (with IPv6 deliberately present on the
+bridge). For dc1-ci-tw-1 every probe is refused except 443 out, its own
+resolver and DHCP. **Recorded finding for Keel's unchanged policy:** IPv6 to
+host services (if the bridge ever carries IPv6) and one-way traffic from a
+spoofed source address to the LAN or the host pass it; enabling
+`ci_isolation_hardening` for dc1-ci-1 is a separate, reviewed change.
+
+**Persistent runner state.** The runner is not ephemeral: a job that gains
+root in the VM (Docker access is enough) can leave state that affects later
+jobs on it. The job hooks remove containers, volumes and the workspace, not
+arbitrary files or processes a job planted. This matters for release builds;
+see the TrueWealth activation runbook (docs/activation.md in that repository).
 
 ### Capacity — measure it live before provisioning (read-only, from dc1-arm-1)
 
 The figures above are **proposals**. The host facts in this repository (16
 vCPU, 27 GiB, `ubuntu-vg` 74.68 GiB free after dc1-ci-1) were recorded when
-dc1-ci-1 was built and are **not re-verified**. Collect them read-only:
+dc1-ci-1 was built and are **not re-verified**. The preflight playbook reads
+the live host without changing it and decides, failing closed on anything it
+cannot read:
 
 ```bash
-ssh dc1-x86 'nproc; free -m; sudo vgs --units g ubuntu-vg; sudo lvs --units g ubuntu-vg;
-  lxc list --format csv -c n,s; for i in $(lxc list --format csv -c n); do
-    echo "$i cpu=$(lxc config get "$i" limits.cpu) mem=$(lxc config get "$i" limits.memory)"; done;
-  docker stats --no-stream --format "{{.Name}} {{.MemUsage}}"; df -h / /srv/data;
-  ip -4 route; ip -4 -br addr; lxc network list --format csv'
+ansible-playbook playbooks/ci-runner-truewealth-preflight.yml --ask-become-pass
 ```
 
-Acceptance (the same arithmetic preflight enforces, on live values):
-`MemTotal − Σ other instances' limits.memory − 6 GiB ≥ 6 GiB reserve`,
-`vCPUs − Σ other limits.cpu − 4 ≥ 4`, `VG free ≥ 50g + 20g`, no route or
-address in 10.72.0.0/24, and production's observed memory well inside the
-reserve. If any fails, lower `ci_vm_memory` / `ci_lv_size` (not the
-reserves) or free capacity first. The play also needs the host's LAN IPv4
-for the isolation probes: `ssh dc1-x86 'ip -4 -br addr'`.
+It checks, on live values: CPU and memory after every other instance's
+**effective** limits (profile-inherited ones included; an instance with no
+limit is UNKNOWN, because it could take the host); production containers'
+observed memory ×1.5 + 2 GiB host overhead inside what VM limits leave; VG free
+≥ 50g + 20g reserve; the volume, pool, bridge, instance and nft table names
+unused; the subnet 10.72.0.0/24 absent from every host address, every route in
+every table (Tailscale's table 52 included), every LXD network and the
+recorded LAN; Docker's FORWARD policy DROP; the LXD unit present. The facts
+and the plan are kept (0700) under `~/ci-preflight/dc1-ci-tw-1/` on the
+controller. If it reports NOT READY, lower `ci_vm_memory` / `ci_lv_size` (not
+the reserves) or free capacity first. The play also needs the host's LAN IPv4
+for the isolation probes: read it from the collected `ip4_addr` section.
 
 ### Provisioning and registration (each step a separate authorisation)
 
 ```bash
+# 0. read-only preflight (above); stop unless it PASSES
+ansible-playbook playbooks/ci-runner-truewealth-preflight.yml --ask-become-pass
 # 1. dry run (no VM is created; preflight capacity runs on live values)
 ansible-playbook playbooks/ci-runner-truewealth.yml --check --diff \
   --ask-become-pass -e ci_tw_host_lan_ip=<dc1-x86 LAN IPv4>
@@ -329,14 +353,27 @@ ansible-playbook playbooks/ci-runner-truewealth.yml \
 CI_RUNNER_LIVE=dc1-x86 CI_RUNNER_VM=dc1-ci-tw-1 tests/run-ci-runner-isolation.sh
 # 4. register: mint a ONE-TIME token in
 #    https://github.com/meetyaks/truewealth/settings/actions/runners/new
-#    (expires in 1 h; never paste it into chat or a file), then immediately:
+#    (expires in 1 h; never paste it into chat, a file or a command line),
+#    then immediately, on the controller:
+read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN      # or skip: hidden prompt
 ansible-playbook playbooks/ci-runner-truewealth.yml --tags register \
-  --ask-become-pass -e ci_tw_host_lan_ip=<…> -e ci_runner_token=<token>
+  --ask-become-pass -e ci_tw_host_lan_ip=<…>
+unset CI_RUNNER_TOKEN
 # 5. confirm: runner "dc1-ci-tw-1", labels self-hosted,linux,x64,local-dc-ci,
 #    status Idle, in the TrueWealth repository ONLY:
 gh api repos/meetyaks/truewealth/actions/runners --jq '.runners[] | {name,status,labels:[.labels[].name]}'
 gh api repos/meetyaks/keel/actions/runners --jq '.runners[].name'   # unchanged: dc1-ci-1
 ```
 
-Removal: `--tags unregister -e ci_runner_removal_token=<token>`; rebuild:
+Where the token travels (tasks/token-input.yml, tasks/register.yml): the
+controller's environment or a hidden prompt (`-e ci_runner_token` is refused)
+→ a module argument on a task that forces pipelining (a runtime probe refuses
+the run if modules would be written to the host's disk) → stdin of
+`lxc exec -T` → `ACTIONS_RUNNER_INPUT_TOKEN` for the one `config.sh` call
+(never `--token`). `no_log` hides Ansible's output; it does not hide process
+arguments, which is why the value is never one. Section 9 of the test suite
+samples every process's argv and Ansible's temp files during synthetic
+registrations to prove it.
+
+Removal: `--tags unregister` with `CI_RUNNER_REMOVAL_TOKEN` exported the same way (or the prompt); rebuild:
 `--tags rebuild -e ci_rebuild_confirm=dc1-ci-tw-1`.

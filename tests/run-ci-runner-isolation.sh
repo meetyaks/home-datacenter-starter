@@ -418,10 +418,23 @@ else
 fi
 
 # stdin, not argv: absent from `ps` on the host and from Ansible's task args.
-if grep -q 'stdin: "{{ ci_runner_token }}"' "$ROLE/tasks/register.yml"; then
-  ok "the token reaches the guest on stdin, not in an argument"
+if grep -q 'stdin: "{{ ci_runner_token_input }}"' "$ROLE/tasks/register.yml" \
+   && grep -q 'stdin: "{{ ci_runner_token_input }}"' "$ROLE/tasks/unregister.yml" \
+   && [ "$(grep -c 'ansible_pipelining: true' "$ROLE/tasks/register.yml")" -ge 1 ] \
+   && [ "$(grep -c 'ansible_pipelining: true' "$ROLE/tasks/unregister.yml")" -ge 1 ]; then
+  ok "the token reaches the guest on stdin, on pipelined tasks (no module file on the host)"
 else
   bad "the token is delivered on stdin" "it would be visible in ps on dc1-x86"
+fi
+# …and never as an argument at either end: the operator's command line is
+# refused, and inside the guest the runner gets it by environment.
+if grep -q "ci_token_legacy: ci_runner_token" "$ROLE/tasks/register.yml" \
+   && grep -q "ci_token_legacy: ci_runner_removal_token" "$ROLE/tasks/unregister.yml" \
+   && ! grep -vE '^\s*#' "$ROLE/templates/guest-register.sh.j2" "$ROLE/templates/guest-unregister.sh.j2" | grep -q -- '--token' \
+   && [ "$(grep -c 'export ACTIONS_RUNNER_INPUT_TOKEN=' "$ROLE/templates/guest-register.sh.j2" "$ROLE/templates/guest-unregister.sh.j2" | awk -F: '{s+=$2} END{print s}')" -eq 2 ]; then
+  ok "-e tokens are refused and config.sh gets the token by environment, never --token"
+else
+  bad "no token in any argv" "a -e token is accepted or config.sh is given --token"
 fi
 
 if ! grep -rnE 'ci_runner_token' "$ROLE/templates/" 2>/dev/null | grep -qv '^\s*#'; then

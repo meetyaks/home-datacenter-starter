@@ -8,9 +8,12 @@
 #   provision   ansible-playbook playbooks/ci-runner-truewealth.yml \
 #                 --ask-become-pass -e ci_tw_host_lan_ip=<dc1-x86 LAN IPv4>
 #   register    ansible-playbook playbooks/ci-runner-truewealth.yml --tags register \
-#                 --ask-become-pass -e ci_tw_host_lan_ip=<…> -e ci_runner_token=<one-time token>
+#                 --ask-become-pass -e ci_tw_host_lan_ip=<…>
+#               (token: `read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN` first,
+#               or leave it unset to be prompted; never -e — see tasks/token-input.yml)
 #   remove      ansible-playbook playbooks/ci-runner-truewealth.yml --tags unregister \
-#                 --ask-become-pass -e ci_tw_host_lan_ip=<…> -e ci_runner_removal_token=<token>
+#                 --ask-become-pass -e ci_tw_host_lan_ip=<…>
+#               (token: CI_RUNNER_REMOVAL_TOKEN exported the same way, or the prompt)
 #   rebuild     ansible-playbook playbooks/ci-runner-truewealth.yml --tags rebuild \
 #                 --ask-become-pass -e ci_tw_host_lan_ip=<…> -e ci_rebuild_confirm=dc1-ci-tw-1
 #

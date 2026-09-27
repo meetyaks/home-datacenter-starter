@@ -1,0 +1,28 @@
+---
+# Drives roles/ci_runner's REAL register/unregister entry points against a
+# stub `lxc` (tests/ci-runner-token-harness.sh provides it, inside a
+# throwaway container). Everything the role sends to "the guest" runs: the
+# rendered guest-register.sh / guest-unregister.sh, the real runuser, and a
+# fake config.sh / svc.sh that record what they were given.
+#
+#   -e entry=register|unregister
+- name: Runner token handling (synthetic)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    ci_vm_name: dc1-ci-synthetic
+    ci_runner_name: dc1-ci-synthetic
+    ci_runner_user: ghrunner
+    ci_runner_dir: /work/guest/home/ghrunner/actions-runner
+    ci_runner_work: /work/guest/home/ghrunner/work
+    ci_stage_dir: /work/stage
+    ci_runner_scope_url: https://github.com/example/synthetic
+    ci_runner_labels: self-hosted,linux,x64,synthetic
+    ci_runner_playbook: tests/ci-runner-token.yml
+  tasks:
+    - name: The entry point under test
+      ansible.builtin.include_role:
+        name: ci_runner
+        tasks_from: "{{ entry }}"

@@ -11,27 +11,29 @@
 # routine re-run of the role. So provisioning is unattended and repeatable, and
 # registration is an explicit, tagged, operator-initiated act.
 #
-#   ansible-playbook playbooks/ci-runner.yml --tags register -e ci_runner_token=…
+#   read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN   # or omit: hidden prompt
+#   ansible-playbook playbooks/ci-runner.yml --tags register --ask-become-pass
+#   unset CI_RUNNER_TOKEN
 #
-# The token reaches the guest ON STDIN. It is never written to disk on either
-# machine, never an argument to `lxc exec`, and the task that carries it is
-# `no_log`.
+# Where the token travels, end to end — never as a process argument:
+#   operator → controller env var or hidden prompt (tasks/token-input.yml;
+#     `-e ci_runner_token=…` is REFUSED: argv and shell history)
+#   controller → host: a module argument (stdin of `lxc exec`), with
+#     pipelining forced on that task so the module is streamed over SSH and
+#     never written to the host's temp directory
+#   host → guest: stdin of `lxc exec -T` (not its argv)
+#   guest script → runner: ACTIONS_RUNNER_INPUT_TOKEN, exported for the single
+#     config.sh call (not --token)
+# Every task that holds it is no_log. no_log hides Ansible output, not process
+# arguments — which is why the value is never put in one.
 # ─────────────────────────────────────────────────────────────────────────────
 
-- name: A registration token must be supplied
-  ansible.builtin.assert:
-    that:
-      - ci_runner_token is defined
-      - (ci_runner_token | default('') | trim | length) > 10
-    fail_msg: >-
-      No registration token. Generate a one-time token at
-      {{ ci_runner_scope_url }}/settings/actions/runners/new?arch=x64&os=linux
-      and pass it for this run only:
-      ansible-playbook {{ ci_runner_playbook }} --tags register -e ci_runner_token=<token>
-    # ⚠️ `quiet` AND the length-only condition together are what keep the token
-    # out of the output. An assertion that printed the value it checked would
-    # defeat the entire stdin-only discipline in its error path.
-    quiet: true
+- name: Obtain the registration token without exposing it
+  ansible.builtin.include_tasks: token-input.yml
+  vars:
+    ci_token_kind: registration
+    ci_token_env: CI_RUNNER_TOKEN
+    ci_token_legacy: ci_runner_token
 
 - name: The guest must already be provisioned
   # Registering into a VM without the runner binaries produces a confusing
@@ -83,38 +85,61 @@
       - --gid=0
   changed_when: true
 
-- name: Register the runner
-  ansible.builtin.command:
-    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", /root/register.sh]
-    # THE ONLY PLACE THE TOKEN EXISTS IN THIS PLAY. `-T` above disables pty
-    # allocation, which is what makes `lxc exec` pipe this straight through to
-    # the script's stdin.
-    stdin: "{{ ci_runner_token }}"
-    stdin_add_newline: true
-  register: ci_register
-  # ⚠️ NOT NEGOTIABLE. Without this the token appears in -v output, in any
-  # callback plugin and in AWX/Ansible logs. The result is unwrapped in the
-  # next task, which is safe because the script prints no token.
-  no_log: true
-  changed_when: "'CHANGED:' in ci_register.stdout"
+- name: Register the runner, then clean up whatever happened
+  block:
+    - name: Register the runner
+      ansible.builtin.command:
+        argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", /root/register.sh]
+        # THE ONLY PLACE THE TOKEN IS SENT. `-T` disables pty allocation,
+        # which is what makes `lxc exec` pipe this straight through to the
+        # script's stdin (never its argv).
+        stdin: "{{ ci_runner_token_input }}"
+        stdin_add_newline: true
+      vars:
+        # Stream the module (and so this stdin value) to the host over the SSH
+        # session instead of writing it to a temp file there first.
+        ansible_pipelining: true
+      register: ci_register
+      # ⚠️ NOT NEGOTIABLE. Without this the token appears in -v output, in any
+      # callback plugin and in AWX/Ansible logs. The result is unwrapped below,
+      # which is safe because the script prints no token and the runner masks
+      # the one it was given.
+      no_log: true
+      # Evaluated below, after the cleanup, so a failure cannot skip it.
+      failed_when: false
+      changed_when: "'CHANGED:' in ci_register.stdout"
+  always:
+    - name: Forget the token for the rest of the play
+      ansible.builtin.set_fact:
+        ci_runner_token_input: ""
+      no_log: true
 
-- name: Remove the staged registration script
-  ansible.builtin.file:
-    path: "{{ ci_stage_dir }}/register.sh"
-    state: absent
+    - name: Remove the staged registration script
+      ansible.builtin.file:
+        path: "{{ ci_stage_dir }}/register.sh"
+        state: absent
 
-- name: Remove it from the guest too
-  # It contains no secret, but a script whose whole purpose is to consume a
-  # registration token has no reason to stay on disk in the CI VM.
-  ansible.builtin.command:
-    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", rm, -f, /root/register.sh]
-    # Not conditional on the registration succeeding — a failed attempt is
-    # exactly when it must not be left behind.
-  changed_when: false
+    - name: Remove it from the guest too
+      # It contains no secret, but a script whose whole purpose is to consume
+      # a token has no reason to stay on disk in the CI VM — least of all
+      # after a failed attempt.
+      ansible.builtin.command:
+        argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", rm, -f, /root/register.sh]
+      changed_when: false
 
 - name: What registration reported
   ansible.builtin.debug:
-    var: ci_register.stdout_lines
+    msg: "{{ (ci_register.stdout_lines | default([])) + (ci_register.stderr_lines | default([])) }}"
+
+- name: The registration must have succeeded
+  ansible.builtin.assert:
+    that:
+      - ci_register.rc | default(1) == 0
+    fail_msg: >-
+      Registration failed (exit {{ ci_register.rc | default('?') }}); the output is
+      above. The token was sent once and may now be spent: generate a new one
+      before retrying.
+    quiet: true
 
 # ── Proof, not assumption ───────────────────────────────────────────────────
 - name: Read the runner service state
