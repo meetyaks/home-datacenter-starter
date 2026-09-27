@@ -57,17 +57,39 @@ for hp in {% for p in ci_isolation_denied_probes %}'{{ p }}' {% endfor %}; do
   fi
 done
 
-# ── A clean workspace ───────────────────────────────────────────────────────
+# ── Stale workspaces from OTHER jobs ────────────────────────────────────────
 #
-# Every repository checkout directory is removed, so no job inherits another
-# job's files, node_modules, containers-under-test or stray credentials. The
-# runner's own caches (_actions, _tool) and the pnpm store are kept: they hold
-# no job state, and rebuilding them every run would triple the cycle time.
+# ⚠️ NOT THIS JOB'S WORKSPACE, AND THAT DISTINCTION COST THE FIRST CI RUN.
+# The runner creates the job's working directory BEFORE it invokes this hook.
+# The first version of this script removed everything under _work, including
+# that directory — so every step then died instantly with
+#
+#   An error occurred trying to start process '/usr/bin/docker' with working
+#   directory '/home/ghrunner/_work/keel/keel'. No such file or directory
+#
+# Both jobs failed in under 20 seconds, having run no product code at all.
+#
+# So this removes the checkout trees of OTHER repositories and other branches —
+# which is what stops one job inheriting another's node_modules, build output or
+# stray credentials — and leaves the current one alone. Clearing the current
+# workspace is the completed hook's job, once the runner has finished with it.
+#
+# The runner's own caches (_actions, _tool) and the pnpm store are kept
+# deliberately: they hold no job state, and rebuilding them every run would
+# triple the cycle time.
+keep="$(basename "${RUNNER_WORKSPACE:-__none__}")"
 if [ -d "$RUNNER_WORK" ]; then
-  find "$RUNNER_WORK" -mindepth 1 -maxdepth 1 \
-    ! -name '_actions' ! -name '_tool' ! -name '_temp' \
-    -exec rm -rf {} + 2>/dev/null
-  rm -rf "${RUNNER_WORK:?}/_temp/"* 2>/dev/null
+  for d in "$RUNNER_WORK"/*; do
+    [ -e "$d" ] || continue
+    case "$(basename "$d")" in
+      _actions|_tool|_temp) continue ;;
+      "$keep")              continue ;;
+      *) rm -rf "$d" 2>/dev/null || true ;;
+    esac
+  done
+  # _temp is scratch the runner recreates per job, and it is not the working
+  # directory, so emptying it here is safe.
+  rm -rf "${RUNNER_WORK:?}/_temp/"* 2>/dev/null || true
 fi
 
 mkdir -p "$CACHE_DIR/pnpm"

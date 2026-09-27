@@ -345,7 +345,25 @@ else
       "a probe that cannot resolve would report success without testing anything"
 fi
 
+# ⚠️ AND IT MUST NOT DELETE THE DIRECTORY THE JOB IS ABOUT TO RUN IN. The runner
+# creates the job's working directory BEFORE invoking this hook. The first
+# version removed everything under _work, so every step died with "No such file
+# or directory" and two jobs failed in under 20 seconds having executed no
+# product code. The current workspace is the completed hook's to clear.
+if grep -q 'RUNNER_WORKSPACE' "$started"; then
+  ok "the started hook spares the current job's workspace"
+else
+  bad "the started hook spares the current workspace" \
+      "it would delete the directory the job is about to run in"
+fi
+
 completed="$R/job-completed.sh"
+
+if grep -q 'GITHUB_WORKSPACE' "$completed"; then
+  ok "the completed hook clears the workspace the job used"
+else
+  bad "the completed hook clears the workspace" "the next job would inherit this job's files"
+fi
 if grep -q 'docker ps -aq' "$completed" && grep -q 'docker volume ls -q' "$completed"; then
   ok "the completed hook destroys containers and volumes"
 else

@@ -4,12 +4,15 @@
 # Runs in the guest, as {{ ci_runner_user }}, after every job's last step.
 # Preserve what diagnosis needs, then destroy what the job created.
 #
-# ⚠️ WHY THE WORKSPACE WIPE IS IN THE *STARTED* HOOK AND NOT HERE. At this point
-# the runner still owns the job's directory tree and cleans it up itself after
-# the hook returns; removing it underneath produces confusing post-job errors.
-# Clearing at the start of the next job gives the same guarantee — no job ever
-# sees another job's files — and also covers the case this hook never ran,
-# because the job was cancelled or the VM lost power.
+# ⚠️ THIS IS WHERE THE CURRENT JOB'S WORKSPACE IS CLEARED, AND IT HAS TO BE.
+# The started hook cannot do it: the runner creates the job's working directory
+# before invoking that hook, so removing it there makes every step fail with
+# "No such file or directory" before any product code runs. The started hook
+# therefore removes only OTHER workspaces, and this one empties the current
+# tree once the runner has finished with it.
+#
+# The CONTENTS are removed and the directory itself is left in place — the
+# runner still expects it to exist after this hook returns.
 set -uo pipefail
 
 LOG_DIR='{{ ci_runner_log_dir }}'
@@ -87,7 +90,16 @@ if [ -n "${used:-}" ] && [ "$used" -ge "$DISK_HIGH_WATER" ]; then
   docker system prune -af --volumes >/dev/null 2>&1 || true
 fi
 
-# ── 3. Retention ────────────────────────────────────────────────────────────
+# ── 3. The workspace ────────────────────────────────────────────────────────
+#
+# Emptied, not removed. Everything worth keeping was copied above; what is left
+# is a checkout, its node_modules and whatever the job wrote — none of which the
+# next job should ever see.
+if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "${GITHUB_WORKSPACE:-}" ]; then
+  find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# ── 4. Retention ────────────────────────────────────────────────────────────
 find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type d -mtime "+${RETAIN_DAYS}" -exec rm -rf {} + 2>/dev/null || true
 
 # The runner's own diagnostics rotate themselves, but not aggressively enough to
