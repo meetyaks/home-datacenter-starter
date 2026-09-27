@@ -138,6 +138,16 @@ sha() { sha256sum "$W/root/$1" 2>/dev/null | cut -d' ' -f1; }
 running() { docker inspect --format '{{.State.Running}}' "$PROJECT-$1-1" 2>/dev/null; }
 revision() { docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$PROJECT-$1-1" 2>/dev/null; }
 
+echo "── 0. check mode on a fresh host ──"
+deploy check v1 --check --diff; rc=$?
+[ $rc -eq 0 ] && [ -z "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ] \
+  && [ ! -e "$W/root/DEPLOYMENT_MANIFEST.json" ] && [ ! -e "$W/root/DEPLOYMENT_ATTEMPT.json" ] \
+  && grep -q 'CHECK MODE: controller-side verification' "$W/logs/check.log" \
+  && ok "--check --diff passes on a fresh host, starts nothing and writes no record" || bad "check mode" "rc=$rc $(grep -E 'fatal|FAILED' "$W/logs/check.log" | head -3)"
+leak=""; for k in truewealth_vault_db_password truewealth_vault_key_secret truewealth_vault_redis_password; do
+  v="$(sed -n "s/^$k: //p" "$W/vars.yml")"; grep -qF -- "$v" "$W/logs/check.log" && leak="$leak $k"; done
+[ -z "$leak" ] && ok "--diff shows no secret value (secret files are diff: false)" || bad "diff leaks" "$leak"
+
 echo "── a. first deployment ──"
 deploy a v1; rc=$?
 [ $rc -eq 0 ] && ok "v1 deploys (migrate 2, up --wait, identity, readyz, loopback, DNS, trusted HTTPS, revision)" \
