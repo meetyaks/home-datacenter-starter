@@ -133,4 +133,11 @@ echo "══ CI runner isolation (39 static checks) ═════════�
 tests/run-ci-runner-isolation.sh
 
 echo
+echo "══ second CI runner (TrueWealth) beside dc1-ci-1 ═══════════════════"
+# dc1-ci-tw-1 shares no host-side name, subnet or egress table with dc1-ci-1,
+# cannot reach it or production, registers to TrueWealth only — and dc1-ci-1
+# still renders byte-identically to the commit the second instance was added on.
+tests/run-ci-runner-truewealth.sh
+
+echo
 echo "All regression suites passed."
