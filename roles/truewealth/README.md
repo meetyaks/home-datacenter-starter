@@ -1,9 +1,13 @@
 # roles/truewealth — TrueWealth on dc1-x86
 
 Deploys TrueWealth to `https://tw.dc1.lan` from **verified images**: built once
-and tested natively on the TrueWealth CI runner, published behind a separate
-gate, and verified on the admin plane (dc1-arm-1). The production host never
-builds, never pulls TrueWealth images and never holds a registry credential.
+and tested natively on the TrueWealth CI runner by `release.yml` (which holds no
+write credential), exported as that run's artifact, and verified on the admin
+plane (dc1-arm-1) against the GitHub API and GitHub's artifact digest by
+TrueWealth's `scripts/release/fetch-verify.mjs`. The production host never
+builds, never pulls TrueWealth images and never holds a registry or GitHub
+credential. The whole sequence and its owner decisions: TrueWealth's
+`docs/activation.md`.
 
 Sibling of `roles/keel`, sharing nothing with it but the Docker daemon and the
 canonical Caddy (`roles/caddy`):

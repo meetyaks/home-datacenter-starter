@@ -2,10 +2,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # TrueWealth on dc1-x86 — deployed from VERIFIED images, never built here.
 #
-# The images were built once and tested natively on the CI runner, published
-# behind a separate gate, and verified on the admin plane by
-# scripts/release/fetch-verify.mjs (TrueWealth repository), which wrote a
-# transfer directory: <role>.tar archives and transfer.json. This role copies
+# The images were built once and tested natively on the CI runner (release.yml,
+# no write credential), exported as that run's artifact, and verified on the
+# admin plane by scripts/release/fetch-verify.mjs (TrueWealth repository)
+# against the GitHub API and GitHub's artifact digest; it wrote a transfer
+# directory: <role>.tar archives, evidence.json and transfer.json (schema 2). This role copies
 # those archives to the host, checks their SHA-256 again, loads them, and
 # refuses any image whose loaded identity is not the one recorded. The host
 # never pulls TrueWealth images and never holds a registry credential.
