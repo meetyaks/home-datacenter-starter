@@ -1,0 +1,104 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# TrueWealth deployment, in order. Each phase is safe to re-run.
+#
+#   controller   the transfer bundle is for THIS commit, complete, and every
+#                archive hashes to its record; the compose file comes from
+#                the same commit (all on the admin plane, no host access)
+#   preflight    the host can take it: ingress role applied, x86-64, /srv/data
+#                mounted, Docker/Compose present, the loopback port free, the
+#                runtime GID ours
+#   directories, secrets
+#   images       copy, re-hash, load, and accept ONLY the recorded identities
+#   compose      render and validate the whole configuration BEFORE starting
+#                anything; refuse LAN-published ports, builds, the Docker socket
+#   migrate      the explicit one-shot step; a failure stops the deployment
+#   deploy       up --wait --pull never; the running images must be the loaded
+#                ones
+#   caddy        one drop-in; whole-config validation before reload; the route
+#                must be LOADED
+#   verify       readiness on loopback, trusted HTTPS through the ingress,
+#                running commit identity
+#   backup       the DR backup timer and scripts
+#
+# Mutating phases are skipped under --check, and the plan says what a real
+# run would do and which checks need the live host.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: The commit to deploy must be a full SHA
+  ansible.builtin.assert:
+    that:
+      - truewealth_commit is match('^[0-9a-f]{40}$')
+    fail_msg: >-
+      Pass -e truewealth_commit=<full 40-character commit>. It is the approved
+      commit the images were validated for; there is no default.
+    quiet: true
+
+- name: Every required secret must come from the vault
+  ansible.builtin.assert:
+    that:
+      - lookup('vars', item, default='') | string | length >= 24
+    fail_msg: >-
+      {{ item }} is missing or shorter than 24 characters. Add it to
+      inventory/group_vars/linux_servers/vault.yml (see vault.yml.example).
+    quiet: true
+  loop: "{{ truewealth_required_vault_vars }}"
+  no_log: true
+
+- name: The Redis password must fit the Redis wrapper's character set
+  ansible.builtin.assert:
+    that:
+      - truewealth_vault_redis_password is match('^[A-Za-z0-9._~+/=-]+$')
+    fail_msg: truewealth_vault_redis_password may only contain A-Z a-z 0-9 . _ ~ + / = -
+    quiet: true
+  no_log: true
+
+- name: Controller — verify the transfer bundle and read the compose file
+  ansible.builtin.include_tasks: controller.yml
+
+- name: Preflight — the host can take this deployment
+  ansible.builtin.include_tasks: preflight.yml
+
+- name: Runtime group for the secret files
+  ansible.builtin.include_tasks: runtime-group.yml
+
+- name: Directories
+  ansible.builtin.include_tasks: directories.yml
+
+- name: Secrets
+  ansible.builtin.include_tasks: secrets.yml
+
+- name: Images — load and accept only the recorded identities
+  ansible.builtin.include_tasks: images.yml
+  when: not ansible_check_mode
+
+- name: Compose — render and validate before anything starts
+  ansible.builtin.include_tasks: compose.yml
+
+- name: Migrations — the explicit one-shot step
+  ansible.builtin.include_tasks: migrate.yml
+  when: not ansible_check_mode
+
+- name: Start the stack and prove it runs the loaded images
+  ansible.builtin.include_tasks: deploy.yml
+  when: not ansible_check_mode
+
+- name: Ingress — one Caddy drop-in
+  ansible.builtin.include_tasks: caddy.yml
+
+- name: Verify through the ingress
+  ansible.builtin.include_tasks: verify.yml
+  when: not ansible_check_mode
+
+- name: Disaster-recovery backups
+  ansible.builtin.include_tasks: backup.yml
+  when: truewealth_backup_enabled | bool
+
+- name: What this check run could not prove
+  ansible.builtin.debug:
+    msg:
+      - "CHECK MODE: controller-side verification of the transfer bundle and compose file ran for real."
+      - "Not run (they need the live host and change it): image load and identity, migrations,"
+      - "  `up --wait`, the running-image identity check, the Caddy reload, readiness and HTTPS"
+      - "  through https://{{ truewealth_hostname }}, and the backup timer's first run."
+  when: ansible_check_mode

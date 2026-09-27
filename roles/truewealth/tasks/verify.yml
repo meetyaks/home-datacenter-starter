@@ -1,0 +1,79 @@
+---
+# Proof, from the host, that the deployment is what was approved and serves.
+
+- name: Readiness on the loopback port (database, migrations, Redis)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ truewealth_web_loopback_port }}/api/readyz"
+    return_content: true
+    status_code: [200]
+  register: truewealth_ready
+  retries: "{{ truewealth_health_retries }}"
+  delay: "{{ truewealth_health_delay_seconds }}"
+  until: truewealth_ready.status | default(0) == 200
+  changed_when: false
+
+- name: Readiness must report every check ok
+  ansible.builtin.assert:
+    that:
+      - truewealth_ready.json.status == 'ready'
+      - (truewealth_ready.json.checks | dict2items | rejectattr('value', 'equalto', 'ok') | list | length) == 0
+    fail_msg: "readyz: {{ truewealth_ready.json | default({}) }}"
+    quiet: true
+
+- name: The web port is bound to loopback only
+  ansible.builtin.shell:
+    cmd: ss -ltnH "sport = :{{ truewealth_web_loopback_port }}"
+  register: truewealth_ss
+  changed_when: false
+
+- name: No non-loopback listener on the web port
+  ansible.builtin.assert:
+    that:
+      - truewealth_ss.stdout_lines | length > 0
+      - truewealth_ss.stdout_lines | reject('search', '127\.0\.0\.1:' ~ truewealth_web_loopback_port) | list | length == 0
+    fail_msg: "The web port is exposed beyond loopback: {{ truewealth_ss.stdout }}"
+    quiet: true
+
+- name: The name resolves on this host
+  ansible.builtin.command:
+    argv: [getent, hosts, "{{ truewealth_hostname }}"]
+  register: truewealth_dns
+  changed_when: false
+  failed_when: false
+
+- name: Report a name-resolution gap distinctly
+  ansible.builtin.assert:
+    that:
+      - truewealth_dns.rc == 0
+    fail_msg: >-
+      INGRESS (DNS): {{ truewealth_hostname }} does not resolve from
+      {{ inventory_hostname }}. The stack is healthy on loopback; add the
+      record to the dc1.lan zone (not /etc/hosts).
+    quiet: true
+
+- name: HTTPS through the ingress, with a TRUSTED certificate
+  # validate_certs stays on: the internal CA was installed into the system
+  # store by roles/caddy. A certificate error is a failure, not a warning.
+  ansible.builtin.uri:
+    url: "https://{{ truewealth_hostname }}/api/healthz"
+    return_content: true
+    status_code: [200]
+  register: truewealth_https
+  retries: "{{ truewealth_health_retries }}"
+  delay: "{{ truewealth_health_delay_seconds }}"
+  until: truewealth_https.status | default(0) == 200
+  changed_when: false
+
+- name: The running web container is this commit
+  ansible.builtin.command:
+    argv: [docker, inspect, --format, "{{ '{{' }}index .Config.Labels \"org.opencontainers.image.revision\"{{ '}}' }}", "{{ truewealth_project }}-web-1"]
+  register: truewealth_running_rev
+  changed_when: false
+
+- name: Deployed identity
+  ansible.builtin.assert:
+    that:
+      - truewealth_running_rev.stdout | trim == truewealth_commit
+    fail_msg: "web runs revision {{ truewealth_running_rev.stdout }}, not {{ truewealth_commit }}."
+    success_msg: "https://{{ truewealth_hostname }} serves {{ truewealth_commit }} (trusted TLS, ready)."
+    quiet: true

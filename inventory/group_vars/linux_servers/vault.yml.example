@@ -56,3 +56,25 @@ keel_vault_jwt_public_key: |
 # variable exists to prevent. The role refuses all-zero and sentinel UUIDs
 # before anything is written or started.
 keel_vault_default_tenant_id: ""
+
+# ── TrueWealth (roles/truewealth) ───────────────────────────────────────────
+# Separate from Keel's: no value is shared between the two applications.
+# Generate each on the operator's machine, e.g.  openssl rand -hex 32
+# (hex keeps every value inside the character sets the stack accepts; the
+# Redis password must match [A-Za-z0-9._~+/=-]).
+#
+# TW_KEY_SECRET encrypts provider credentials and MFA secrets at rest. A
+# restored database is unreadable without the SAME value: back this vault up
+# separately from the database backups. Backup manifests record only its
+# fingerprint (sha256('tw-key:'+value)[0:16]), never the value.
+truewealth_vault_db_password: ""
+truewealth_vault_key_secret: ""
+truewealth_vault_compute_token: ""
+truewealth_vault_redis_password: ""
+# Optional (empty = feature off):
+# truewealth_vault_smtp_host: ""
+# truewealth_vault_smtp_port: ""
+# truewealth_vault_smtp_user: ""
+# truewealth_vault_smtp_pass: ""
+# truewealth_vault_smtp_from: ""
+# truewealth_vault_audit_signing_secret: ""

@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+#
+# TrueWealth — https://{{ truewealth_hostname }} → 127.0.0.1:{{ truewealth_web_loopback_port }}.
+# The ONLY TrueWealth file in Caddy's configuration; roles/caddy owns the
+# main Caddyfile, the internal CA and the reload.
+#
+# CLIENT IP: reverse_proxy with no trusted_proxies REPLACES any client
+# X-Forwarded-For with the peer address, and the app (TW_TRUSTED_PROXY_HOPS=1)
+# reads only that last entry. Do not add `trusted_proxies`, `header_up
+# X-Forwarded-For` or `X-Real-IP` here: each would let a client choose the
+# address the app rate-limits and audits.
+{{ truewealth_hostname }} {
+	encode zstd gzip
+	tls internal
+	reverse_proxy 127.0.0.1:{{ truewealth_web_loopback_port }}
+	log {
+		output file {{ truewealth_caddy_log_dir }}/{{ truewealth_hostname }}.log
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				resp_headers>Set-Cookie delete
+			}
+		}
+	}
+}

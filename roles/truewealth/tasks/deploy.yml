@@ -1,0 +1,92 @@
+---
+# Start (or converge) the stack from the loaded images only, wait for real
+# health, and prove the running containers are the verified images.
+#
+# ⚠️ NO `compose down`, EVER, IN A ROUTINE DEPLOY. `up` recreates only what
+# changed; data volumes are bind mounts that `down` would not remove anyway,
+# but a `down` would take production offline for nothing.
+
+- name: Remember the images that were running, for a code-only rollback
+  ansible.builtin.command:
+    argv: [docker, ps, --filter, "label=com.docker.compose.project={{ truewealth_project }}", --format, "{{ '{{' }}.Label \"com.docker.compose.service\"{{ '}}' }}={{ '{{' }}.Image{{ '}}' }}"]
+  register: truewealth_previous
+  changed_when: false
+
+- name: Record them (only when something was running)
+  ansible.builtin.copy:
+    dest: "{{ truewealth_rollback_file }}"
+    content: "{{ {'recordedAt': now(utc=true).isoformat(), 'images': dict(truewealth_previous.stdout_lines | map('split', '=', 1))} | to_nice_json }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  when: truewealth_previous.stdout_lines | length > 0
+
+- name: Start the stack and wait for every health check
+  ansible.builtin.command:
+    argv: >-
+      {{ (truewealth_compose_cmd | split) + ['up', '-d', '--pull', 'never', '--remove-orphans',
+         '--wait', '--wait-timeout', truewealth_wait_timeout_seconds | string] }}
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_up
+  changed_when: truewealth_up.stderr is search('(Recreated|Created|Started)')
+  failed_when: false
+
+- name: When the stack did not become healthy, collect evidence and stop
+  when: truewealth_up.rc != 0
+  block:
+    - name: Container states
+      ansible.builtin.command:
+        argv: "{{ (truewealth_compose_cmd | split) + ['ps', '-a'] }}"
+        chdir: "{{ truewealth_root }}"
+      register: truewealth_ps
+      changed_when: false
+    - name: Recent logs (application logs carry no secrets by design)
+      ansible.builtin.command:
+        argv: "{{ (truewealth_compose_cmd | split) + ['logs', '--no-color', '--tail', '80', 'web', 'worker', 'compute'] }}"
+        chdir: "{{ truewealth_root }}"
+      register: truewealth_logs
+      changed_when: false
+    - name: Stop
+      ansible.builtin.fail:
+        msg:
+          - "The stack did not become healthy within {{ truewealth_wait_timeout_seconds }}s."
+          - "{{ truewealth_ps.stdout_lines }}"
+          - "{{ truewealth_logs.stdout_lines[-80:] }}"
+
+- name: Read the image each running service uses
+  ansible.builtin.command:
+    argv: [docker, inspect, --format, "{{ '{{' }}.Image{{ '}}' }}", "{{ truewealth_project }}-{{ item.svc }}-1"]
+  register: truewealth_running_images
+  loop:
+    - { svc: web, role: web }
+    - { svc: worker, role: worker }
+    - { svc: compute, role: compute }
+  loop_control:
+    label: "{{ item.svc }}"
+  changed_when: false
+
+- name: Every running container must be the verified, loaded image
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim == truewealth_loaded_ids[item.item.role]
+    fail_msg: >-
+      {{ item.item.svc }} runs {{ item.stdout | trim }}, not the loaded
+      {{ truewealth_loaded_ids[item.item.role] }}.
+    quiet: true
+  loop: "{{ truewealth_running_images.results }}"
+  loop_control:
+    label: "{{ item.item.svc }}"
+
+- name: Record what is deployed
+  ansible.builtin.copy:
+    dest: "{{ truewealth_deployment_manifest }}"
+    content: >-
+      {{ {'schema': truewealth_role_contract, 'commit': truewealth_commit,
+          'deployedAt': now(utc=true).isoformat(),
+          'runId': truewealth_transfer.runId, 'runAttempt': truewealth_transfer.runAttempt,
+          'workflowSha': truewealth_transfer.workflowSha,
+          'images': truewealth_transfer.images,
+          'loadedIds': truewealth_loaded_ids} | to_nice_json }}
+    owner: root
+    group: root
+    mode: "0644"

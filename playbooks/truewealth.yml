@@ -1,0 +1,48 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# TrueWealth on dc1-x86 — https://tw.dc1.lan. Run from the admin plane
+# (dc1-arm-1), which holds the vault and the verified transfer bundle.
+#
+#   check    ansible-playbook playbooks/truewealth.yml --check --diff --ask-become-pass \
+#              -e truewealth_commit=<sha> -e truewealth_transfer_dir=<dir>
+#   deploy   ansible-playbook playbooks/truewealth.yml --ask-become-pass \
+#              -e truewealth_commit=<sha> -e truewealth_transfer_dir=<dir>
+#   backup   ansible-playbook playbooks/truewealth.yml --tags backup-now ...
+#
+# <dir> is the output of scripts/release/fetch-verify.mjs (TrueWealth
+# repository) for the approved commit and CI run.
+#
+# ⚠️ NOT in site.yml, and never runs host bootstrap roles (docker, common,
+# storage): a TrueWealth deploy must not restart Docker or change Keel. The
+# only shared role it runs is roles/caddy, whose ingress contract it uses —
+# the same as playbooks/keel.yml — and whose reload validates the whole
+# configuration first.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Deploy TrueWealth
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+  vars:
+    ansible_remote_tmp: /tmp/ansible-truewealth
+  tasks:
+    - name: The host's reverse proxy (canonical ingress contract)
+      ansible.builtin.include_role:
+        name: caddy
+        apply:
+          tags: [deploy]
+      tags: [deploy]
+
+    - name: TrueWealth
+      ansible.builtin.include_role:
+        name: truewealth
+        apply:
+          tags: [deploy]
+      tags: [deploy]
+
+    - name: Take a backup now
+      ansible.builtin.command:
+        argv: [systemctl, start, truewealth-backup.service]
+      changed_when: true
+      when: not ansible_check_mode
+      tags: [backup-now, never]

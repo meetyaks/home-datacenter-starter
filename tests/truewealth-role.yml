@@ -1,0 +1,183 @@
+---
+# roles/truewealth, exercised on the controller with fixtures (no host):
+#
+#   1. every template renders (shell templates pass bash -n) into render_dir,
+#      plus the main Caddyfile and Keel's drop-in, so the composed Caddy
+#      configuration can be validated by a real caddy binary
+#   2. tasks/controller.yml, the REAL task file, accepts a correct transfer
+#      bundle and refuses: another commit, a tampered archive, a missing role,
+#      a foreign platform, a malformed tag, a compose file with a build
+#   3. tasks/compose.yml, the REAL task file, renders the real TrueWealth
+#      compose file with docker compose and accepts it — and refuses a
+#      variant that publishes on the LAN
+#
+# Extra vars (tests/run-truewealth-role.sh provides them):
+#   render_dir, fixture_transfer_dir, fixture_repo, fixture_commit,
+#   fixture_bad_commit (a commit whose compose file has a `build:`),
+#   work_dir (scratch for the compose test), compose_lan_file
+
+- name: Render the TrueWealth templates
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    truewealth_commit: "{{ fixture_commit }}"
+    truewealth_vault_db_password: synthetic-db-password-000000000000
+    truewealth_vault_key_secret: synthetic-key-secret-00000000000000000
+    truewealth_vault_compute_token: synthetic-compute-token-000000000000
+    truewealth_vault_redis_password: syntheticRedisPassword000000000000
+  tasks:
+    - name: Load the role's defaults
+      ansible.builtin.include_vars:
+        file: ../roles/truewealth/defaults/main.yml
+    - name: Load the transfer fixture as the controller phase would
+      ansible.builtin.set_fact:
+        truewealth_images: "{{ dict(t.images | map(attribute='role') | zip(t.images)) }}"
+      vars:
+        t: "{{ lookup('file', fixture_transfer_dir ~ '/transfer.json') | from_json }}"
+    - name: Render the role's templates
+      ansible.builtin.template:
+        src: "../roles/truewealth/templates/{{ item.src }}"
+        dest: "{{ render_dir }}/{{ item.dest }}"
+        mode: "0600"
+      loop:
+        - { src: truewealth.env.j2, dest: truewealth.env }
+        - { src: truewealth.caddy.j2, dest: truewealth.caddy }
+        - { src: truewealth-backup.sh.j2, dest: truewealth-backup.sh }
+        - { src: truewealth-restore-verify.sh.j2, dest: truewealth-restore-verify.sh }
+      loop_control:
+        label: "{{ item.dest }}"
+    - name: Shell templates are valid bash
+      ansible.builtin.command:
+        argv: [bash, -n, "{{ render_dir }}/{{ item }}"]
+      loop: [truewealth-backup.sh, truewealth-restore-verify.sh]
+      changed_when: false
+
+- name: Render the canonical Caddyfile and Keel's drop-in beside ours
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Load caddy and keel defaults
+      ansible.builtin.include_vars:
+        file: "../roles/{{ item }}/defaults/main.yml"
+      loop: [caddy, keel]
+    - name: Composed configuration directory
+      ansible.builtin.file:
+        path: "{{ render_dir }}/caddy/conf.d"
+        state: directory
+        mode: "0755"
+    - name: Main Caddyfile (roles/caddy)
+      ansible.builtin.template:
+        src: ../roles/caddy/templates/Caddyfile.j2
+        dest: "{{ render_dir }}/caddy/Caddyfile"
+        mode: "0644"
+      vars:
+        caddy_conf_d: /etc/caddy/conf.d
+    - name: Keel's drop-in
+      ansible.builtin.template:
+        src: ../roles/keel/templates/keel.caddy.j2
+        dest: "{{ render_dir }}/caddy/conf.d/keel.caddy"
+        mode: "0644"
+    - name: TrueWealth's drop-in
+      ansible.builtin.copy:
+        src: "{{ render_dir }}/truewealth.caddy"
+        dest: "{{ render_dir }}/caddy/conf.d/truewealth.caddy"
+        mode: "0644"
+
+- name: Controller verification — the real task file
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    base:
+      truewealth_commit: "{{ fixture_commit }}"
+      truewealth_transfer_dir: "{{ fixture_transfer_dir }}"
+      truewealth_source_repo: "{{ fixture_repo }}"
+  tasks:
+    - name: A correct bundle is accepted
+      ansible.builtin.include_role:
+        name: truewealth
+        tasks_from: controller
+      vars:
+        truewealth_commit: "{{ base.truewealth_commit }}"
+        truewealth_transfer_dir: "{{ base.truewealth_transfer_dir }}"
+        truewealth_source_repo: "{{ base.truewealth_source_repo }}"
+
+    - name: It produced the image index
+      ansible.builtin.assert:
+        that:
+          - truewealth_images | length == 4
+          - truewealth_images.web.localTag is match('^truewealth/web:')
+        quiet: true
+
+    - name: Negative cases
+      ansible.builtin.include_tasks: truewealth-controller-negative.yml
+      loop:
+        - { name: another commit, commit: "{{ 'f' * 40 }}", dir: "{{ fixture_transfer_dir }}" }
+        - { name: tampered archive, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-tampered" }
+        - { name: missing role, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-missing-role" }
+        - { name: foreign platform, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-arm64" }
+        - { name: malformed tag, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-badtag" }
+        - { name: compose with a build, commit: "{{ fixture_bad_commit }}", dir: "{{ fixture_transfer_dir }}-badcommit" }
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+- name: Compose validation — the real task file, the real compose file
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    truewealth_vault_redis_password: syntheticRedisPassword000000000000
+  tasks:
+    - name: A local copy of the rendered env, pointing at the local password file
+      ansible.builtin.copy:
+        src: "{{ render_dir }}/truewealth.env"
+        dest: "{{ render_dir }}/truewealth.env.local"
+        mode: "0600"
+    - name: Point it at the fixture password file
+      ansible.builtin.lineinfile:
+        path: "{{ render_dir }}/truewealth.env.local"
+        regexp: '^TW_REDIS_PASSWORD_FILE='
+        line: "TW_REDIS_PASSWORD_FILE={{ work_dir }}/redis_password"
+
+    - name: Accepts the TrueWealth dc1 compose file
+      ansible.builtin.include_role:
+        name: truewealth
+        tasks_from: compose
+      vars:
+        truewealth_root: "{{ work_dir }}/ok"
+        truewealth_owner: "{{ lookup('env', 'USER') }}"
+        truewealth_group: "{{ omit }}"
+        truewealth_env_file: "{{ render_dir }}/truewealth.env.local"
+        truewealth_redis_password_file: "{{ work_dir }}/redis_password"
+        truewealth_compose_source: { stdout: "{{ lookup('file', fixture_compose_file) }}" }
+
+    - name: Refuses a variant that publishes on the LAN
+      block:
+        - name: Run it against the LAN-publishing variant
+          ansible.builtin.include_role:
+            name: truewealth
+            tasks_from: compose
+          vars:
+            truewealth_root: "{{ work_dir }}/lan"
+            truewealth_owner: "{{ lookup('env', 'USER') }}"
+            truewealth_group: "{{ omit }}"
+            truewealth_env_file: "{{ render_dir }}/truewealth.env.local"
+            truewealth_redis_password_file: "{{ work_dir }}/redis_password"
+            truewealth_compose_source: { stdout: "{{ lookup('file', compose_lan_file) }}" }
+        - name: It should not get here
+          ansible.builtin.fail:
+            msg: "MISSED: a LAN-published web port was accepted"
+      rescue:
+        - name: Refused as expected
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_result.msg is search('not the expected runtime shape')
+            fail_msg: "Refused, but for the wrong reason: {{ ansible_failed_result.msg }}"
+            quiet: true

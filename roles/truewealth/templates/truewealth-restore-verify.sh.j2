@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+#
+# Restore a TrueWealth backup into an ISOLATED, disposable PostgreSQL and
+# verify it — without touching production.
+#
+#   truewealth-restore-verify <backup dir>
+#
+# - The dump must hash to the manifest's digest.
+# - It is restored into a throwaway container (no network, same PostgreSQL
+#   image as production, a random one-time password, labelled and removed on
+#   exit — success, failure or interrupt).
+# - Checks: migration count and representative counts equal the manifest;
+#   no orphaned rows along the financial relationships (members, accounts,
+#   balances, assets, valuations, positions, snapshots); sign-in material is
+#   present (scrypt password hashes).
+# Exit 0 only when every check passes. Nothing here restores over live data:
+# a production restore is a separate, approved procedure (docs/truewealth.md).
+set -euo pipefail
+umask 077
+
+DIR="${1:?usage: truewealth-restore-verify <backup directory>}"
+MANIFEST="$DIR/manifest.json"
+DUMP="$DIR/db.dump"
+PG_CONTAINER="${TW_RESTORE_SOURCE_CONTAINER:-{{ truewealth_project }}-postgres-1}"
+[ -r "$MANIFEST" ] && [ -r "$DUMP" ] || { echo "restore-verify: $DIR has no manifest.json/db.dump" >&2; exit 2; }
+
+jget() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1]));
+for k in sys.argv[2].split("."): d=d[k]
+print(d)' "$MANIFEST" "$1"; }
+
+want_sha="$(jget database.sha256)"
+have_sha="$(sha256sum "$DUMP" | cut -d' ' -f1)"
+[ "$want_sha" = "$have_sha" ] || { echo "restore-verify: FAIL dump sha256 $have_sha != manifest $want_sha" >&2; exit 1; }
+echo "restore-verify: dump digest matches the manifest"
+
+image="${TW_RESTORE_IMAGE:-$(docker inspect --format '{{ '{{' }}.Config.Image{{ '}}' }}' "$PG_CONTAINER")}"
+name="twrestore-verify-$(date +%s)-$$"
+pw="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+cleanup() { docker rm -f -v "$name" >/dev/null 2>&1 || true; }
+trap cleanup EXIT INT TERM
+
+docker run -d --name "$name" --label io.truewealth.task=restore-verify --network none \
+  -e POSTGRES_USER=truewealth -e POSTGRES_DB=truewealth -e POSTGRES_PASSWORD="$pw" "$image" >/dev/null
+unset pw
+for _ in $(seq 1 60); do
+  docker exec "$name" pg_isready -U truewealth -d truewealth >/dev/null 2>&1 && break
+  sleep 1
+done
+docker exec "$name" pg_isready -U truewealth -d truewealth >/dev/null
+
+docker exec -i "$name" pg_restore -U truewealth -d truewealth --no-owner --no-privileges --exit-on-error < "$DUMP"
+echo "restore-verify: restored into isolated container $name ($image)"
+
+q() { docker exec "$name" psql -U truewealth -d truewealth -AtX -v ON_ERROR_STOP=1 -c "$1"; }
+fail=0
+check() { # label expected actual
+  if [ "$2" = "$3" ]; then echo "  ok    $1 ($3)"; else echo "  FAIL  $1: expected $2, got $3"; fail=1; fi
+}
+
+check "applied migrations" "$(jget schemaState.appliedMigrations)" "$(q 'SELECT count(*) FROM public._tw_migrations')"
+check "users"              "$(jget counts.users)"                  "$(q 'SELECT count(*) FROM core.users')"
+check "households"         "$(jget counts.households)"             "$(q 'SELECT count(*) FROM core.households')"
+
+orphans() { check "no orphaned $1" 0 "$(q "$2")"; }
+orphans "household members"  "SELECT count(*) FROM core.household_members m LEFT JOIN core.users u ON u.id=m.user_id LEFT JOIN core.households h ON h.id=m.household_id WHERE u.id IS NULL OR h.id IS NULL"
+orphans "accounts"           "SELECT count(*) FROM wealth.accounts a LEFT JOIN core.households h ON h.id=a.household_id WHERE h.id IS NULL"
+orphans "account balances"   "SELECT count(*) FROM wealth.account_balances b LEFT JOIN wealth.accounts a ON a.id=b.account_id WHERE a.id IS NULL"
+orphans "assets"             "SELECT count(*) FROM wealth.assets a LEFT JOIN core.households h ON h.id=a.household_id WHERE h.id IS NULL"
+orphans "asset valuations"   "SELECT count(*) FROM wealth.asset_valuations v LEFT JOIN wealth.assets a ON a.id=v.asset_id WHERE a.id IS NULL"
+orphans "positions"          "SELECT count(*) FROM wealth.positions p LEFT JOIN wealth.accounts a ON a.id=p.account_id LEFT JOIN wealth.securities s ON s.id=p.security_id WHERE a.id IS NULL OR s.id IS NULL"
+orphans "snapshot items"     "SELECT count(*) FROM wealth.snapshot_items i LEFT JOIN wealth.snapshots s ON s.id=i.snapshot_id WHERE s.id IS NULL"
+
+users_total="$(q 'SELECT count(*) FROM core.users')"
+with_hash="$(q "SELECT count(*) FROM core.users WHERE password_hash LIKE 'scrypt\$%'")"
+if [ "$users_total" -gt 0 ] && [ "$with_hash" -gt 0 ]; then
+  echo "  ok    sign-in material present ($with_hash of $users_total users have scrypt password hashes)"
+else
+  echo "  FAIL  no user can sign in (password hashes: $with_hash of $users_total)"; fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then echo "restore-verify: FAILED" >&2; exit 1; fi
+echo "restore-verify: PASSED — $DIR restores cleanly and is internally consistent"

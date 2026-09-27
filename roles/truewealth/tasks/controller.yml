@@ -1,0 +1,116 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# ON THE CONTROLLER (the admin plane). Nothing here touches the host.
+#
+# fetch-verify.mjs already verified the images against the CI evidence and
+# the registry by digest; this re-checks that the bundle about to be copied is
+# the one for THIS commit and has not changed since, and reads the compose
+# file from the same commit. Runs for real in check mode (observe-only).
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Read the transfer manifest
+  ansible.builtin.slurp:
+    src: "{{ truewealth_transfer_dir }}/transfer.json"
+  register: truewealth_transfer_raw
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+  check_mode: false
+
+- name: Parse it
+  ansible.builtin.set_fact:
+    truewealth_transfer: "{{ truewealth_transfer_raw.content | b64decode | from_json }}"
+
+- name: The bundle must be for exactly this commit, platform and set of roles
+  ansible.builtin.assert:
+    that:
+      - truewealth_transfer.schema == 'truewealth-transfer/1'
+      - truewealth_transfer.commit == truewealth_commit
+      - truewealth_transfer.platform == truewealth_platform
+      - (truewealth_transfer.images | map(attribute='role') | sort) == (truewealth_image_roles | sort)
+      - (truewealth_transfer.images | map(attribute='role') | unique | length) == (truewealth_image_roles | length)
+    fail_msg: >-
+      The transfer bundle in {{ truewealth_transfer_dir }} is not for commit
+      {{ truewealth_commit }} on {{ truewealth_platform }} with exactly the roles
+      {{ truewealth_image_roles }} (it records commit
+      {{ truewealth_transfer.commit | default('?') }}, platform
+      {{ truewealth_transfer.platform | default('?') }}, roles
+      {{ truewealth_transfer.images | default([]) | map(attribute='role') | list }}).
+      Run fetch-verify.mjs for the approved commit and run.
+    quiet: true
+
+- name: Every image record must carry exact identities
+  ansible.builtin.assert:
+    that:
+      - item.archiveSha256 is match('^sha256:[0-9a-f]{64}$')
+      - item.configDigest is match('^sha256:[0-9a-f]{64}$')
+      - item.manifestDigest is match('^sha256:[0-9a-f]{64}$')
+      - item.localTag is match('^truewealth/' ~ item.role ~ ':[0-9a-f]{12}-[0-9a-f]{12}$')
+      - item.localTag.split(':')[1].split('-')[0] == truewealth_commit[:12]
+      - item.acceptLoadedIds | length > 0
+      - (item.acceptLoadedIds | reject('match', '^sha256:[0-9a-f]{64}$') | list | length) == 0
+      - item.archive == item.role ~ '.tar'
+    fail_msg: "Malformed image record in transfer.json: {{ item.role | default('?') }}"
+    quiet: true
+  loop: "{{ truewealth_transfer.images }}"
+  loop_control:
+    label: "{{ item.role }}"
+
+- name: Hash every archive on the controller
+  ansible.builtin.stat:
+    path: "{{ truewealth_transfer_dir }}/{{ item.archive }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: truewealth_archive_stat
+  loop: "{{ truewealth_transfer.images }}"
+  loop_control:
+    label: "{{ item.role }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+  check_mode: false
+
+- name: Every archive must still be the verified one
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | default(false)
+      - ('sha256:' ~ item.stat.checksum | default('')) == item.item.archiveSha256
+    fail_msg: >-
+      {{ item.item.archive }} does not hash to the {{ item.item.archiveSha256 }}
+      fetch-verify recorded. The bundle changed after verification; fetch and
+      verify it again.
+    quiet: true
+  loop: "{{ truewealth_archive_stat.results }}"
+  loop_control:
+    label: "{{ item.item.role }}"
+
+- name: Read the compose file from the approved commit
+  # `git show <sha>:<path>`: exactly the committed file, never a working tree.
+  ansible.builtin.command:
+    argv: [git, -C, "{{ truewealth_source_repo }}", show, "{{ truewealth_commit }}:{{ truewealth_compose_path_in_repo }}"]
+  register: truewealth_compose_source
+  changed_when: false
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+  check_mode: false
+
+- name: The compose file must be the dc1 runtime definition
+  ansible.builtin.assert:
+    that:
+      - "'name: truewealth' in truewealth_compose_source.stdout"
+      - "'127.0.0.1:${TW_WEB_PORT' in truewealth_compose_source.stdout"
+      - truewealth_compose_source.stdout is not search('(?m)^\s+build:')
+      - truewealth_compose_source.stdout is not search('docker\.sock')
+    fail_msg: >-
+      {{ truewealth_compose_path_in_repo }} at {{ truewealth_commit }} is not the
+      dc1 runtime definition this role deploys (project name, loopback web port,
+      no builds, no Docker socket).
+    quiet: true
+
+- name: Index the image records by role
+  ansible.builtin.set_fact:
+    truewealth_images: "{{ dict(truewealth_transfer.images | map(attribute='role') | zip(truewealth_transfer.images)) }}"

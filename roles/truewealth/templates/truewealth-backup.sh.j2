@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+#
+# TrueWealth disaster-recovery backup. Runs as root from
+# truewealth-backup.timer; exits non-zero on ANY failure (the unit then shows
+# failed, and the partial directory is removed) — a backup that did not
+# happen must never look like one that did.
+#
+#   <backups>/<stamp>/db.dump          pg_dump -Fc, ONE transaction (consistent)
+#   <backups>/<stamp>/manifest.json    secret-free: commit, images, schema,
+#                                      sizes, digests, key fingerprints, policy
+#   <backups>/<stamp>/db.dump.age      only when age recipients are configured
+#                                      (what goes off-host; plaintext never does)
+#
+# PostgreSQL is the only authoritative store. Redis is NOT backed up (queues
+# and schedules; see the redis policy in the manifest).
+set -euo pipefail
+umask 077
+
+ROOT='{{ truewealth_root }}'
+BACKUPS='{{ truewealth_backup_dir }}'
+KEEP='{{ truewealth_backup_keep }}'
+ENV_FILE='{{ truewealth_env_file }}'
+DEPLOYMENT='{{ truewealth_deployment_manifest }}'
+# The same invocation the role uses (truewealth_compose_cmd); paths contain no spaces.
+COMPOSE=({{ truewealth_compose_cmd }})
+AGE_RECIPIENTS=({% for r in truewealth_backup_age_recipients %}'{{ r }}' {% endfor %})
+OFFHOST='{{ truewealth_backup_offhost_target }}'
+OFFHOST_KEY='{{ truewealth_backup_offhost_ssh_key }}'
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+work="$BACKUPS/.${stamp}.partial"
+final="$BACKUPS/$stamp"
+cleanup() { rm -rf "$work"; }
+trap cleanup EXIT
+mkdir -p "$work"
+cd "$ROOT"
+
+# 1. A consistent dump. pg_dump runs in ONE repeatable-read transaction, so
+#    every table is from the same instant; -Fc is compressed and restorable
+#    table by table. Credentials come from the container's own environment.
+"${COMPOSE[@]}" exec -T postgres sh -ec 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc --no-owner --no-privileges' > "$work/db.dump"
+[ -s "$work/db.dump" ] || { echo "backup: pg_dump produced nothing" >&2; exit 1; }
+
+# 2. The dump must parse as an archive (catches truncation).
+"${COMPOSE[@]}" exec -T postgres pg_restore --list < "$work/db.dump" > "$work/.toc"
+entries="$(grep -cvE '^\s*(;|$)' "$work/.toc" || true)"
+rm -f "$work/.toc"
+[ "${entries:-0}" -gt 0 ] || { echo "backup: the dump has no restorable entries" >&2; exit 1; }
+
+# 3. Schema state and representative counts, for the manifest.
+q() { "${COMPOSE[@]}" exec -T postgres sh -ec "psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -AtX -c \"$1\""; }
+migrations="$(q 'SELECT count(*) FROM public._tw_migrations')"
+last_migration="$(q 'SELECT max(name) FROM public._tw_migrations')"
+users="$(q 'SELECT count(*) FROM core.users')"
+households="$(q 'SELECT count(*) FROM core.households')"
+pg_version="$(q 'SHOW server_version')"
+
+# 4. Key references WITHOUT the keys: a fingerprint lets a restore confirm it
+#    holds the right secret (from the vault) before decrypting anything.
+fp() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+key_secret="$(sed -n 's/^TW_KEY_SECRET=//p' "$ENV_FILE")"
+[ -n "$key_secret" ] || { echo "backup: TW_KEY_SECRET is not in $ENV_FILE" >&2; exit 1; }
+key_fp="$(fp "tw-key:$key_secret")"
+unset key_secret
+
+dump_sha="$(sha256sum "$work/db.dump" | cut -d' ' -f1)"
+dump_size="$(wc -c < "$work/db.dump" | tr -d " ")"
+deployment='null'
+[ -r "$DEPLOYMENT" ] && deployment="$(cat "$DEPLOYMENT")"
+
+cat > "$work/manifest.json" <<JSON
+{
+  "schema": "truewealth-backup/1",
+  "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "host": "$(hostname -s)",
+  "database": {
+    "file": "db.dump",
+    "format": "pg_dump custom (-Fc), single transaction",
+    "sha256": "$dump_sha",
+    "sizeBytes": $dump_size,
+    "restorableEntries": $entries,
+    "postgresVersion": "$pg_version"
+  },
+  "schemaState": { "appliedMigrations": $migrations, "lastMigration": "$last_migration" },
+  "counts": { "users": $users, "households": $households },
+  "deployment": $deployment,
+  "keys": {
+    "TW_KEY_SECRET": { "fingerprint": "$key_fp", "algorithm": "sha256('tw-key:'+secret)[0:16]",
+      "note": "Encrypted provider credentials and MFA secrets in this dump are unreadable without this exact secret (Ansible Vault: truewealth_vault_key_secret)." }
+  },
+  "redis": { "policy": "{{ truewealth_backup_redis_policy }}",
+    "note": "Queues and schedules only. Not restored: the worker re-registers schedules at start; replaying a stale queue onto restored rows could run jobs twice. Jobs in flight at backup time are lost." },
+  "restore": "Restore into an ISOLATED database first (truewealth-restore-verify). Never over newer production data without an approved, exact replacement target."
+}
+JSON
+
+# 5. Encrypted copy for off-host transfer (public keys only on this host).
+if [ -n "${AGE_RECIPIENTS[*]:-}" ]; then
+  args=()
+  for r in "${AGE_RECIPIENTS[@]}"; do args+=(-r "$r"); done
+  age "${args[@]}" -o "$work/db.dump.age" "$work/db.dump"
+
+fi
+
+mv "$work" "$final"
+trap - EXIT
+echo "backup: $final ($dump_size bytes, sha256 $dump_sha, $migrations migrations)"
+
+# 6. Off-host transfer: the ENCRYPTED file and the manifest only.
+if [ -n "$OFFHOST" ]; then
+  [ -f "$final/db.dump.age" ] || { echo "backup: off-host target set but no age recipients; refusing to send plaintext" >&2; exit 1; }
+  [ -r "$OFFHOST_KEY" ] || { echo "backup: off-host SSH key $OFFHOST_KEY is not readable" >&2; exit 1; }
+  rsync -a --mkpath --chmod=F600 -e "ssh -i $OFFHOST_KEY -o BatchMode=yes -o StrictHostKeyChecking=yes" \
+    "$final/db.dump.age" "$final/manifest.json" "$OFFHOST/$stamp/"
+  echo "backup: sent encrypted copy to $OFFHOST/$stamp/"
+fi
+
+# 7. Local retention: newest $KEEP complete backups.
+ls -1dt "$BACKUPS"/[0-9]*Z 2>/dev/null | tail -n +"$((KEEP + 1))" | xargs -r rm -rf

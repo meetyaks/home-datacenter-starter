@@ -1,0 +1,93 @@
+---
+# Everything that must be true of the HOST before anything is changed.
+# Observe-only (check_mode: false is used only on reads).
+
+- name: The canonical ingress role must have run in this play
+  # roles/caddy sets this fact last; the drop-in contract depends on it.
+  ansible.builtin.assert:
+    that:
+      - caddy_role_applied | default(false) | bool
+    fail_msg: >-
+      roles/caddy has not run in this play. playbooks/truewealth.yml includes it
+      first; do not run this role on its own.
+    quiet: true
+
+- name: The host must be x86-64 (the images are linux/amd64)
+  ansible.builtin.assert:
+    that:
+      - ansible_architecture == 'x86_64'
+    fail_msg: "{{ inventory_hostname }} is {{ ansible_architecture }}; the verified images are {{ truewealth_platform }}."
+    quiet: true
+
+- name: /srv/data must be its own mounted filesystem
+  ansible.builtin.assert:
+    that:
+      - ansible_mounts | selectattr('mount', 'equalto', '/srv/data') | list | length == 1
+    fail_msg: /srv/data is not a mount point; persistent data would land on the root filesystem.
+    quiet: true
+
+- name: Read the Docker and Compose versions
+  ansible.builtin.command:
+    argv: [docker, compose, version, --short]
+  register: truewealth_compose_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Docker Compose v2.24+ must be present (up --wait, --pull never)
+  ansible.builtin.assert:
+    that:
+      - truewealth_compose_version.rc == 0
+      - truewealth_compose_version.stdout | regex_replace('^v', '') is version('2.24.0', '>=')
+    fail_msg: "docker compose is missing or too old: {{ truewealth_compose_version.stdout | default('') }}"
+    quiet: true
+
+- name: Who holds the loopback web port
+  # A different listener on the port (another app, a stale container) must
+  # stop the deployment, not be silently shadowed.
+  ansible.builtin.shell:
+    cmd: >-
+      ss -ltnpH "sport = :{{ truewealth_web_loopback_port }}" 2>/dev/null
+  register: truewealth_port_holders
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Which containers of our project already run
+  ansible.builtin.command:
+    argv: [docker, ps, --filter, "label=com.docker.compose.project={{ truewealth_project }}", --format, "{{ '{{' }}.Names{{ '}}' }}"]
+  register: truewealth_running
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: The web port must be free or already ours
+  ansible.builtin.assert:
+    that:
+      - truewealth_port_holders.stdout | trim == '' or (truewealth_running.stdout | trim) != ''
+      - truewealth_port_holders.stdout is not search('0\.0\.0\.0:' ~ truewealth_web_loopback_port)
+    fail_msg: >-
+      127.0.0.1:{{ truewealth_web_loopback_port }} is held by something that is
+      not the {{ truewealth_project }} project: {{ truewealth_port_holders.stdout }}
+    quiet: true
+
+- name: Look up the runtime GID
+  ansible.builtin.getent:
+    database: group
+    key: "{{ truewealth_runtime_gid | string }}"
+    fail_key: false
+  check_mode: false
+
+- name: The runtime GID must be free or ours
+  # The Redis password file is group-readable by this GID (the containers'
+  # gid). If a host group already uses it for something else, its members
+  # could read the secret.
+  # getent keys its result by the group NAME even when asked by GID.
+  ansible.builtin.assert:
+    that:
+      - (ansible_facts.getent_group | default({}) | list) in [[], [truewealth_runtime_group]]
+    fail_msg: >-
+      GID {{ truewealth_runtime_gid }} already belongs to group(s)
+      {{ ansible_facts.getent_group | default({}) | list }}.
+      Refusing to make a secret readable by it.
+    quiet: true

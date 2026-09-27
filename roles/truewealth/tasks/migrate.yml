@@ -1,0 +1,28 @@
+---
+# The explicit, one-shot migration step. Web and worker refuse to start on a
+# pending migration, so a failure here stops the deployment before `up`.
+# The runner is advisory-locked and idempotent (TrueWealth db/client.ts).
+
+- name: Apply migrations
+  ansible.builtin.command:
+    argv: "{{ (truewealth_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T', 'migrate'] }}"
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_migrate
+  changed_when: truewealth_migrate.stdout is search('migrations applied: [1-9]')
+  failed_when: false
+
+- name: Stop when migrations failed
+  ansible.builtin.fail:
+    msg: >-
+      Migrations failed (exit {{ truewealth_migrate.rc }}); nothing was started
+      or changed after this point. Output:
+      {{ (truewealth_migrate.stdout ~ '\n' ~ truewealth_migrate.stderr) | trim | truncate(2000) }}
+  when: truewealth_migrate.rc != 0
+
+- name: Confirm nothing is pending
+  ansible.builtin.command:
+    argv: "{{ (truewealth_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T', 'migrate', 'node', 'dist/ops/migrate.mjs', '--status'] }}"
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_migrate_status
+  changed_when: false
+  failed_when: truewealth_migrate_status.rc != 0 or truewealth_migrate_status.stdout is not search(', 0 pending')

@@ -1,0 +1,85 @@
+---
+# The DR backup: scripts, a oneshot service and a daily timer. The first run
+# happens on the timer, or on demand with `systemctl start truewealth-backup`.
+
+- name: Install age when backups are encrypted for off-host transfer
+  ansible.builtin.apt:
+    name: age
+    state: present
+    update_cache: false
+  when: truewealth_backup_age_recipients | length > 0
+
+- name: Off-host transfer needs recipients to encrypt to
+  ansible.builtin.assert:
+    that:
+      - truewealth_backup_offhost_target == '' or truewealth_backup_age_recipients | length > 0
+      - truewealth_backup_offhost_target == '' or truewealth_backup_offhost_ssh_key != ''
+    fail_msg: >-
+      truewealth_backup_offhost_target is set, but backups can only leave the
+      host encrypted: set truewealth_backup_age_recipients (public keys) and
+      truewealth_backup_offhost_ssh_key.
+    quiet: true
+
+- name: Install the backup and restore-verification scripts
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/usr/local/sbin/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0700"
+    validate: /bin/bash -n %s
+  loop:
+    - { src: truewealth-backup.sh.j2, dest: truewealth-backup }
+    - { src: truewealth-restore-verify.sh.j2, dest: truewealth-restore-verify }
+
+- name: Install the backup service and timer
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: truewealth-backup.service
+      content: |
+        # Managed by roles/truewealth (home-datacenter-starter).
+        [Unit]
+        Description=TrueWealth disaster-recovery backup (consistent pg_dump + manifest)
+        After=docker.service
+        Requires=docker.service
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/truewealth-backup
+        Nice=10
+        IOSchedulingClass=idle
+    - name: truewealth-backup.timer
+      content: |
+        # Managed by roles/truewealth (home-datacenter-starter).
+        [Unit]
+        Description=Daily TrueWealth backup
+
+        [Timer]
+        OnCalendar={{ truewealth_backup_on_calendar }}
+        Persistent=true
+        RandomizedDelaySec=300
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  register: truewealth_backup_units
+
+- name: Observe whether the timer unit is on disk
+  ansible.builtin.stat:
+    path: /etc/systemd/system/truewealth-backup.timer
+  register: truewealth_timer_file
+  check_mode: false
+
+- name: Enable the timer
+  ansible.builtin.systemd_service:
+    name: truewealth-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: "{{ truewealth_backup_units is changed }}"
+  when: truewealth_timer_file.stat.exists or not ansible_check_mode
