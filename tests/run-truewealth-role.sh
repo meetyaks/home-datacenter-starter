@@ -189,5 +189,30 @@ else
 fi
 
 echo
+echo "── 5. loading a real verified bundle (tasks/images.yml) ──"
+if [ -n "${TW_TRANSFER_BUNDLE:-}" ] && [ -f "$TW_TRANSFER_BUNDLE/transfer.json" ]; then
+  bc=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "$TW_TRANSFER_BUNDLE/transfer.json")
+  bp=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["platform"])' "$TW_TRANSFER_BUNDLE/transfer.json")
+  tags=$(python3 -c 'import json,sys; print(" ".join(i["localTag"] for i in json.load(open(sys.argv[1]))["images"]))' "$TW_TRANSFER_BUNDLE/transfer.json")
+  # Exactly the tags this bundle defines; nothing else is touched.
+  for t in $tags; do docker image rm "$t" >/dev/null 2>&1 || true; done
+  mkdir -p "$R/imgwork/images"
+  ansible-playbook tests/truewealth-images.yml -e bundle_dir="$TW_TRANSFER_BUNDLE" -e bundle_commit="$bc" \
+    -e bundle_platform="$bp" -e work_dir="$R/imgwork" \
+    -e foreign_image="${FOREIGN_TEST_IMAGE:-redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499}" \
+    > "$R/images.log" 2>&1 </dev/null
+  if grep -q 'failed=0' "$R/images.log" && ! grep -q MISSED "$R/images.log"; then
+    ok "images.yml loads a real bundle ($bp) and accepts only the recorded identities"
+    ok "a second run transfers and loads nothing"
+    ok "a foreign image under an expected tag is refused"
+  else
+    bad "images.yml with a real bundle" "$(grep -E 'FAILED|MISSED|msg' "$R/images.log" | head -4)"
+  fi
+  for t in $tags; do docker image rm "$t" >/dev/null 2>&1 || true; done
+else
+  skip "loading a real bundle" "set TW_TRANSFER_BUNDLE to a fetch-verify.mjs output directory"
+fi
+
+echo
 printf '── %d passed, %d failed ──\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

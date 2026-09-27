@@ -1,0 +1,90 @@
+---
+# roles/truewealth/tasks/images.yml — the REAL task file — against the local
+# Docker engine, with a real transfer bundle produced by TrueWealth's
+# release/fetch-verify.mjs (tests/run-truewealth-role.sh drives it when
+# TW_TRANSFER_BUNDLE is set). Proves on this machine's image store:
+# copy → re-hash → docker load → accept only the recorded identities and
+# this commit's labels; a second run loads nothing; a foreign image under
+# the expected tag is refused.
+#
+# Extra vars: bundle_dir, bundle_commit, bundle_platform, work_dir
+- name: Load a verified bundle with the real task file
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    common: &common
+      truewealth_commit: "{{ bundle_commit }}"
+      truewealth_transfer_dir: "{{ bundle_dir }}"
+      truewealth_platform: "{{ bundle_platform }}"
+      truewealth_images_dir: "{{ work_dir }}/images"
+      truewealth_owner: "{{ lookup('env', 'USER') }}"
+      truewealth_group: "{{ omit }}"
+  tasks:
+    - name: Index the bundle as the controller phase does
+      ansible.builtin.set_fact:
+        truewealth_images: "{{ dict(t.images | map(attribute='role') | zip(t.images)) }}"
+      vars:
+        t: "{{ lookup('file', bundle_dir ~ '/transfer.json') | from_json }}"
+
+    - name: First run — transfer, verify, load
+      ansible.builtin.include_role:
+        name: truewealth
+        tasks_from: images
+      vars: *common
+
+    - name: It loaded all four, each under an accepted identity
+      ansible.builtin.assert:
+        that:
+          - truewealth_need | length == 4
+          - truewealth_loaded_ids[item.key] in item.value.acceptLoadedIds
+        quiet: true
+      loop: "{{ truewealth_images | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Second run — nothing to load (idempotent)
+      ansible.builtin.include_role:
+        name: truewealth
+        tasks_from: images
+      vars: *common
+
+    - name: Nothing was transferred the second time
+      ansible.builtin.assert:
+        that:
+          - truewealth_need | length == 0
+        fail_msg: "second run wanted to load {{ truewealth_need }}"
+        quiet: true
+
+    # Outside the block: a failure to set up the foreign image must fail the
+    # test, not be mistaken for the refusal below.
+    - name: Make the foreign image available
+      ansible.builtin.command:
+        argv: [docker, pull, "{{ foreign_image }}"]
+      changed_when: false
+
+    - name: Put another image under the web tag
+      ansible.builtin.command:
+        argv: [docker, tag, "{{ foreign_image }}", "{{ truewealth_images.web.localTag }}"]
+      changed_when: true
+
+    - name: A foreign image under an expected tag is refused
+      block:
+        - name: Run the task file again
+          ansible.builtin.include_role:
+            name: truewealth
+            tasks_from: images
+          vars: *common
+        - name: It should not get here
+          ansible.builtin.fail:
+            msg: "MISSED: a foreign image under the web tag was accepted"
+      rescue:
+        - name: Refused as expected
+          ansible.builtin.assert:
+            that:
+              - ansible_failed_result.msg is not search('^MISSED')
+              # A looped assert reports per item; search the whole result.
+              - ansible_failed_result | to_json is search('not an identity recorded for it')
+            fail_msg: "{{ ansible_failed_result.msg }}"
+            quiet: true

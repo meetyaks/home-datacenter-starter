@@ -41,8 +41,8 @@
   ansible.builtin.copy:
     src: "{{ truewealth_transfer_dir }}/{{ truewealth_images[item].archive }}"
     dest: "{{ truewealth_images_dir }}/{{ truewealth_images[item].archive }}"
-    owner: root
-    group: root
+    owner: "{{ truewealth_owner }}"
+    group: "{{ truewealth_group }}"
     mode: "0600"
   loop: "{{ truewealth_need }}"
 
