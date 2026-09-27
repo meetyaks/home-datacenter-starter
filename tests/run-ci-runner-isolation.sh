@@ -364,6 +364,27 @@ if grep -q 'GITHUB_WORKSPACE' "$completed"; then
 else
   bad "the completed hook clears the workspace" "the next job would inherit this job's files"
 fi
+
+# ⚠️ AND THE STARTED HOOK MUST RECOVER FROM AN INTERRUPTED JOB. A CANCELLED job
+# never runs the completed hook — observed: a cancelled run left 87 files in the
+# workspace, two service containers holding 5432 and 4222, and a volume. The
+# next job's Postgres then fails to bind a port, naming neither the cause nor
+# the previous job.
+if grep -q 'docker rm -f' "$started"; then
+  ok "the started hook removes containers an interrupted job left behind"
+else
+  bad "the started hook recovers from an interrupted job" \
+      "a cancelled job's Postgres would still hold 5432 when the next one starts"
+fi
+
+# It must discriminate by age, or it destroys the services of the job it is
+# about to run.
+if grep -q 'now - ts' "$started"; then
+  ok "leftover removal spares the current job's own service containers"
+else
+  bad "leftover removal is age-discriminated" \
+      "a blanket removal here would kill the Postgres this job is about to use"
+fi
 if grep -q 'docker ps -aq' "$completed" && grep -q 'docker volume ls -q' "$completed"; then
   ok "the completed hook destroys containers and volumes"
 else

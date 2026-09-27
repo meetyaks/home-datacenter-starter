@@ -123,6 +123,12 @@ ci_runner_log_dir: /var/log/ci-runner
 ci_runner_log_retain_days: 14
 ci_runner_disk_high_water_pct: 80
 
+# How old a container must be, at job-start time, to count as an earlier job's
+# leftover rather than this job's own service container. The runner creates this
+# job's services SECONDS before the started hook runs, so five minutes is a wide
+# margin in one direction and still catches everything in the other.
+ci_runner_leftover_age_seconds: 300
+
 # The runner's name in the GitHub UI. One runner, one VM, one name — so a queued
 # job that never starts is traceable to a specific machine.
 ci_runner_name: "{{ ci_vm_name }}"

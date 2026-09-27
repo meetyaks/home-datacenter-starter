@@ -92,5 +92,46 @@ if [ -d "$RUNNER_WORK" ]; then
   rm -rf "${RUNNER_WORK:?}/_temp/"* 2>/dev/null || true
 fi
 
+# ⚠️ AND THE CURRENT WORKSPACE'S CONTENTS, BECAUSE THE COMPLETED HOOK IS NOT
+# GUARANTEED TO HAVE RUN. A CANCELLED JOB SKIPS IT — observed: a cancelled run
+# left 87 entries in the tree, two service containers and a volume behind.
+# Emptying the directory is safe where REMOVING it is fatal: the runner created
+# it and expects it to exist, and nothing has been written into it yet at this
+# point (actions/checkout is the job's first step, after this hook).
+#
+# On the normal path the completed hook already emptied it, so this costs
+# nothing; after an abnormal exit it is what restores the guarantee that no job
+# ever sees another job's files.
+if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "${GITHUB_WORKSPACE:-}" ]; then
+  find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# ── Containers an interrupted job left running ──────────────────────────────
+#
+# ⚠️ AGE IS THE DISCRIMINATOR, AND IT HAS TO BE SOMETHING. The runner creates
+# THIS job's service containers seconds before this hook runs, so a blanket
+# `docker rm -f $(docker ps -aq)` here would destroy the Postgres and NATS the
+# job is about to use. The runner's per-job label is a bare hash with an empty
+# value, which identifies nothing without already knowing the answer.
+#
+# So anything older than the threshold belongs to a previous job. Without this,
+# a cancelled job leaves Postgres holding 5432 and the NEXT job's service
+# container fails to bind — a failure that names a port and explains nothing.
+now=$(date -u +%s)
+for c in $(docker ps -aq 2>/dev/null); do
+  created=$(docker inspect "$c" 2>/dev/null | jq -r '.[0].Created' 2>/dev/null)
+  [ -n "${created:-}" ] || continue
+  ts=$(date -u -d "$created" +%s 2>/dev/null || echo "$now")
+  if [ $(( now - ts )) -gt {{ ci_runner_leftover_age_seconds }} ]; then
+    echo "removing container $c left by an earlier job ($(( (now - ts) / 60 ))m old)"
+    docker rm -f "$c" >/dev/null 2>&1 || true
+  fi
+done
+
+# Networks and volumes still referenced by the current job's services are "in
+# use" and are never pruned, so these only reach an interrupted job's leftovers.
+docker network prune -f >/dev/null 2>&1 || true
+docker volume prune -f  >/dev/null 2>&1 || true
+
 mkdir -p "$CACHE_DIR/pnpm"
 echo "CI isolation checks passed; workspace reset."
