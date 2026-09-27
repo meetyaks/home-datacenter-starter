@@ -119,4 +119,18 @@ echo "══ installation identity (7 cases + no committed value) ════�
 ansible-playbook tests/installation-identity.yml
 
 echo
+echo "══ CI runner isolation (39 static checks) ══════════════════════════"
+# A DIFFERENT ROLE, AND THE ONLY ONE THAT RUNS UNTRUSTED CODE. roles/ci_runner
+# puts a GitHub Actions runner in a VM on the host that holds every secret in
+# the lab, so "it cannot reach production" has to be a set of checked properties
+# rather than a design intention: no host-path device, an egress policy with an
+# INPUT chain — without one the VM reaches production Caddy on the bridge
+# address and every forward-chain drop is beside the point — an unprivileged
+# service account, hooks that are root-owned and actually wired to the runner,
+# and a registration token that is never written down.
+#
+# Add CI_RUNNER_LIVE=dc1-x86 to run the probes inside the real VM as well.
+tests/run-ci-runner-isolation.sh
+
+echo
 echo "All regression suites passed."

@@ -1,0 +1,85 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REBUILD — destroy the CI VM and build it again from the role.
+#
+# This exists so that "the runner is disposable" is a demonstrated property and
+# not a claim. If the VM is ever suspected of holding something a job left
+# behind, the answer is to delete it, and that answer has to be a tested path.
+#
+#   ansible-playbook playbooks/ci-runner.yml --tags rebuild \
+#     --ask-become-pass -e ci_rebuild_confirm=dc1-ci-1
+#
+# ⚠️ WHAT IT DOES NOT TOUCH: the logical volume, the storage pool, the bridge,
+# the host egress policy, or anything under /srv/data. It deletes ONE INSTANCE.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: The VM to destroy must be named explicitly
+  # Not a yes/no prompt: the operator has to type the name of the thing being
+  # destroyed, so `--tags rebuild` on the wrong host cannot proceed on a reflex.
+  ansible.builtin.assert:
+    that:
+      - ci_rebuild_confirm is defined
+      - ci_rebuild_confirm == ci_vm_name
+    fail_msg: >-
+      Refusing to destroy {{ ci_vm_name }}. Confirm by naming it:
+      -e ci_rebuild_confirm={{ ci_vm_name }}
+    quiet: true
+
+- name: Read the instance before destroying anything
+  ansible.builtin.command:
+    argv: [lxc, list, "^{{ ci_vm_name }}$", "--format", json]
+  register: ci_rebuild_info
+  changed_when: false
+  check_mode: false
+
+- name: Establish that this is the instance the role owns
+  ansible.builtin.set_fact:
+    ci_rebuild_found: "{{ (ci_rebuild_info.stdout | from_json) }}"
+
+- name: It must exist, be a VM, and live in this role's pool
+  # ⚠️ THE POOL CHECK IS THE REAL GUARD. A name can be reused; an instance whose
+  # root disk is not in {{ ci_lxd_pool }} belongs to something else, and this
+  # task is the difference between rebuilding CI and deleting a stranger's work.
+  ansible.builtin.assert:
+    that:
+      - ci_rebuild_found | length == 1
+      - ci_rebuild_found[0].type == 'virtual-machine'
+      - ci_rebuild_found[0].devices.root.pool | default('') == ci_lxd_pool
+    fail_msg: >-
+      {{ ci_vm_name }} is not a virtual machine in pool {{ ci_lxd_pool }}.
+      Refusing to delete it. Found: {{ ci_rebuild_found | default([]) }}
+    quiet: true
+
+- name: Check whether a runner is still registered
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", test, -f, "{{ ci_runner_dir }}/.runner"]
+  register: ci_rebuild_registered
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Unregister before destroying
+  # ⚠️ ORDER MATTERS AND IT IS NOT REVERSIBLE. Deleting the VM while its runner
+  # is registered leaves an offline runner in the repository's list that nothing
+  # in this role can ever remove — GitHub's removal token has to be redeemed BY
+  # the machine. That orphan then sits there holding the `keel-ci` label, and a
+  # job can be dispatched to a machine that no longer exists.
+  ansible.builtin.assert:
+    that:
+      - ci_rebuild_registered.rc != 0
+    fail_msg: >-
+      {{ ci_vm_name }} still has a registered runner. Remove it first:
+      ansible-playbook playbooks/ci-runner.yml --tags unregister
+      -e ci_runner_removal_token=<token>
+      Only then rebuild.
+    quiet: true
+
+- name: Destroy the CI VM
+  ansible.builtin.command:
+    argv: [lxc, delete, "{{ ci_vm_name }}", --force]
+  changed_when: true
+
+- name: Build it again
+  # The same tasks that built it the first time — which is the point. A rebuild
+  # path made of its own bespoke steps proves nothing about the ordinary one.
+  ansible.builtin.include_tasks: main.yml

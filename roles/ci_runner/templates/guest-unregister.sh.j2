@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# MANAGED BY roles/ci_runner — runs inside {{ ci_vm_name }}, as root.
+#
+# Removes the runner from the repository and uninstalls its service, leaving the
+# VM provisioned and ready to register again. This is the supported way back
+# out: deleting the VM would also work, and would throw away the caches and the
+# preserved job logs for no reason.
+#
+# The REMOVAL token arrives on stdin, under the same rule as the registration
+# one. It is a different token from a different button, and it is equally
+# single-use.
+set -euo pipefail
+
+RUNNER_USER='{{ ci_runner_user }}'
+RUNNER_DIR='{{ ci_runner_dir }}'
+
+IFS= read -r TOKEN || true
+if [ -z "${TOKEN:-}" ]; then
+  echo "FATAL: no removal token on stdin." >&2
+  exit 1
+fi
+
+cd "$RUNNER_DIR"
+
+if [ ! -f .runner ]; then
+  echo "OK: not configured; nothing to remove."
+  exit 0
+fi
+
+# Stop and uninstall the service BEFORE removing the configuration: the reverse
+# order leaves a unit pointing at a runner that no longer has an identity, which
+# restarts, fails, and restarts again.
+if [ -f ./svc.sh ]; then
+  ./svc.sh stop      || true
+  ./svc.sh uninstall || true
+fi
+
+runuser -u "$RUNNER_USER" -- ./config.sh remove --token "$TOKEN"
+unset TOKEN
+
+echo "CHANGED: removed {{ ci_runner_name }} from {{ ci_runner_scope_url }}"

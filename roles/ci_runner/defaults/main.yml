@@ -1,0 +1,194 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# A SELF-HOSTED GITHUB ACTIONS RUNNER, IN A VM, ON THE HOST THAT RUNS PRODUCTION.
+#
+# ═══ THE PREMISE THIS ROLE IS BUILT ON ══════════════════════════════════════
+#
+# A CI runner executes repository code. The correct assumption is therefore
+# ARBITRARY CODE EXECUTION AS THE RUNNER USER — not "our code, so it is fine".
+# Restricting triggers to trusted branches changes WHO can start it; it does not
+# change what the isolation has to withstand, and a malicious dependency in a
+# build reaches the same position without anyone landing a commit.
+#
+# dc1-x86 holds, in `/srv/data/services/keel`: the RS256 JWT private key, the
+# credential-vault and MFA master keys, all ten database and object-store
+# secrets, and Caddy's internal CA private key — which could mint certificates
+# trusted for keel.dc1.lan. It also has a Docker socket that is root on the host.
+#
+# So this is a VM, not a container: its own kernel, its own Docker daemon, its
+# own disk, and no device that reaches the host filesystem.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Identity ───────────────────────────────────────────────────────────────
+ci_vm_name: dc1-ci-1
+ci_vm_image: ubuntu:24.04
+ci_runner_labels: "self-hosted,linux,x64,keel-ci"
+
+# THE REPOSITORY, AND ONLY THIS ONE. A repository-scoped runner cannot be
+# reached by any other repository in the organisation; an organisation-scoped
+# one can, which would silently widen the blast radius to every repo that learns
+# the label.
+ci_runner_scope_url: "https://github.com/meetyaks/keel"
+
+# ── Resources ──────────────────────────────────────────────────────────────
+#
+# The host has 16 vCPU and 27 GiB. Production Keel currently uses ~2-3 GiB, so
+# 14 GiB leaves ~11 GiB for the host and production with the integration lane
+# at full stretch. 14 rather than 16 is deliberate headroom: an LXD VM's memory
+# is allocated at boot, so over-committing here is felt by production, not by CI.
+ci_vm_cpu: 8
+ci_vm_memory: 14GiB
+
+# What `lxc config set` must hold on the instance, checked before it is written.
+# `boot.autostart` is here so a power cut does not silently leave CI offline.
+ci_vm_settings:
+  - { k: "limits.cpu", v: "{{ ci_vm_cpu }}" }
+  - { k: "limits.memory", v: "{{ ci_vm_memory }}" }
+  - { k: "boot.autostart", v: "true" }
+
+# ⚠️ 180 GiB, NOT 250. `ubuntu-vg` had 254.68 GiB free, so a 250 GiB volume
+# would have left 4.68 GiB — no capacity to ever extend `/` or `/srv/data`
+# again, and no LVM snapshot headroom, on a host running production. 180 leaves
+# ~75 GiB of reserve; the Keel checkout, its pnpm store and every test image
+# together are well under 60 GiB today.
+ci_lv_name: ci-lxd
+ci_lv_size: 180g
+ci_vg_name: ubuntu-vg
+ci_lv_mount: /var/lib/ci-lxd
+ci_vm_root_size: 170GiB          # inside the 180 GiB volume, leaving fs overhead
+
+# ── LXD ────────────────────────────────────────────────────────────────────
+#
+# LXD 6.9 is installed on dc1-x86 and was never initialised — no pools, no
+# managed networks, no instances. This role is therefore the first and only
+# owner of LXD on that host, which is why it may initialise it.
+ci_lxd_pool: ci-pool
+ci_lxd_bridge: lxdbr0
+ci_lxd_subnet: 10.71.0.1/24
+ci_lxd_subnet_cidr: 10.71.0.0/24
+
+# ── Egress policy ──────────────────────────────────────────────────────────
+#
+# ⚠️ ENFORCED ON THE HOST, NOT IN THE GUEST. Once code runs as the CI user the
+# guest's own firewall is attacker-controlled, so a policy written inside the VM
+# is advisory. These rules live in a forward chain on dc1-x86, outside the blast
+# radius.
+#
+# ⚠️ AND IT IS A SUBNET DENY, NOT A DOMAIN ALLOW-LIST. nftables cannot match
+# hostnames, so the honest description is: 80/443 to the public internet is
+# permitted, and every private range is denied. A true "GitHub and registries
+# only" allow-list needs an egress proxy with SNI inspection; that is a
+# deliberate non-goal here and is recorded as such rather than implied.
+ci_egress_denied_cidrs:
+  - 10.0.0.0/24        # the lab LAN — dc1-x86, the Mac Mini, the router
+  - 100.64.0.0/10      # Tailscale CGNAT — the host's offsite identity
+  - 172.16.0.0/12      # Docker networks on the host, incl. production Keel
+  - 192.168.0.0/16
+  - 169.254.0.0/16     # link-local, incl. cloud metadata conventions
+ci_egress_allowed_ports: [80, 443]
+
+# ── The runner service account ──────────────────────────────────────────────
+#
+# Unprivileged, and NOT in the guest's sudo group. It is in `docker` because the
+# integration lane starts containers — inside the VM, where the socket grants
+# root only in the VM.
+ci_runner_user: ghrunner
+ci_runner_home: /home/ghrunner
+ci_runner_dir: /home/ghrunner/actions-runner
+ci_runner_work: /home/ghrunner/_work
+ci_runner_hook_dir: /opt/ci-hooks
+
+# The scripts that are rendered on the host and pushed into the guest, with
+# where each one lands. One list so the render, the checksum comparison and the
+# push cannot disagree about what the set is.
+ci_guest_files:
+  - src: guest-provision.sh.j2
+    dest: provision.sh
+    guest: /root/provision.sh
+  - src: job-hook-started.sh.j2
+    dest: job-started.sh
+    guest: "{{ ci_runner_hook_dir }}/job-started.sh"
+  - src: job-hook-completed.sh.j2
+    dest: job-completed.sh
+    guest: "{{ ci_runner_hook_dir }}/job-completed.sh"
+
+# Where the host renders the guest scripts before pushing them in. Removed at
+# the end of the run — see the last task in tasks/guest.yml.
+ci_stage_dir: /run/ci-runner-stage
+
+# Kept deliberately OUTSIDE _work, which the started hook wipes before every
+# job. Job state must not survive; a package store and a build cache must.
+ci_runner_cache_dir: /opt/ci-cache
+ci_runner_log_dir: /var/log/ci-runner
+ci_runner_log_retain_days: 14
+ci_runner_disk_high_water_pct: 80
+
+# How old a container must be, at job-start time, to count as an earlier job's
+# leftover rather than this job's own service container. The runner creates this
+# job's services SECONDS before the started hook runs, so five minutes is a wide
+# margin in one direction and still catches everything in the other.
+ci_runner_leftover_age_seconds: 300
+
+# The runner's name in the GitHub UI. One runner, one VM, one name — so a queued
+# job that never starts is traceable to a specific machine.
+ci_runner_name: "{{ ci_vm_name }}"
+
+# Pinned by version AND checked against the published SHA-256. An unpinned
+# installer is a dependency on someone else's release state at download time,
+# which is the same class of defect that stopped a Keel deployment at
+# `docker compose pull`.
+#
+# ⚠️ THE DIGEST IS COPIED FROM THE RELEASE NOTES, NEVER RECONSTRUCTED. The first
+# value here was not: provisioning failed with a computed hash whose first
+# SIXTEEN BYTES matched the pin and whose tail did not, which is not something a
+# real mismatch does — it is what a fabricated value looks like. The download was
+# genuine; the pin was invented.
+#
+#   gh api repos/actions/runner/releases/tags/v<version> --jq .body \
+#     | grep -oE 'BEGIN SHA linux-x64 -->[0-9a-f]{64}'
+#
+# That is the only acceptable source. A checksum that is "about right" is worse
+# than none: it fails honest downloads and would pass nothing an attacker did.
+ci_runner_version: "2.337.0"
+ci_runner_tarball: "actions-runner-linux-x64-{{ ci_runner_version }}.tar.gz"
+ci_runner_url: "https://github.com/actions/runner/releases/download/v{{ ci_runner_version }}/{{ ci_runner_tarball }}"
+ci_runner_sha256: "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
+
+# ── Registration ───────────────────────────────────────────────────────────
+#
+# ⚠️ NEVER COMMITTED, NEVER PRINTED, NEVER DEFAULTED. The registration token is
+# single-use and short-lived; it is supplied on the command line for one run and
+# the only task that touches it is `no_log`.
+#
+# ⚠️ EPHEMERAL IS OFF, AND THAT IS A DELIBERATE REVERSAL OF THE OBVIOUS ANSWER.
+#
+# `--ephemeral` makes the runner de-register after one job, which is genuinely
+# the stronger isolation between jobs. But a runner that de-registers can only
+# come back by CONFIGURING ITSELF AGAIN, and registration tokens are single-use
+# and last an hour. Automating that means storing, inside the least-trusted
+# machine in the lab, a PAT or app key that can register runners — a credential
+# that in practice also carries repository read. That is a worse trade than the
+# one it buys: it puts a real GitHub credential where arbitrary CI code runs, to
+# defend against a job poisoning the next job on a single-committer private repo.
+#
+# So the isolation between jobs is enforced instead by the two hooks — the
+# workspace is wiped before every job and every container, volume and network is
+# destroyed after it — and the runner itself stays registered.
+#
+# Set this true if you ever wire up a token-minting credential OUT OF BAND (a
+# GitHub App with a short-lived installation token, minted on the controller and
+# passed in per run). The role supports it; it just will not be the default that
+# quietly parks a PAT in the CI VM.
+ci_runner_ephemeral: false
+
+# ── What the runner must NOT be able to reach ──────────────────────────────
+#
+# Probed from inside the guest before every job by the started hook, so the host
+# egress policy is proven in force at the moment code is about to run rather
+# than assumed from the fact it was once applied. `host:port`.
+#
+# Defaults to the managed host's own LAN address on the two ports that matter:
+# 443 is Caddy in front of production Keel, 5432 is its database.
+ci_isolation_denied_probes:
+  - "{{ ansible_host | default(inventory_hostname) }}:443"
+  - "{{ ansible_host | default(inventory_hostname) }}:5432"

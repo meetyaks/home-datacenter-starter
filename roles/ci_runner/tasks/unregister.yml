@@ -1,0 +1,91 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REMOVAL — the way back out, and the thing that makes registration reversible.
+#
+#   ansible-playbook playbooks/ci-runner.yml --tags unregister \
+#     -e ci_runner_removal_token=<token from the runner's Remove button>
+#
+# Same discipline as registration: stdin only, `no_log`, nothing written down.
+# The VM survives, provisioned and idle, so re-registering is one command and
+# not a rebuild.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: A removal token must be supplied
+  ansible.builtin.assert:
+    that:
+      - ci_runner_removal_token is defined
+      - (ci_runner_removal_token | default('') | trim | length) > 10
+    fail_msg: >-
+      No removal token. Open the runner at
+      {{ ci_runner_scope_url }}/settings/actions/runners, choose Remove, and
+      copy the token from the command it shows:
+      ansible-playbook playbooks/ci-runner.yml --tags unregister -e ci_runner_removal_token=<token>
+    quiet: true
+
+- name: A staging directory for the removal script
+  ansible.builtin.file:
+    path: "{{ ci_stage_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Stage the removal script on the host
+  ansible.builtin.template:
+    src: guest-unregister.sh.j2
+    dest: "{{ ci_stage_dir }}/unregister.sh"
+    mode: "0700"
+    validate: /bin/bash -n %s
+
+- name: Push the removal script into the guest
+  ansible.builtin.command:
+    argv:
+      - lxc
+      - file
+      - push
+      - "{{ ci_stage_dir }}/unregister.sh"
+      - "{{ ci_vm_name }}/root/unregister.sh"
+      - --mode=0700
+      - --uid=0
+      - --gid=0
+  changed_when: true
+
+- name: Remove the runner
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", /root/unregister.sh]
+    stdin: "{{ ci_runner_removal_token }}"
+    stdin_add_newline: true
+  register: ci_unregister
+  no_log: true
+  changed_when: "'CHANGED:' in ci_unregister.stdout"
+
+- name: Clean up the removal script, on both machines
+  ansible.builtin.file:
+    path: "{{ ci_stage_dir }}/unregister.sh"
+    state: absent
+
+- name: Remove it from the guest too
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", rm, -f, /root/unregister.sh]
+  changed_when: false
+
+- name: What removal reported
+  ansible.builtin.debug:
+    var: ci_unregister.stdout_lines
+
+- name: Confirm no runner service remains
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "-T", "--", /bin/sh, -c,
+           "systemctl list-units --type=service --all --no-legend 'actions.runner.*' | wc -l"]
+  register: ci_svc_left
+  changed_when: false
+  check_mode: false
+
+- name: The runner service must be gone
+  ansible.builtin.assert:
+    that:
+      - (ci_svc_left.stdout | trim | int) == 0
+    fail_msg: >-
+      A runner service unit is still present in {{ ci_vm_name }}.
+      Inspect with: lxc exec {{ ci_vm_name }} -- systemctl list-units 'actions.runner.*'
+    quiet: true

@@ -1,0 +1,143 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# dc1-ci-1 — a VIRTUAL MACHINE, with nothing that reaches the host.
+#
+# ⚠️ `--vm`, NOT A CONTAINER. A container shares the host kernel, so a container
+# escape is a host compromise and the host holds every production secret. A VM
+# has its own kernel; the boundary is the hypervisor.
+#
+# ⚠️ AND NO `disk` DEVICE BEYOND ITS OWN ROOT. The single most likely way to
+# undo this whole role is to add a bind-mount "just for the pnpm cache". There is
+# no path from the guest to /srv/data because no device provides one, and
+# tests/run-ci-runner-isolation.sh asserts the device list stays that way.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Check whether the CI VM already exists
+  ansible.builtin.command:
+    argv: [lxc, info, "{{ ci_vm_name }}"]
+  register: ci_vm_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# The same observe-before-predicting rule as storage.yml. In `--check` the
+# launch below does not happen, so every task that INSPECTS the VM — the agent
+# wait, the device list, the two assertions — would be interrogating a machine
+# that does not exist, and would fail the dry run on its own prediction.
+- name: Whether this run can inspect the VM
+  ansible.builtin.set_fact:
+    ci_vm_inspectable: "{{ (ci_vm_check.rc == 0) or (not ansible_check_mode) }}"
+
+- name: Launch the CI virtual machine
+  ansible.builtin.command:
+    argv:
+      - lxc
+      - launch
+      - "{{ ci_vm_image }}"
+      - "{{ ci_vm_name }}"
+      - --vm
+      - --storage
+      - "{{ ci_lxd_pool }}"
+      - --network
+      - "{{ ci_lxd_bridge }}"
+      - -c
+      - "limits.cpu={{ ci_vm_cpu }}"
+      - -c
+      - "limits.memory={{ ci_vm_memory }}"
+      - -d
+      - "root,size={{ ci_vm_root_size }}"
+  when: ci_vm_check.rc != 0
+  changed_when: true
+
+- name: Read the VM's current settings
+  # ⚠️ READ BEFORE WRITING, or the role can never report a converged run. The
+  # first version simply set all three every time with `changed_when: true`, so
+  # a re-run against a correctly configured VM reported changes it had not made.
+  # `lxc config set` is silent and cannot tell us whether it did anything, so
+  # the comparison has to happen here.
+  ansible.builtin.command:
+    argv: [lxc, config, get, "{{ ci_vm_name }}", "{{ item.k }}"]
+  loop: "{{ ci_vm_settings }}"
+  loop_control:
+    label: "{{ item.k }}"
+  register: ci_vm_current
+  when: ci_vm_inspectable
+  changed_when: false
+  check_mode: false
+
+- name: Apply the settings that differ
+  # So a re-run with a changed limit converges rather than silently keeping the
+  # value from first launch — and a re-run with no change says nothing.
+  ansible.builtin.command:
+    argv: [lxc, config, set, "{{ ci_vm_name }}", "{{ item.item.k }}", "{{ item.item.v }}"]
+  loop: "{{ ci_vm_current.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.k }}={{ item.item.v }}"
+  when:
+    - ci_vm_inspectable
+    - (item.stdout | default('') | trim) != (item.item.v | string)
+  changed_when: true
+
+- name: Wait for the guest agent to answer
+  # `lxc exec` needs the agent, which takes longer in a VM than in a container.
+  # Everything after this depends on it, so it is waited for explicitly rather
+  # than discovered as a confusing failure in the next task.
+  ansible.builtin.command:
+    argv: [lxc, exec, "{{ ci_vm_name }}", "--", /bin/true]
+  register: ci_agent
+  retries: 40
+  delay: 5
+  until: ci_agent.rc == 0
+  when: ci_vm_inspectable
+  changed_when: false
+
+- name: Read the VM's device list
+  ansible.builtin.command:
+    argv: [lxc, config, device, show, "{{ ci_vm_name }}"]
+  register: ci_devices
+  when: ci_vm_inspectable
+  changed_when: false
+  check_mode: false
+
+- name: The VM must have no device that reaches the host filesystem
+  # THE ASSERTION THAT MAKES THE ISOLATION CLAIM TRUE. A `source:` on a disk
+  # device is a host path handed to the guest; the root volume has none.
+  ansible.builtin.assert:
+    that:
+      - "'/srv' not in ci_devices.stdout"
+      - "'docker.sock' not in ci_devices.stdout"
+      - ci_devices.stdout is not search('source:\\s*/')
+    fail_msg: >-
+      {{ ci_vm_name }} has a device that reaches the host filesystem:
+      {{ ci_devices.stdout }}
+      Remove it. A bind-mount from this host puts production secrets one `cat`
+      away from anything CI executes.
+    quiet: true
+  when: ci_vm_inspectable
+
+- name: The VM must not be privileged
+  ansible.builtin.command:
+    argv: [lxc, config, show, "{{ ci_vm_name }}"]
+  register: ci_vm_config
+  when: ci_vm_inspectable
+  changed_when: false
+  check_mode: false
+
+- name: security.privileged must not be set
+  ansible.builtin.assert:
+    that:
+      - ci_vm_config.stdout is not search('security\.privileged:\s*(true|"true")')
+    fail_msg: "{{ ci_vm_name }} is configured privileged. Remove it."
+    quiet: true
+  when: ci_vm_inspectable
+
+# ⚠️ AND SAY SO WHEN THEY DID NOT RUN. A skipped assertion is not a satisfied
+# assertion; a dry run that stays silent here would read as "isolation
+# verified" when nothing was inspected at all.
+- name: What the dry run could not assert about the VM
+  ansible.builtin.debug:
+    msg: >-
+      {{ ci_vm_name }} does not exist yet, so the device list and the
+      privileged-mode check were NOT verified in this dry run. They run for
+      real on the next `ansible-playbook playbooks/ci-runner.yml`.
+  when: not ci_vm_inspectable

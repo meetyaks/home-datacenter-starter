@@ -1,0 +1,59 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# LXD, initialised for exactly one purpose.
+#
+# Preflight established that nothing else owns LXD on this host — no pools, no
+# managed networks, no instances — which is what makes initialising it here
+# defensible rather than a takeover.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Check whether the CI storage pool already exists
+  ansible.builtin.command:
+    argv: [lxc, storage, show, "{{ ci_lxd_pool }}"]
+  register: ci_pool_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Create the CI storage pool on the dedicated volume
+  # `dir` on a dedicated LV rather than the `lvm` driver: the capacity boundary
+  # is the volume, which is what matters, and a directory pool is inspectable
+  # with `ls` when something goes wrong at 2am.
+  ansible.builtin.command:
+    argv:
+      - lxc
+      - storage
+      - create
+      - "{{ ci_lxd_pool }}"
+      - dir
+      - "source={{ ci_lv_mount }}"
+  when: ci_pool_check.rc != 0
+  changed_when: true
+
+- name: Check whether the CI bridge already exists
+  ansible.builtin.command:
+    argv: [lxc, network, show, "{{ ci_lxd_bridge }}"]
+  register: ci_net_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Create an isolated NAT bridge for the CI VM
+  # ⚠️ NAT, AND NO PORT FORWARDS. The VM gets a private address and reaches the
+  # internet through the host; nothing on the LAN can reach in. Administration is
+  # `lxc exec` from the host, so the guest needs no listening service at all —
+  # which is why this role installs no sshd and opens no inbound port.
+  #
+  # IPv6 is switched OFF deliberately: an address the egress policy below does
+  # not cover would be a path around it, and nothing in CI needs IPv6.
+  ansible.builtin.command:
+    argv:
+      - lxc
+      - network
+      - create
+      - "{{ ci_lxd_bridge }}"
+      - "ipv4.address={{ ci_lxd_subnet }}"
+      - ipv4.nat=true
+      - ipv6.address=none
+  when: ci_net_check.rc != 0
+  changed_when: true

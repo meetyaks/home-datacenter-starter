@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# MANAGED BY roles/ci_runner — ACTIONS_RUNNER_HOOK_JOB_STARTED.
+#
+# Runs in the guest, as {{ ci_runner_user }}, before every job's first step.
+# Two jobs: give the job a clean workspace, and REFUSE TO RUN if the isolation
+# this whole role exists for has been undone.
+set -uo pipefail
+
+RUNNER_WORK='{{ ci_runner_work }}'
+CACHE_DIR='{{ ci_runner_cache_dir }}'
+
+fail() { echo "::error title=CI isolation::$*"; exit 1; }
+
+# ── The isolation self-check ────────────────────────────────────────────────
+#
+# ⚠️ THIS IS THE RUNTIME HALF OF THE ISOLATION CLAIM. tests/ proves the VM is
+# built without a path to production; this proves it at the moment code is about
+# to run, which is the only moment that matters. If someone adds a bind-mount to
+# "just share the pnpm cache", the next job fails here instead of quietly
+# handing the repository's own CI a copy of the lab's JWT signing key.
+[ -e /srv/data ]            && fail "/srv/data is visible inside the CI VM. A host path has been mounted in. Refusing to run."
+[ -S /var/run/docker.sock ] || fail "no Docker socket in the guest — the CI daemon is not running."
+
+# The guest's own socket must be the guest's. A host socket bind-mounted in
+# would answer with the HOST's containers, production Keel among them.
+if command -v docker >/dev/null 2>&1; then
+  names="$(docker ps --format '{{ '{{' }}.Names{{ '}}' }}' 2>/dev/null || true)"
+  case "$names" in
+    *keel-gateway*|*keel-postgres*|*keel-caddy*|*keel-minio*)
+      fail "production Keel containers are visible from the CI runner. Refusing to run." ;;
+  esac
+fi
+
+# Production must be unreachable by ADDRESS as well as by mount. The host's own
+# LAN address runs Caddy on 443 and is inside 10.0.0.0/24, which the host's
+# `inet ci_egress` table drops. Reaching it would mean the policy is not loaded
+# — so this checks the control is in force instead of assuming it.
+#
+# `/dev/tcp` with a timeout, not curl: no dependency, and a DROP shows up as the
+# timeout rather than a connection refused.
+for hp in {% for p in ci_isolation_denied_probes %}'{{ p }}' {% endfor %}; do
+  host="${hp%:*}"; port="${hp##*:}"
+
+  # ⚠️ A PROBE THAT CANNOT RESOLVE PASSES, AND MEANS NOTHING. `/dev/tcp` to an
+  # unresolvable name fails exactly like a dropped packet, so if this list is
+  # ever rendered from an inventory NAME — the controller's `ansible_host` is
+  # `dc1-x86`, which does not resolve inside the guest — every check here would
+  # report the host as unreachable while nothing had been tested. A negative
+  # result is only evidence when the target was addressable.
+  case "$host" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*) : ;;
+    *) fail "isolation probe '${hp}' is not an IP address. An unresolvable target cannot prove anything; set ci_isolation_denied_probes to addresses." ;;
+  esac
+
+  if timeout 4 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+    fail "${hp} answered from inside the CI VM. The host egress policy is not in force."
+  fi
+done
+
+# ── Stale workspaces from OTHER jobs ────────────────────────────────────────
+#
+# ⚠️ NOT THIS JOB'S WORKSPACE, AND THAT DISTINCTION COST THE FIRST CI RUN.
+# The runner creates the job's working directory BEFORE it invokes this hook.
+# The first version of this script removed everything under _work, including
+# that directory — so every step then died instantly with
+#
+#   An error occurred trying to start process '/usr/bin/docker' with working
+#   directory '/home/ghrunner/_work/keel/keel'. No such file or directory
+#
+# Both jobs failed in under 20 seconds, having run no product code at all.
+#
+# So this removes the checkout trees of OTHER repositories and other branches —
+# which is what stops one job inheriting another's node_modules, build output or
+# stray credentials — and leaves the current one alone. Clearing the current
+# workspace is the completed hook's job, once the runner has finished with it.
+#
+# The runner's own caches (_actions, _tool) and the pnpm store are kept
+# deliberately: they hold no job state, and rebuilding them every run would
+# triple the cycle time.
+keep="$(basename "${RUNNER_WORKSPACE:-__none__}")"
+if [ -d "$RUNNER_WORK" ]; then
+  for d in "$RUNNER_WORK"/*; do
+    [ -e "$d" ] || continue
+    case "$(basename "$d")" in
+      _actions|_tool|_temp) continue ;;
+      "$keep")              continue ;;
+      *) rm -rf "$d" 2>/dev/null || true ;;
+    esac
+  done
+  # _temp is scratch the runner recreates per job, and it is not the working
+  # directory, so emptying it here is safe.
+  rm -rf "${RUNNER_WORK:?}/_temp/"* 2>/dev/null || true
+fi
+
+# ⚠️ AND THE CURRENT WORKSPACE'S CONTENTS, BECAUSE THE COMPLETED HOOK IS NOT
+# GUARANTEED TO HAVE RUN. A CANCELLED JOB SKIPS IT — observed: a cancelled run
+# left 87 entries in the tree, two service containers and a volume behind.
+# Emptying the directory is safe where REMOVING it is fatal: the runner created
+# it and expects it to exist, and nothing has been written into it yet at this
+# point (actions/checkout is the job's first step, after this hook).
+#
+# On the normal path the completed hook already emptied it, so this costs
+# nothing; after an abnormal exit it is what restores the guarantee that no job
+# ever sees another job's files.
+if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "${GITHUB_WORKSPACE:-}" ]; then
+  find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# ── Containers an interrupted job left running ──────────────────────────────
+#
+# ⚠️ AGE IS THE DISCRIMINATOR, AND IT HAS TO BE SOMETHING. The runner creates
+# THIS job's service containers seconds before this hook runs, so a blanket
+# `docker rm -f $(docker ps -aq)` here would destroy the Postgres and NATS the
+# job is about to use. The runner's per-job label is a bare hash with an empty
+# value, which identifies nothing without already knowing the answer.
+#
+# So anything older than the threshold belongs to a previous job. Without this,
+# a cancelled job leaves Postgres holding 5432 and the NEXT job's service
+# container fails to bind — a failure that names a port and explains nothing.
+now=$(date -u +%s)
+for c in $(docker ps -aq 2>/dev/null); do
+  created=$(docker inspect "$c" 2>/dev/null | jq -r '.[0].Created' 2>/dev/null)
+  [ -n "${created:-}" ] || continue
+  ts=$(date -u -d "$created" +%s 2>/dev/null || echo "$now")
+  if [ $(( now - ts )) -gt {{ ci_runner_leftover_age_seconds }} ]; then
+    echo "removing container $c left by an earlier job ($(( (now - ts) / 60 ))m old)"
+    docker rm -f "$c" >/dev/null 2>&1 || true
+  fi
+done
+
+# Networks and volumes still referenced by the current job's services are "in
+# use" and are never pruned, so these only reach an interrupted job's leftovers.
+docker network prune -f >/dev/null 2>&1 || true
+docker volume prune -f  >/dev/null 2>&1 || true
+
+mkdir -p "$CACHE_DIR/pnpm"
+echo "CI isolation checks passed; workspace reset."

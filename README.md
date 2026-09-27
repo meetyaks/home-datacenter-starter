@@ -84,3 +84,25 @@ docker info --format '{{.LoggingDriver}}'
 The next milestone is a private core Compose stack containing PostgreSQL,
 Redis, Caddy and Uptime Kuma, with persistent data bind-mounted beneath
 `/srv/data`.
+
+## Continuous integration on dc1-x86
+
+`playbooks/ci-runner.yml` provisions a **self-hosted GitHub Actions runner for
+`meetyaks/keel`** in a dedicated LXD virtual machine (`dc1-ci-1`) on the same
+host — with no path to the production Keel deployment that shares it.
+
+```bash
+ansible-playbook playbooks/ci-runner.yml --ask-become-pass            # provision
+ansible-playbook playbooks/ci-runner.yml --tags register \
+  --ask-become-pass -e ci_runner_token=<one-time token>               # register
+tests/run-ci-runner-isolation.sh                                      # verify
+```
+
+It is deliberately **not** part of `site.yml`: an ordinary site run manages
+production, and must not also build or alter a machine whose job is to run
+whatever a workflow tells it to. Registration, removal and rebuild are
+`never`-tagged, so none of them can happen as a side effect.
+
+The threat model, the ownership boundary, what the egress policy does and does
+not promise, and why ephemeral registration is off are in
+[roles/ci_runner/README.md](roles/ci_runner/README.md).

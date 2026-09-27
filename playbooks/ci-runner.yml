@@ -1,0 +1,71 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# The self-hosted CI runner: a dedicated VM on dc1-x86, isolated from the Keel
+# production runtime that shares the host.
+#
+#   check       ansible-playbook playbooks/ci-runner.yml --check --diff --ask-become-pass
+#   provision   ansible-playbook playbooks/ci-runner.yml --ask-become-pass
+#   register    ansible-playbook playbooks/ci-runner.yml --tags register \
+#                 --ask-become-pass -e ci_runner_token=<one-time token>
+#   remove      ansible-playbook playbooks/ci-runner.yml --tags unregister \
+#                 --ask-become-pass -e ci_runner_removal_token=<one-time token>
+#   rebuild     ansible-playbook playbooks/ci-runner.yml --tags rebuild \
+#                 --ask-become-pass -e ci_rebuild_confirm=dc1-ci-1
+#
+# ⚠️ DELIBERATELY NOT IN site.yml. An ordinary site run manages the production
+# Keel deployment; it must not also build or alter a CI machine as a side
+# effect. The two have opposite risk profiles — one holds every secret in the
+# lab, the other runs whatever a workflow tells it to — and the only thing they
+# share is the metal.
+#
+# ⚠️ REGISTRATION AND REMOVAL ARE `never`-TAGGED. Both consume a one-time GitHub
+# token that a human mints in the repository's settings, so neither may happen
+# as a side effect of provisioning. REBUILD is `never`-tagged because it
+# destroys the VM.
+#
+# ⚠️ AND EVERY INCLUDE CARRIES `apply:`, WHICH IS NOT DECORATION. A tag on a
+# dynamic `include_role` applies to the INCLUDE TASK ONLY — the tasks it pulls
+# in inherit nothing, so under `--tags <x>` they are filtered out and the play
+# runs the include and then nothing at all. `--tags rebuild` reported
+# "ok=2 changed=0" against a VM it had not touched. The same defect on
+# `--tags register` is worse: it would consume a one-time registration token,
+# report success, and leave no runner. `apply:` pushes the tag onto the included
+# tasks so they actually run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Provision and manage the CI runner VM
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Build the CI VM and install the runner
+      ansible.builtin.include_role:
+        name: ci_runner
+        apply:
+          tags: [provision]
+      tags: [provision]
+
+    - name: Register the runner with GitHub
+      ansible.builtin.include_role:
+        name: ci_runner
+        tasks_from: register.yml
+        apply:
+          tags: [register]
+      tags: [register, never]
+
+    - name: Remove the runner from GitHub
+      ansible.builtin.include_role:
+        name: ci_runner
+        tasks_from: unregister.yml
+        apply:
+          tags: [unregister]
+      tags: [unregister, never]
+
+    - name: Destroy and rebuild the CI VM
+      ansible.builtin.include_role:
+        name: ci_runner
+        tasks_from: rebuild.yml
+        apply:
+          tags: [rebuild]
+      tags: [rebuild, never]

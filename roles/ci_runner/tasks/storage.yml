@@ -1,0 +1,73 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# A DEDICATED LOGICAL VOLUME, AND NOT A DIRECTORY ON /srv/data.
+#
+# /srv/data holds production Keel's database, object store and secrets. Putting
+# the CI pool there would mean a runaway job's disk use lands on the production
+# data volume, and CI I/O competes with production I/O on the same filesystem.
+# A separate LV gives a hard capacity boundary the kernel enforces.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ⚠️ OBSERVE BEFORE PREDICTING — the check-mode rule this repository learned the
+# hard way in roles/caddy. Under `--check`, `lvol` REPORTS a volume it has not
+# created, and the very next task runs `mkfs` against a device that does not
+# exist: "Device /dev/ubuntu-vg/ci-lxd not found", on a fresh host, from a dry
+# run that was supposed to be side-effect free. A dry run that fails on its own
+# prediction teaches an operator to stop running dry runs.
+#
+# So every consumer below is gated on the device being REAL. In a real run
+# `not ansible_check_mode` is true and nothing changes; in a dry run they skip
+# and the report says what could not be verified.
+- name: Observe whether the CI volume already exists
+  ansible.builtin.stat:
+    path: "/dev/{{ ci_vg_name }}/{{ ci_lv_name }}"
+  register: ci_lv_dev
+  check_mode: false
+
+- name: Create the CI logical volume
+  community.general.lvol:
+    vg: "{{ ci_vg_name }}"
+    lv: "{{ ci_lv_name }}"
+    size: "{{ ci_lv_size }}"
+    state: present
+    # ⚠️ NEVER shrink or resize implicitly. `resizefs` and a smaller size would
+    # silently destroy data on a re-run with a changed variable.
+    resizefs: false
+  register: ci_lvol
+
+- name: Put a filesystem on it
+  community.general.filesystem:
+    fstype: ext4
+    dev: "/dev/{{ ci_vg_name }}/{{ ci_lv_name }}"
+    # `force: false` is the default and is load-bearing: it refuses to overwrite
+    # an existing filesystem, so a re-run cannot erase the CI pool.
+    force: false
+  when: ci_lv_dev.stat.exists or not ansible_check_mode
+
+- name: Mount it, and record it in fstab so a reboot keeps the runner
+  ansible.posix.mount:
+    path: "{{ ci_lv_mount }}"
+    src: "/dev/{{ ci_vg_name }}/{{ ci_lv_name }}"
+    fstype: ext4
+    opts: defaults,noatime
+    state: mounted
+  when: ci_lv_dev.stat.exists or not ansible_check_mode
+
+- name: Say what the dry run could not verify
+  ansible.builtin.debug:
+    msg: >-
+      The CI volume does not exist yet, so the filesystem, the mount and
+      everything downstream of them cannot be checked in this dry run. Run
+      without --check to create /dev/{{ ci_vg_name }}/{{ ci_lv_name }}.
+  when: ansible_check_mode and not ci_lv_dev.stat.exists
+
+- name: Only root may read the CI pool from the host side
+  # The pool holds the VM's disk image. Anything that can read it can read the
+  # guest's whole filesystem, so it is not group- or world-readable.
+  ansible.builtin.file:
+    path: "{{ ci_lv_mount }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: ci_lv_dev.stat.exists or not ansible_check_mode

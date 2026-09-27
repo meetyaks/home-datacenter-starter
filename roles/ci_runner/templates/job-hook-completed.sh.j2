@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# MANAGED BY roles/ci_runner — ACTIONS_RUNNER_HOOK_JOB_COMPLETED.
+#
+# Runs in the guest, as {{ ci_runner_user }}, after every job's last step.
+# Preserve what diagnosis needs, then destroy what the job created.
+#
+# ⚠️ THIS IS WHERE THE CURRENT JOB'S WORKSPACE IS CLEARED, AND IT HAS TO BE.
+# The started hook cannot do it: the runner creates the job's working directory
+# before invoking that hook, so removing it there makes every step fail with
+# "No such file or directory" before any product code runs. The started hook
+# therefore removes only OTHER workspaces, and this one empties the current
+# tree once the runner has finished with it.
+#
+# The CONTENTS are removed and the directory itself is left in place — the
+# runner still expects it to exist after this hook returns.
+set -uo pipefail
+
+LOG_DIR='{{ ci_runner_log_dir }}'
+RUNNER_DIR='{{ ci_runner_dir }}'
+RETAIN_DAYS='{{ ci_runner_log_retain_days }}'
+DISK_HIGH_WATER={{ ci_runner_disk_high_water_pct }}
+
+run="${GITHUB_RUN_ID:-norun}-${GITHUB_RUN_ATTEMPT:-1}-${GITHUB_JOB:-nojob}"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+dest="$LOG_DIR/${stamp}-${run}"
+mkdir -p "$dest"
+
+# ── 1. Preserve what a failure investigation actually needs ─────────────────
+{
+  echo "repository   ${GITHUB_REPOSITORY:-?}"
+  echo "workflow     ${GITHUB_WORKFLOW:-?}"
+  echo "job          ${GITHUB_JOB:-?}"
+  echo "run          ${GITHUB_RUN_ID:-?} attempt ${GITHUB_RUN_ATTEMPT:-?}"
+  echo "ref          ${GITHUB_REF:-?}"
+  echo "sha          ${GITHUB_SHA:-?}"
+  echo "finished     $stamp"
+  echo
+  echo "── containers still running at job end ──"
+  docker ps -a --format '{{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Image{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}' 2>/dev/null || true
+  echo
+  echo "── disk ──"
+  df -h / 2>/dev/null || true
+  echo
+  echo "── docker space ──"
+  docker system df 2>/dev/null || true
+} > "$dest/job-summary.txt" 2>&1
+
+# Logs from any container the job left behind — the usual reason a compose-based
+# integration test fails in a way the step output does not explain.
+for c in $(docker ps -aq 2>/dev/null); do
+  name="$(docker inspect -f '{{ '{{' }}.Name{{ '}}' }}' "$c" 2>/dev/null | tr -d '/' | tr -c 'A-Za-z0-9_.-' '_')"
+  docker logs --tail 2000 "$c" > "$dest/container-${name}.log" 2>&1 || true
+done
+
+# ⚠️ REDACTION IS A REDUCTION, NOT A GUARANTEE. The runner masks values it was
+# given as secrets; these logs are container output it never saw. This strips
+# the shapes that leak most often. It is not a substitute for the real control,
+# which is that this VM holds no production credential to leak in the first
+# place.
+for f in "$dest"/*.log "$dest"/job-summary.txt; do
+  [ -f "$f" ] || continue
+  sed -i -E \
+    -e 's/(gh[pousr]_)[A-Za-z0-9]{16,}/\1<redacted>/g' \
+    -e 's/(AKIA)[0-9A-Z]{12,}/\1<redacted>/g' \
+    -e 's/(eyJ[A-Za-z0-9_-]{8,})\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/<redacted-jwt>/g' \
+    -e 's/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][^[:space:]]{0,12}[=:])[^[:space:]]+/\1<redacted>/g' \
+    -e 's/([Ss][Ee][Cc][Rr][Ee][Tt][^[:space:]]{0,12}[=:])[^[:space:]]+/\1<redacted>/g' \
+    -e 's/([Tt][Oo][Kk][Ee][Nn][^[:space:]]{0,12}[=:])[^[:space:]]+/\1<redacted>/g' \
+    -e 's#-----BEGIN [A-Z ]*PRIVATE KEY-----#<redacted-private-key>#g' \
+    "$f" 2>/dev/null || true
+done
+chmod -R go-rwx "$dest" 2>/dev/null || true
+
+# ── 2. Destroy what the job created ─────────────────────────────────────────
+#
+# Containers first (they hold networks and volumes open), then volumes — which
+# is where a test database lives — then networks, then dangling images. Tagged
+# images survive on purpose: they are the build cache that keeps a cycle to
+# minutes, and they carry no job state.
+docker ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true
+docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f >/dev/null 2>&1 || true
+docker network prune -f >/dev/null 2>&1 || true
+docker image prune -f >/dev/null 2>&1 || true
+
+# Under disk pressure the cache stops being worth its space. One job that fails
+# on a full disk costs more than every cold rebuild it was avoiding.
+used="$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')"
+if [ -n "${used:-}" ] && [ "$used" -ge "$DISK_HIGH_WATER" ]; then
+  echo "disk at ${used}% — pruning the build cache as well"
+  docker system prune -af --volumes >/dev/null 2>&1 || true
+fi
+
+# ── 3. The workspace ────────────────────────────────────────────────────────
+#
+# Emptied, not removed. Everything worth keeping was copied above; what is left
+# is a checkout, its node_modules and whatever the job wrote — none of which the
+# next job should ever see.
+if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "${GITHUB_WORKSPACE:-}" ]; then
+  find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# ── 4. Retention ────────────────────────────────────────────────────────────
+find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type d -mtime "+${RETAIN_DAYS}" -exec rm -rf {} + 2>/dev/null || true
+
+# The runner's own diagnostics rotate themselves, but not aggressively enough to
+# leave unattended for months.
+find "$RUNNER_DIR/_diag" -type f -name '*.log' -mtime "+${RETAIN_DAYS}" -delete 2>/dev/null || true
+
+echo "job artefacts preserved in $dest; containers, volumes and networks removed."
