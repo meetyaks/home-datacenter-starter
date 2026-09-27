@@ -12,10 +12,21 @@
     fail_msg: Pass -e truewealth_admin_email=<address>.
     quiet: true
 
+- name: Refuse a password passed as a variable
+  # -e truewealth_admin_password=… is visible in ps and shell history.
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', 'truewealth_admin_password', default='__absent__') == '__absent__'
+    fail_msg: >-
+      truewealth_admin_password was supplied as a variable (e.g. -e). That exposes
+      it in process arguments and shell history; it is refused. Treat it as
+      disclosed, choose another, and answer the hidden prompt instead.
+    quiet: true
+
 - name: A password must have been entered
   ansible.builtin.assert:
     that:
-      - truewealth_admin_password | default('') | length >= 12
+      - truewealth_admin_password_input | default('') | length >= 12
     fail_msg: The administrator password must be at least 12 characters.
     quiet: true
   no_log: true
@@ -33,6 +44,12 @@
     fail_msg: Deploy TrueWealth first (playbooks/truewealth.yml).
     quiet: true
 
+- name: Modules must reach the host streamed before the password is sent
+  ansible.builtin.include_tasks: pipelining-probe.yml
+  vars:
+    truewealth_probe_purpose: the administrator password
+  when: not ansible_check_mode
+
 - name: Enroll the administrator
   ansible.builtin.command:
     argv: >-
@@ -40,8 +57,10 @@
          'node', 'dist/ops/platform-admin.mjs', 'enroll',
          '--email', truewealth_admin_email, '--reason', truewealth_admin_reason] }}
     chdir: "{{ truewealth_root }}"
-    stdin: "{{ truewealth_admin_password }}"
+    stdin: "{{ truewealth_admin_password_input }}"
     stdin_add_newline: true
+  vars:
+    ansible_pipelining: true
   register: truewealth_enroll
   changed_when: truewealth_enroll.rc == 0
   failed_when: false

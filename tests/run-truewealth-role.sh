@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# roles/truewealth — controller-side proof, no host involved.
+# roles/truewealth — proof on this machine, no datacenter host involved.
 #
-#   tests/run-truewealth-role.sh
 #   TW_APP_REPO=~/Projects/truewealth tests/run-truewealth-role.sh
-#   TW_BACKUP_LIVE='docker compose -p <proj> -f … --env-file …' \
-#   TW_BACKUP_LIVE_ENV=<env file> tests/run-truewealth-role.sh
+#   (sections 4 and 6 need Docker; 4 also needs the TrueWealth node_modules)
 #
-#   1. static contract: deploys never build, never pull TrueWealth images,
-#      never `compose down`, never mount the Docker socket, never publish
-#      beyond loopback; secrets are no_log and file-based; migrations run
-#      before `up` and stop on failure; not in site.yml; no host-bootstrap
-#      roles; the Caddy drop-in adds no forwarding-header trust
-#   2. templates render; tasks/controller.yml and tasks/compose.yml (the real
-#      task files) accept correct inputs and refuse wrong ones
-#   3. a real caddy validates the COMPOSED configuration (main Caddyfile +
-#      Keel's drop-in + TrueWealth's) and a broken drop-in is refused
-#   4. (optional, TW_BACKUP_LIVE) the rendered backup script and restore
-#      verifier run against a disposable running stack
+#   1. static contract: never build/pull/down/--remove-orphans, no Docker
+#      socket, loopback-only publication; secrets file-based, no_log AND
+#      diff: false, never a process argument (no docker -e secrets; the admin
+#      password via hidden prompt + pipelined stdin); a changed deployment
+#      runs recovery point → migrate → start → verify → record
+#   2. templates render; the real controller.yml accepts a correct bundle
+#      and refuses 15 wrong ones (incl. dev-local evidence, another run or
+#      attempt, not API-verified, another workflow/head, failed run, changed
+#      evidence); compose.yml refuses a LAN-published variant
+#   3. a real caddy validates the COMPOSED configuration
+#   4. backup/restore integrity with the REAL migrator image and synthetic
+#      data: snapshot-consistent manifest under concurrent writes, app-level
+#      key checks, encrypted off-host recovery, failure paths, locking
+#   5. (optional, TW_TRANSFER_BUNDLE) images.yml with a real verified bundle
+#   6. the real role end to end with stand-in images: unchanged re-runs,
+#      a migration behind a recovery point, a failing migration, a failed
+#      post-start verification, a stray container, a crashing web
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -52,8 +56,21 @@ for f in secrets.yml enroll-admin.yml; do
   n_secret=$(grep -cE "vault_|admin_password" "$tasks/$f"); n_nolog=$(grep -c "no_log: true" "$tasks/$f")
   [ "$n_nolog" -ge 2 ] && ok "$f: secret-bearing tasks are no_log ($n_nolog)" || bad "$f is no_log" "only $n_nolog no_log tasks"
 done
-grep -q "stdin: \"{{ truewealth_admin_password }}\"" "$tasks/enroll-admin.yml" && ! grep -qE "argv:.*admin_password" "$tasks/enroll-admin.yml" \
-  && ok "the admin password reaches the CLI on stdin, never as an argument" || bad "password on stdin" "check enroll-admin.yml"
+grep -q "stdin: \"{{ truewealth_admin_password_input }}\"" "$tasks/enroll-admin.yml" && ! grep -qE "argv:.*admin_password" "$tasks/enroll-admin.yml" \
+  && grep -q "include_tasks: pipelining-probe.yml" "$tasks/enroll-admin.yml" && grep -q "ansible_pipelining: true" "$tasks/enroll-admin.yml" \
+  && grep -q "lookup('ansible.builtin.vars', 'truewealth_admin_password', default='__absent__')" "$tasks/enroll-admin.yml" \
+  && ok "the admin password: hidden prompt, stdin on a pipelined task (probed), never -e or an argument" || bad "password handling" "check enroll-admin.yml"
+if code | grep -E "docker (run|exec)|\-e " | grep -qE "\-e [A-Z_]*(PASS|SECRET|TOKEN|KEY)[A-Z_]*="; then
+  bad "no secret in a docker -e argument" "$(code | grep -nE "\-e [A-Z_]*(PASS|SECRET|TOKEN|KEY)[A-Z_]*=" | head -2)"
+else
+  ok "no secret is passed as a docker -e argument anywhere in the role (restore-verify uses --env-file)"
+fi
+grep -q -- "'--remove-orphans'" "$tasks/deploy.yml" && bad "no --remove-orphans in a routine deploy" "found" \
+  || ok "no --remove-orphans: unexpected containers are reported, never removed"
+[ "$(grep -c 'diff: false' "$tasks/secrets.yml")" -ge 2 ] && ok "secret files are written with diff: false as well as no_log" || bad "diff suppressed" "missing"
+ord=$(grep -oE "include_tasks: (premigrate|migrate|deploy|verify|record)\.yml" "$tasks/main.yml" | head -5 | sed 's/include_tasks: //' | tr '\n' ' ')
+[ "$ord" = "premigrate.yml migrate.yml deploy.yml verify.yml record.yml " ] \
+  && ok "a changed deployment: recovery point → migrate → start → verify → record (success recorded last)" || bad "deploy ordering" "$ord"
 order=$(grep -nE "include_tasks: (migrate|deploy).yml" "$tasks/main.yml" | cut -d: -f1 | tr '\n' ' ')
 set -- $order
 [ "${1:-0}" -lt "${2:-0}" ] && grep -q "Stop when migrations failed" "$tasks/migrate.yml" \
@@ -83,8 +100,11 @@ if [ -d "$APP/.git" ] || git -C "$APP" rev-parse >/dev/null 2>&1; then
   git -C "$repo" show "$commit:infra/dc1/compose.dc1.yml" > "$R/compose.ok.yml"
   sed "s/'127.0.0.1:\${TW_WEB_PORT/'0.0.0.0:\${TW_WEB_PORT/" "$R/compose.ok.yml" > "$R/compose.lan.yml"
 
-  mk_transfer() { # dir commit platform roles tagcommit
-    local d="$1" c="$2" p="$3" roles="$4" tc="$5"
+  mk_transfer() { # dir commit platform roles tagcommit [key=value …]
+    # keys: class verified wf head conclusion schema run attempt
+    local d="$1" c="$2" p="$3" roles="$4" tc="$5"; shift 5
+    local class=ci verified=github-api wf=.github/workflows/release.yml head="$c" conclusion=success schema=truewealth-transfer/2 run=4242 attempt=1
+    local kv; for kv in "$@"; do local "$kv"; done
     mkdir -p "$d"; local imgs=""
     for role in $roles; do
       head -c 4096 /dev/urandom > "$d/$role.tar"
@@ -92,8 +112,11 @@ if [ -d "$APP/.git" ] || git -C "$APP" rev-parse >/dev/null 2>&1; then
       local cfg; cfg=$(printf %s "$role$c" | shasum -a 256 | cut -d' ' -f1)
       imgs="$imgs{\"role\":\"$role\",\"title\":\"truewealth-$role\",\"archive\":\"$role.tar\",\"archiveSha256\":\"sha256:$sha\",\"configDigest\":\"sha256:$cfg\",\"manifestDigest\":\"sha256:$cfg\",\"acceptLoadedIds\":[\"sha256:$cfg\"],\"localTag\":\"truewealth/$role:${tc:0:12}-${cfg:0:12}\"},"
     done
-    printf '{"schema":"truewealth-transfer/1","commit":"%s","source":"https://github.com/meetyaks/truewealth","runId":"1","runAttempt":"1","workflowSha":"%s","platform":"%s","evidenceSha256":"sha256:%s","images":[%s]}\n' \
-      "$c" "$(printf 'w' | shasum -a 256 | cut -c1-40)" "$p" "$(printf e | shasum -a 256 | cut -d' ' -f1)" "${imgs%,}" > "$d/transfer.json"
+    printf '{"synthetic":"evidence for %s"}\n' "$c" > "$d/evidence.json"
+    local esha; esha=$(shasum -a 256 "$d/evidence.json" | cut -d' ' -f1)
+    printf '{"schema":"%s","commit":"%s","source":"https://github.com/meetyaks/truewealth","evidenceClass":"%s","platform":"%s","run":{"id":%s,"attempt":%s,"workflowPath":"%s","workflowSha":"%s","headSha":"%s","headBranch":"main","event":"workflow_dispatch","conclusion":"%s","verifiedWith":"%s"},"artifact":{"name":"release-bundle-%s-%s","id":1,"digest":"sha256:%s"},"evidenceFile":"evidence.json","evidenceSha256":"sha256:%s","images":[%s]}\n' \
+      "$schema" "$c" "$class" "$p" "$run" "$attempt" "$wf" "$head" "$head" "$conclusion" "$verified" "$run" "$attempt" \
+      "$(printf a | shasum -a 256 | cut -d' ' -f1)" "$esha" "${imgs%,}" > "$d/transfer.json"
   }
   mk_transfer "$T" "$commit" linux/amd64 "web worker compute migrator" "$commit"
   cp -R "$T" "$T-tampered"; printf x >> "$T-tampered/web.tar"
@@ -101,6 +124,16 @@ if [ -d "$APP/.git" ] || git -C "$APP" rev-parse >/dev/null 2>&1; then
   mk_transfer "$T-arm64" "$commit" linux/arm64 "web worker compute migrator" "$commit"
   mk_transfer "$T-badtag" "$commit" linux/amd64 "web worker compute migrator" "0000000000000000000000000000000000000000"
   mk_transfer "$T-badcommit" "$bad_commit" linux/amd64 "web worker compute migrator" "$bad_commit"
+  all="web worker compute migrator"
+  mk_transfer "$T-devlocal" "$commit" linux/amd64 "$all" "$commit" class=dev-local verified=none
+  mk_transfer "$T-otherrun" "$commit" linux/amd64 "$all" "$commit" run=9999
+  mk_transfer "$T-otherattempt" "$commit" linux/amd64 "$all" "$commit" attempt=2
+  mk_transfer "$T-unverified" "$commit" linux/amd64 "$all" "$commit" verified=none
+  mk_transfer "$T-otherworkflow" "$commit" linux/amd64 "$all" "$commit" wf=.github/workflows/validate.yml
+  mk_transfer "$T-otherhead" "$commit" linux/amd64 "$all" "$commit" head=$(printf 'o' | shasum -a 256 | cut -c1-40)
+  mk_transfer "$T-failedrun" "$commit" linux/amd64 "$all" "$commit" conclusion=failure
+  mk_transfer "$T-schema1" "$commit" linux/amd64 "$all" "$commit" schema=truewealth-transfer/1
+  cp -R "$T" "$T-evidence-changed"; printf ' ' >> "$T-evidence-changed/evidence.json"
   printf 'syntheticRedisPassword000000000000\n' > "$R/work/redis_password"
 
   ansible-playbook tests/truewealth-role.yml -e render_dir="$R/render" -e fixture_transfer_dir="$T" \
@@ -110,7 +143,7 @@ if [ -d "$APP/.git" ] || git -C "$APP" rev-parse >/dev/null 2>&1; then
   if grep -q 'failed=0' "$R/role.log" && ! grep -q 'MISSED' "$R/role.log"; then
     ok "templates render; shell templates pass bash -n"
     n=$(grep -c 'Refused: ' "$R/role.log")
-    ok "controller.yml accepts the correct bundle and refuses $n wrong ones (commit, tampered archive, missing role, platform, tag, compose with build)"
+    ok "controller.yml accepts the correct bundle and refuses $n wrong ones (commit, tampered archive, missing role, platform, tag, compose with build, dev-local evidence, another run, another attempt, not API-verified, another workflow, another head, failed run, old schema, evidence changed)"
     ok "compose.yml renders the real compose file and refuses a LAN-published variant"
   else
     bad "role task files behave" "$(grep -E 'FAILED|MISSED|msg' "$R/role.log" | head -5)"
@@ -149,43 +182,72 @@ else
 fi
 
 echo
-echo "── 4. backup and restore against a running stack ──"
-if [ -n "${TW_BACKUP_LIVE:-}" ]; then
-  B="$R/backups"; mkdir -p "$B"
-  cat > "$R/live-vars.yml" <<YML
-truewealth_compose_cmd: "${TW_BACKUP_LIVE}"
-truewealth_backup_dir: "$B"
-truewealth_env_file: "${TW_BACKUP_LIVE_ENV}"
-truewealth_root: "$R"
-truewealth_deployment_manifest: "$R/none.json"
-YML
-  ansible localhost -c local -m template -a "src=$ROLE/templates/truewealth-backup.sh.j2 dest=$R/backup.sh mode=0700" \
-    -e @"$ROLE/defaults/main.yml" -e @"$R/live-vars.yml" -e ansible_become=false </dev/null > "$R/render-live.log" 2>&1
-  ansible localhost -c local -m template -a "src=$ROLE/templates/truewealth-restore-verify.sh.j2 dest=$R/restore.sh mode=0700" \
-    -e @"$ROLE/defaults/main.yml" -e @"$R/live-vars.yml" -e ansible_become=false </dev/null > "$R/render-live.log" 2>&1
-  if bash "$R/backup.sh" > "$R/backup.log" 2>&1; then
-    d=$(ls -1d "$B"/[0-9]*Z | tail -1)
-    ok "backup: $(tail -1 "$R/backup.log" | sed 's/^backup: //')"
-    python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["redis"]["policy"]=="not-restored"; assert len(m["keys"]["TW_KEY_SECRET"]["fingerprint"])==16' "$d/manifest.json" \
-      && ok "manifest: schema, counts, key fingerprint only, Redis policy recorded" || bad "manifest content" "incomplete"
-    ! grep -q "$(sed -n 's/^TW_KEY_SECRET=//p' "$TW_BACKUP_LIVE_ENV")" "$d/manifest.json" && ok "manifest holds no key material" || bad "manifest leaks the key" "!"
-    if TW_RESTORE_SOURCE_CONTAINER="${TW_BACKUP_LIVE_PG:-}" bash "$R/restore.sh" "$d" > "$R/restore.log" 2>&1; then
-      ok "restore-verify: $(tail -1 "$R/restore.log")"
+echo "── 4. backup and restore integrity with the real migrator (synthetic data, concurrent writes, encrypted recovery) ──"
+# Needs Docker, the TrueWealth checkout WITH node_modules (the seeder uses the
+# application's own encryption code) and Node. Resources carry
+# twtask=tw-backup-test / the twtest-backup compose project and are removed by
+# exactly those labels afterwards.
+backup_cleanup() {
+  local ids
+  ids=$(docker ps -aq --filter label=twtask=tw-backup-test; docker ps -aq --filter label=com.docker.compose.project=twtest-backup; docker ps -aq --filter label=io.truewealth.task=restore-verify)
+  [ -n "$ids" ] && docker rm -f -v $ids > /dev/null 2>&1
+  docker network ls -q --filter label=com.docker.compose.project=twtest-backup | xargs -r docker network rm > /dev/null 2>&1
+  docker volume rm twtest-backup-work > /dev/null 2>&1
+  true
+}
+NODE_BIN="${TW_NODE:-node}"
+if [ -n "${SKIP_TW_BACKUP_EXERCISE:-}" ]; then
+  skip "backup/restore exercise" "SKIP_TW_BACKUP_EXERCISE is set"
+elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && [ -d "$APP/node_modules/tsx" ] && command -v "$NODE_BIN" >/dev/null 2>&1; then
+  backup_cleanup
+  BX_PORT="${TW_BACKUP_EXERCISE_PG_PORT:-55461}"
+  GIT_NO_LAZY_FETCH=1 git -C "$APP" show "$(git -C "$APP" rev-parse HEAD):infra/dc1/compose.dc1.yml" > "$R/bx-compose.dc1.yml"
+  if docker build -q --target migrator --label twtask=tw-backup-test -t twtest-real/migrator:exercise "$APP" > "$R/bx-build.log" 2>&1 \
+     && docker build -q --label twtask=hds-test-tools -t hds-deploy-harness:local -f tests/tools/deploy-harness.Dockerfile tests/tools >> "$R/bx-build.log" 2>&1 \
+     && docker volume create --label twtask=tw-backup-test twtest-backup-work > /dev/null; then
+    BMP=$(docker volume inspect -f '{{.Mountpoint}}' twtest-backup-work)
+    bx() {
+      docker run --rm --label twtask=tw-backup-test --network host -v /var/run/docker.sock:/var/run/docker.sock \
+        -v "twtest-backup-work:$BMP" -v "$PWD:/repo:ro" -v "$R/bx-compose.dc1.yml:/app/compose.dc1.yml:ro" \
+        -e MIGRATOR_IMAGE=twtest-real/migrator:exercise -e PG_PORT="$BX_PORT" hds-deploy-harness:local \
+        bash /repo/tests/truewealth-backup-exercise.sh "$1" "$BMP"
+    }
+    if bx up > "$R/bx-up.log" 2>&1; then
+      # Seed with the application's own code: the demo household, then
+      # encrypted MFA/provider/LLM fields (tests/fixtures/tw-backup-seed.ts).
+      # The synthetic DB password and keys are read from the work volume into
+      # this process's environment only.
+      bxenv="$(docker run --rm -v twtest-backup-work:/w hds-deploy-harness:local cat /w/root/env/truewealth.env)"
+      bxget() { printf '%s\n' "$bxenv" | sed -n "s/^$1=//p"; }
+      if ( cd "$APP" && export TW_DB_HOST=127.0.0.1 TW_DB_PORT="$BX_PORT" TW_DB_USER=truewealth TW_DB_NAME=truewealth \
+             TW_DB_PASSWORD="$(bxget TW_DB_PASSWORD)" TW_KEY_SECRET="$(bxget TW_KEY_SECRET)" TW_SECRET_KEY="$(bxget TW_SECRET_KEY)" \
+           && "$NODE_BIN" node_modules/tsx/dist/cli.mjs db/seed-demo.ts \
+           && TSX_TSCONFIG_PATH="$APP/tsconfig.json" NODE_PATH="$APP/node_modules" \
+              "$NODE_BIN" node_modules/tsx/dist/cli.mjs "$OLDPWD/tests/fixtures/tw-backup-seed.ts" ) > "$R/bx-seed.log" 2>&1; then
+        unset bxenv
+        if bx exercise > "$R/bx-exercise.log" 2>&1; then
+          ok "a backup taken during ~400 synthetic writes: manifest counts from the dump's own snapshot; restore matches it"
+          ok "restore-verify: schema, representative tables, orphans, key fingerprint, app-level decryption of MFA/provider/LLM secrets, a known password verifies"
+          ok "encrypted to a synthetic age key; the simulated off-host copy is ciphertext + manifest + COMPLETE; recovered with separately held identity and keys"
+          ok "partial/tampered copies, wrong identity, wrong/missing key and loose key files fail with distinct exits; no secret in any output"
+          ok "backups serialize on a lock, a failure leaves no partial directory and records its stage, retention deletes nothing ($(grep -o 'backup exercise: [0-9]* passed' "$R/bx-exercise.log"))"
+        else
+          bad "backup/restore exercise" "$(grep -A1 FAIL "$R/bx-exercise.log" | head -10)"
+        fi
+      else
+        unset bxenv
+        bad "seed the exercise database" "$(tail -4 "$R/bx-seed.log")"
+      fi
     else
-      bad "restore-verify passes" "$(tail -6 "$R/restore.log")"
+      bad "start the exercise database" "$(tail -6 "$R/bx-up.log")"
     fi
-    cp -R "$d" "$R/tampered"; printf 'x' >> "$R/tampered/db.dump"
-    TW_RESTORE_SOURCE_CONTAINER="${TW_BACKUP_LIVE_PG:-}" bash "$R/restore.sh" "$R/tampered" > /dev/null 2>&1 \
-      && bad "a tampered dump is refused" "accepted" || ok "a tampered dump is refused before restore"
-    cp -R "$d" "$R/wrongcount"; python3 -c 'import json,sys; p=sys.argv[1]; m=json.load(open(p)); m["counts"]["users"]+=1; json.dump(m,open(p,"w"))' "$R/wrongcount/manifest.json"
-    TW_RESTORE_SOURCE_CONTAINER="${TW_BACKUP_LIVE_PG:-}" bash "$R/restore.sh" "$R/wrongcount" > /dev/null 2>&1 \
-      && bad "a count mismatch fails verification" "accepted" || ok "a restore that does not match its manifest fails verification"
-    [ -z "$(docker ps -aq --filter label=io.truewealth.task=restore-verify)" ] && ok "no restore container is left behind" || bad "restore cleanup" "containers remain"
   else
-    bad "backup runs" "$(tail -5 "$R/backup.log")"
+    bad "exercise setup" "$(tail -3 "$R/bx-build.log")"
   fi
+  backup_cleanup
+  docker image rm twtest-real/migrator:exercise > /dev/null 2>&1
 else
-  skip "backup/restore against a running stack" "set TW_BACKUP_LIVE (compose command), TW_BACKUP_LIVE_ENV and TW_BACKUP_LIVE_PG"
+  skip "backup/restore exercise" "needs Docker, TW_APP_REPO with node_modules, and Node"
 fi
 
 echo
@@ -213,6 +275,52 @@ else
   skip "loading a real bundle" "set TW_TRANSFER_BUNDLE to a fetch-verify.mjs output directory"
 fi
 
+
+echo
+echo "── 6. the real role, end to end, with stand-in images (deploy, re-run, migrate, fail, recover) ──"
+# Needs Docker and the TrueWealth checkout (its dc1 compose file). Everything
+# it creates carries twtask=tw-deploy-test or the twtest-deploy compose
+# project, and is removed by exactly those labels/names afterwards.
+deploy_cleanup() {
+  local ids
+  ids=$(docker ps -aq --filter label=twtask=tw-deploy-test; docker ps -aq --filter label=com.docker.compose.project=twtest-deploy)
+  [ -n "$ids" ] && docker rm -f -v $ids > /dev/null 2>&1
+  docker network ls -q --filter label=com.docker.compose.project=twtest-deploy | xargs -r docker network rm > /dev/null 2>&1
+  docker volume rm twtest-deploy-work > /dev/null 2>&1
+  # Stand-in images: built with the label; their truewealth/* tags point at them.
+  for img in $(docker images -q --filter label=io.truewealth.test.standin=true | sort -u); do
+    docker image rm -f "$img" > /dev/null 2>&1
+  done
+  true
+}
+if [ -n "${SKIP_TW_DEPLOY_HARNESS:-}" ]; then
+  skip "end-to-end deploy scenarios" "SKIP_TW_DEPLOY_HARNESS is set"
+elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && git -C "$APP" rev-parse >/dev/null 2>&1; then
+  deploy_cleanup
+  GIT_NO_LAZY_FETCH=1 git -C "$APP" show "$(git -C "$APP" rev-parse HEAD):infra/dc1/compose.dc1.yml" > "$R/app-compose.dc1.yml"
+  if docker build -q --label twtask=hds-test-tools -t hds-deploy-harness:local -f tests/tools/deploy-harness.Dockerfile tests/tools > "$R/harness-build.log" 2>&1 \
+     && docker volume create --label twtask=tw-deploy-test twtest-deploy-work > /dev/null; then
+    MP=$(docker volume inspect -f '{{.Mountpoint}}' twtest-deploy-work)
+    docker run --rm --name twtest-harness --label twtask=tw-deploy-test --network host --add-host tw.dc1.test:127.0.0.1 \
+      -v /var/run/docker.sock:/var/run/docker.sock -v "twtest-deploy-work:$MP" -v "$PWD:/repo:ro" \
+      -v "$R/app-compose.dc1.yml:/app/compose.dc1.yml:ro" -e CADDY_IMAGE="$CADDY_IMAGE" \
+      hds-deploy-harness:local bash /repo/tests/truewealth-deploy-harness.sh "$MP" > "$R/deploy-harness.log" 2>&1
+    hrc=$?
+    n=$(grep -o 'deploy harness: [0-9]* passed' "$R/deploy-harness.log" | grep -o '[0-9]*')
+    if [ "$hrc" -eq 0 ]; then
+      ok "unchanged re-runs change nothing; a changed release migrates behind a recovery point and a stopped worker; rollback target = last distinct success"
+      ok "a failing migration, a failed post-start verification and a crashing web each leave the success record and rollback target untouched"
+      ok "stray containers are reported, not removed; failure diagnostics are bounded and leak no synthetic secret ($n checks, tests/truewealth-deploy-harness.sh)"
+    else
+      bad "end-to-end deploy scenarios" "$(grep -A1 FAIL "$R/deploy-harness.log" | head -10)"
+    fi
+  else
+    bad "deploy harness setup" "$(tail -3 "$R/harness-build.log")"
+  fi
+  deploy_cleanup
+else
+  skip "end-to-end deploy scenarios" "needs Docker and TW_APP_REPO"
+fi
 echo
 printf '── %d passed, %d failed ──\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

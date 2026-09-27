@@ -10,6 +10,7 @@
     owner: "{{ truewealth_owner }}"
     group: "{{ truewealth_group }}"
     mode: "0644"
+  register: truewealth_compose_written
 
 - name: Observe whether the rendered inputs are real (not only predicted)
   ansible.builtin.stat:

@@ -1,25 +1,28 @@
 ---
 # ─────────────────────────────────────────────────────────────────────────────
-# TrueWealth deployment, in order. Each phase is safe to re-run.
+# TrueWealth deployment, in order. Safe to re-run; an unchanged re-run writes
+# nothing.
 #
-#   controller   the transfer bundle is for THIS commit, complete, and every
-#                archive hashes to its record; the compose file comes from
-#                the same commit (all on the admin plane, no host access)
-#   preflight    the host can take it: ingress role applied, x86-64, /srv/data
-#                mounted, Docker/Compose present, the loopback port free, the
-#                runtime GID ours
-#   directories, secrets
-#   images       copy, re-hash, load, and accept ONLY the recorded identities
-#   compose      render and validate the whole configuration BEFORE starting
-#                anything; refuse LAN-published ports, builds, the Docker socket
-#   migrate      the explicit one-shot step; a failure stops the deployment
-#   deploy       up --wait --pull never; the running images must be the loaded
-#                ones
-#   caddy        one drop-in; whole-config validation before reload; the route
-#                must be LOADED
-#   verify       readiness on loopback, trusted HTTPS through the ingress,
-#                running commit identity
-#   backup       the DR backup timer and scripts
+#   controller   the transfer bundle is for THIS commit and THIS approved CI
+#                run/attempt, native linux/amd64 CI evidence, complete, and
+#                every archive hashes to its record; the compose file comes
+#                from the same commit (admin plane only, no host access)
+#   preflight    the host can take it
+#   directories, secrets, images (accept ONLY the recorded identities),
+#   compose (render and validate before anything starts), scripts
+#   state        last VERIFIED deployment vs this one: UNCHANGED or CHANGE
+#
+#   CHANGE:      attempt record (started) → pre-migration recovery point and
+#                worker stop (only when migrations are pending on existing
+#                data) → migrate → up --wait → ingress → verify (readiness,
+#                image identity, loopback, DNS, trusted HTTPS, revision) →
+#                ROLLBACK_PREVIOUS.json (last DISTINCT success) and
+#                DEPLOYMENT_MANIFEST.json (success) → attempt succeeded.
+#                Any failure: attempt failed + stage; the success record and
+#                the rollback target are untouched; nothing is rolled back
+#                or restored automatically.
+#   UNCHANGED:   converge (no-op) → ingress → verify; no record is written.
+#   backup       the DR backup timer
 #
 # Mutating phases are skipped under --check, and the plan says what a real
 # run would do and which checks need the live host.
@@ -53,6 +56,16 @@
     quiet: true
   no_log: true
 
+- name: The approved run must be named, not inferred
+  ansible.builtin.assert:
+    that:
+      - truewealth_run_id | string is match('^[0-9]+$')
+      - truewealth_run_attempt | string is match('^[0-9]+$')
+    fail_msg: >-
+      Pass -e truewealth_run_id=<id> -e truewealth_run_attempt=<n>: the CI run
+      whose evidence was approved. The bundle must come from exactly that run.
+    quiet: true
+
 - name: Controller — verify the transfer bundle and read the compose file
   ansible.builtin.include_tasks: controller.yml
 
@@ -75,22 +88,115 @@
 - name: Compose — render and validate before anything starts
   ansible.builtin.include_tasks: compose.yml
 
-- name: Migrations — the explicit one-shot step
-  ansible.builtin.include_tasks: migrate.yml
-  when: not ansible_check_mode
+- name: Operational scripts (backup, restore verification, diagnostics)
+  ansible.builtin.include_tasks: scripts.yml
 
-- name: Start the stack and prove it runs the loaded images
-  ansible.builtin.include_tasks: deploy.yml
-  when: not ansible_check_mode
+- name: State — what is deployed, and does this run change it?
+  ansible.builtin.include_tasks: state.yml
 
-- name: Ingress — one Caddy drop-in
+- name: A CHANGED deployment — attempt, recovery point, migrate, start, verify, then record
+  when:
+    - not ansible_check_mode
+    - not truewealth_unchanged
+  block:
+    - name: Open the attempt record
+      ansible.builtin.include_tasks: attempt.yml
+      vars:
+        truewealth_stage: attempt
+        truewealth_attempt_update:
+          schema: truewealth-attempt/1
+          id: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+          status: started
+          startedAt: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+          commit: "{{ truewealth_commit }}"
+          run: "{{ truewealth_transfer.run }}"
+          evidenceSha256: "{{ truewealth_transfer.evidenceSha256 }}"
+          loadedIds: "{{ truewealth_loaded_ids }}"
+          workerHeld: "{{ truewealth_hold_worker | bool }}"
+          previousSuccess: "{{ {'commit': truewealth_prev.commit, 'loadedIds': truewealth_prev.loadedIds, 'verifiedAt': truewealth_prev.verifiedAt | default(truewealth_prev.deployedAt | default(none))} if truewealth_prev else {} }}"
+          pendingMigrations: "{{ truewealth_pending }}"
+          existingDeployment: "{{ truewealth_existing }}"
+
+    - name: Stage — pre-migration recovery point and worker stop
+      ansible.builtin.set_fact:
+        truewealth_stage: pre-migration
+    - name: Recovery point before migrating existing data
+      ansible.builtin.include_tasks: premigrate.yml
+      when:
+        - truewealth_existing | bool
+        - truewealth_pending | length > 0
+
+    - name: Stage — migrate
+      ansible.builtin.set_fact:
+        truewealth_stage: migrate
+    - name: Migrations — the explicit one-shot step
+      ansible.builtin.include_tasks: migrate.yml
+      when: truewealth_pending | length > 0
+
+    - name: Stage — start
+      ansible.builtin.set_fact:
+        truewealth_stage: start
+    - name: Start the stack and prove it runs the loaded images
+      ansible.builtin.include_tasks: deploy.yml
+
+    - name: Stage — ingress
+      ansible.builtin.set_fact:
+        truewealth_stage: ingress
+    - name: Ingress — one Caddy drop-in
+      ansible.builtin.include_tasks: caddy.yml
+      when: truewealth_manage_ingress | bool
+
+    - name: Stage — verify
+      ansible.builtin.set_fact:
+        truewealth_stage: verify
+    - name: Verify through the ingress
+      ansible.builtin.include_tasks: verify.yml
+
+    - name: Stage — record
+      ansible.builtin.set_fact:
+        truewealth_stage: record
+    - name: Record the verified deployment
+      ansible.builtin.include_tasks: record.yml
+
+  rescue:
+    - name: Close the attempt as FAILED (the success record is untouched)
+      ansible.builtin.include_tasks: attempt.yml
+      vars:
+        truewealth_attempt_update:
+          status: failed
+          failedStage: "{{ truewealth_stage | default('attempt') }}"
+          failedTask: "{{ ansible_failed_task.name | default('?') }}"
+          finishedAt: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+    - name: Stop, with the recovery options
+      ansible.builtin.fail:
+        msg:
+          - "Deployment of {{ truewealth_commit }} FAILED at stage '{{ truewealth_stage | default('attempt') }}' ({{ ansible_failed_task.name | default('?') }})."
+          - "{{ ansible_failed_result.msg | default('') if (ansible_failed_result.msg | default('') is string) else (ansible_failed_result.msg | join(' | ')) }}"
+          - "DEPLOYMENT_ATTEMPT.json records the failure. DEPLOYMENT_MANIFEST.json is unchanged: the last VERIFIED deployment is still {{ truewealth_prev.commit if truewealth_prev else 'none (first deployment)' }}."
+          - "{{ 'Pre-migration recovery point: ' ~ truewealth_recovery_point if truewealth_recovery_point is defined else 'No recovery point was taken (no migration on existing data was reached).' }}"
+          - "{{ 'The worker was stopped before migrating and has NOT been restarted.' if (truewealth_worker_stop is defined and truewealth_worker_stop is changed) else '' }}"
+          - "Options (each a separate, approved decision; none is automatic): fix forward with a corrected commit; CODE rollback to the last verified commit only if its code works with the schema as it now is; or a DATABASE RESTORE from the recovery point (README: Restore) — never over newer data without an approved, exact target."
+
+- name: An UNCHANGED deployment — converge and verify only; no records written
+  when:
+    - not ansible_check_mode
+    - truewealth_unchanged
+  block:
+    - name: Converge (a no-op when everything already runs as recorded)
+      ansible.builtin.include_tasks: deploy.yml
+    - name: Ingress — one Caddy drop-in
+      ansible.builtin.include_tasks: caddy.yml
+      when: truewealth_manage_ingress | bool
+    - name: Verify through the ingress
+      ansible.builtin.include_tasks: verify.yml
+
+- name: Ingress — one Caddy drop-in (check mode)
   ansible.builtin.include_tasks: caddy.yml
+  when:
+    - ansible_check_mode
+    - truewealth_manage_ingress | bool
 
-- name: Verify through the ingress
-  ansible.builtin.include_tasks: verify.yml
-  when: not ansible_check_mode
-
-- name: Disaster-recovery backups
+- name: Disaster-recovery backup timer
   ansible.builtin.include_tasks: backup.yml
   when: truewealth_backup_enabled | bool
 
@@ -98,7 +204,7 @@
   ansible.builtin.debug:
     msg:
       - "CHECK MODE: controller-side verification of the transfer bundle and compose file ran for real."
-      - "Not run (they need the live host and change it): image load and identity, migrations,"
-      - "  `up --wait`, the running-image identity check, the Caddy reload, readiness and HTTPS"
-      - "  through https://{{ truewealth_hostname }}, and the backup timer's first run."
+      - "Not run (they need the live host and change it): image load and identity, the migration status,"
+      - "  the recovery point, migrations, `up --wait`, the running-image identity check, the Caddy reload,"
+      - "  readiness and HTTPS through https://{{ truewealth_hostname }}, the records, and the backup timer's first run."
   when: ansible_check_mode

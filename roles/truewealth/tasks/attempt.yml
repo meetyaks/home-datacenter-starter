@@ -1,0 +1,17 @@
+---
+# Update DEPLOYMENT_ATTEMPT.json with `truewealth_attempt_update`. The attempt
+# record says what was tried and how far it got; it is NOT evidence of a
+# deployment (only DEPLOYMENT_MANIFEST.json is, and it is written after every
+# verification passed).
+
+- name: Merge the attempt record
+  ansible.builtin.set_fact:
+    truewealth_attempt: "{{ (truewealth_attempt | default({})) | combine(truewealth_attempt_update) }}"
+
+- name: Write the attempt record
+  ansible.builtin.copy:
+    dest: "{{ truewealth_attempt_file }}"
+    content: "{{ truewealth_attempt | to_nice_json }}\n"
+    owner: "{{ truewealth_owner }}"
+    group: "{{ truewealth_group }}"
+    mode: "0644"

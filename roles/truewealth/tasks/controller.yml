@@ -22,10 +22,58 @@
   ansible.builtin.set_fact:
     truewealth_transfer: "{{ truewealth_transfer_raw.content | b64decode | from_json }}"
 
+- name: The bundle must come from the APPROVED run, as native CI evidence
+  # fetch-verify.mjs checked the run against the GitHub API (not the
+  # runner's own claims) and recorded what it checked; this binds the
+  # deployment to the run the operator named.
+  ansible.builtin.assert:
+    that:
+      - truewealth_transfer.schema == 'truewealth-transfer/2'
+      - truewealth_transfer.evidenceClass in truewealth_accept_evidence_classes
+      - truewealth_transfer.run.id | string == truewealth_run_id | string
+      - truewealth_transfer.run.attempt | string == truewealth_run_attempt | string
+      - >-
+        truewealth_transfer.evidenceClass != 'ci' or (
+          truewealth_transfer.run.verifiedWith == 'github-api'
+          and truewealth_transfer.run.conclusion == 'success'
+          and truewealth_transfer.run.workflowPath == '.github/workflows/release.yml'
+          and truewealth_transfer.run.headSha == truewealth_commit
+          and truewealth_transfer.platform == 'linux/amd64'
+          and truewealth_transfer.artifact.digest is match('^sha256:[0-9a-f]{64}$'))
+    fail_msg: >-
+      The transfer bundle is not from the approved run as native CI evidence:
+      schema {{ truewealth_transfer.schema | default('?') }}, evidence
+      {{ truewealth_transfer.evidenceClass | default('?') }} (accepted:
+      {{ truewealth_accept_evidence_classes }}), run
+      {{ truewealth_transfer.run.id | default('?') }}/{{ truewealth_transfer.run.attempt | default('?') }}
+      (approved {{ truewealth_run_id }}/{{ truewealth_run_attempt }}), verified with
+      {{ truewealth_transfer.run.verifiedWith | default('?') }}, platform
+      {{ truewealth_transfer.platform | default('?') }}. Run fetch-verify.mjs for the approved run.
+    quiet: true
+
+- name: Hash the evidence the bundle was verified against
+  ansible.builtin.stat:
+    path: "{{ truewealth_transfer_dir }}/{{ truewealth_transfer.evidenceFile | default('evidence.json') }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: truewealth_evidence_stat
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+  check_mode: false
+
+- name: The evidence must be the one fetch-verify checked
+  ansible.builtin.assert:
+    that:
+      - truewealth_evidence_stat.stat.exists | default(false)
+      - ('sha256:' ~ truewealth_evidence_stat.stat.checksum | default('')) == truewealth_transfer.evidenceSha256
+    fail_msg: The evidence file in the transfer directory is missing or changed since verification.
+    quiet: true
+
 - name: The bundle must be for exactly this commit, platform and set of roles
   ansible.builtin.assert:
     that:
-      - truewealth_transfer.schema == 'truewealth-transfer/1'
       - truewealth_transfer.commit == truewealth_commit
       - truewealth_transfer.platform == truewealth_platform
       - (truewealth_transfer.images | map(attribute='role') | sort) == (truewealth_image_roles | sort)

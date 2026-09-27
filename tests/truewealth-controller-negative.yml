@@ -10,6 +10,8 @@
         truewealth_commit: "{{ case.commit }}"
         truewealth_transfer_dir: "{{ case.dir }}"
         truewealth_source_repo: "{{ fixture_repo }}"
+        truewealth_run_id: "4242"
+        truewealth_run_attempt: "1"
     - name: It should not get here
       ansible.builtin.fail:
         msg: "MISSED: {{ case.name }} was accepted"

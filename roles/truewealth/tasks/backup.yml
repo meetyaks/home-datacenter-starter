@@ -1,36 +1,7 @@
 ---
-# The DR backup: scripts, a oneshot service and a daily timer. The first run
+# The DR backup timer: a oneshot service and a daily timer (the scripts are
+# installed by tasks/scripts.yml, before the deployment needs them). The first run
 # happens on the timer, or on demand with `systemctl start truewealth-backup`.
-
-- name: Install age when backups are encrypted for off-host transfer
-  ansible.builtin.apt:
-    name: age
-    state: present
-    update_cache: false
-  when: truewealth_backup_age_recipients | length > 0
-
-- name: Off-host transfer needs recipients to encrypt to
-  ansible.builtin.assert:
-    that:
-      - truewealth_backup_offhost_target == '' or truewealth_backup_age_recipients | length > 0
-      - truewealth_backup_offhost_target == '' or truewealth_backup_offhost_ssh_key != ''
-    fail_msg: >-
-      truewealth_backup_offhost_target is set, but backups can only leave the
-      host encrypted: set truewealth_backup_age_recipients (public keys) and
-      truewealth_backup_offhost_ssh_key.
-    quiet: true
-
-- name: Install the backup and restore-verification scripts
-  ansible.builtin.template:
-    src: "{{ item.src }}"
-    dest: "/usr/local/sbin/{{ item.dest }}"
-    owner: root
-    group: root
-    mode: "0700"
-    validate: /bin/bash -n %s
-  loop:
-    - { src: truewealth-backup.sh.j2, dest: truewealth-backup }
-    - { src: truewealth-restore-verify.sh.j2, dest: truewealth-restore-verify }
 
 - name: Install the backup service and timer
   ansible.builtin.copy:
@@ -50,7 +21,7 @@
 
         [Service]
         Type=oneshot
-        ExecStart=/usr/local/sbin/truewealth-backup
+        ExecStart={{ truewealth_sbin_dir }}/truewealth-backup --reason scheduled
         Nice=10
         IOSchedulingClass=idle
     - name: truewealth-backup.timer

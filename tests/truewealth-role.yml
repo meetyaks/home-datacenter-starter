@@ -46,12 +46,13 @@
         - { src: truewealth.caddy.j2, dest: truewealth.caddy }
         - { src: truewealth-backup.sh.j2, dest: truewealth-backup.sh }
         - { src: truewealth-restore-verify.sh.j2, dest: truewealth-restore-verify.sh }
+        - { src: truewealth-diagnose.sh.j2, dest: truewealth-diagnose.sh }
       loop_control:
         label: "{{ item.dest }}"
     - name: Shell templates are valid bash
       ansible.builtin.command:
         argv: [bash, -n, "{{ render_dir }}/{{ item }}"]
-      loop: [truewealth-backup.sh, truewealth-restore-verify.sh]
+      loop: [truewealth-backup.sh, truewealth-restore-verify.sh, truewealth-diagnose.sh]
       changed_when: false
 
 - name: Render the canonical Caddyfile and Keel's drop-in beside ours
@@ -93,6 +94,8 @@
   gather_facts: false
   become: false
   vars:
+    truewealth_run_id: "4242"
+    truewealth_run_attempt: "1"
     base:
       truewealth_commit: "{{ fixture_commit }}"
       truewealth_transfer_dir: "{{ fixture_transfer_dir }}"
@@ -106,6 +109,10 @@
         truewealth_commit: "{{ base.truewealth_commit }}"
         truewealth_transfer_dir: "{{ base.truewealth_transfer_dir }}"
         truewealth_source_repo: "{{ base.truewealth_source_repo }}"
+        # Include parameters: an earlier play's include_vars of the role
+        # defaults persists as a host fact and would outrank play vars.
+        truewealth_run_id: "4242"
+        truewealth_run_attempt: "1"
 
     - name: It produced the image index
       ansible.builtin.assert:
@@ -123,6 +130,15 @@
         - { name: foreign platform, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-arm64" }
         - { name: malformed tag, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-badtag" }
         - { name: compose with a build, commit: "{{ fixture_bad_commit }}", dir: "{{ fixture_transfer_dir }}-badcommit" }
+        - { name: dev-local evidence, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-devlocal" }
+        - { name: another run, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-otherrun" }
+        - { name: another attempt, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-otherattempt" }
+        - { name: not verified against the GitHub API, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-unverified" }
+        - { name: another workflow, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-otherworkflow" }
+        - { name: run at another head, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-otherhead" }
+        - { name: failed run, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-failedrun" }
+        - { name: old transfer schema, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-schema1" }
+        - { name: evidence changed after verification, commit: "{{ fixture_commit }}", dir: "{{ fixture_transfer_dir }}-evidence-changed" }
       loop_control:
         loop_var: case
         label: "{{ case.name }}"

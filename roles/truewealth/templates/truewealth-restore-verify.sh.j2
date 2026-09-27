@@ -4,63 +4,130 @@
 # Restore a TrueWealth backup into an ISOLATED, disposable PostgreSQL and
 # verify it — without touching production.
 #
-#   truewealth-restore-verify <backup dir>
+#   truewealth-restore-verify [options] <backup dir>
+#     --identity FILE        age identity (private key) for an ENCRYPTED copy
+#                            (a directory with db.dump.age + manifest.json,
+#                            e.g. an off-host copy); root-only, never on the
+#                            production host except for the drill
+#     --key-file FILE        KEY=value lines (TW_KEY_SECRET, optional
+#                            TW_SECRET_KEY) for the key check; root-only.
+#                            Default: the deployed env file.
+#     --no-key-check         skip the key check (reported as UNPROVEN)
+#     --check-email EMAIL    also verify a KNOWN account's password against
+#                            its restored hash; the password is read from
+#                            --check-password-file FILE (root-only) or a
+#                            hidden prompt
 #
-# - The dump must hash to the manifest's digest.
-# - It is restored into a throwaway container (no network, same PostgreSQL
-#   image as production, a random one-time password, labelled and removed on
-#   exit — success, failure or interrupt).
-# - Checks: migration count and representative counts equal the manifest;
-#   no orphaned rows along the financial relationships (members, accounts,
-#   balances, assets, valuations, positions, snapshots); sign-in material is
-#   present (scrypt password hashes).
-# Exit 0 only when every check passes. Nothing here restores over live data:
-# a production restore is a separate, approved procedure (docs/truewealth.md).
+# Exit: 0 all checks pass; 1 a data/integrity check failed; 2 usage or input
+# problem; 3 the key held does not match the backup (fingerprint) or decrypts
+# none of its values; 4 an off-host copy is incomplete; 5 encrypted values
+# only partly decrypt; 6 the password check failed; 7 key check skipped or
+# nothing encrypted to test (unproven).
+#
+# Secrets never become process arguments: the throwaway database password and
+# the verifier's database password go through `docker run --env-file` (a 0600
+# file in a private temp directory, removed on exit); keys go to the verifier
+# on stdin. Output carries counts and fingerprints only.
 set -euo pipefail
 umask 077
 
-DIR="${1:?usage: truewealth-restore-verify <backup directory>}"
-MANIFEST="$DIR/manifest.json"
-DUMP="$DIR/db.dump"
+ENV_FILE='{{ truewealth_env_file }}'
+DEPLOYMENT='{{ truewealth_deployment_manifest }}'
 PG_CONTAINER="${TW_RESTORE_SOURCE_CONTAINER:-{{ truewealth_project }}-postgres-1}"
-[ -r "$MANIFEST" ] && [ -r "$DUMP" ] || { echo "restore-verify: $DIR has no manifest.json/db.dump" >&2; exit 2; }
+IDENTITY="" KEY_FILE="" KEY_CHECK=1 CHECK_EMAIL="" CHECK_PW_FILE=""
+while [ $# -gt 1 ]; do
+  case "$1" in
+    --identity) IDENTITY="$2"; shift 2 ;;
+    --key-file) KEY_FILE="$2"; shift 2 ;;
+    --no-key-check) KEY_CHECK=0; shift ;;
+    --check-email) CHECK_EMAIL="$2"; shift 2 ;;
+    --check-password-file) CHECK_PW_FILE="$2"; shift 2 ;;
+    *) echo "restore-verify: unknown option $1" >&2; exit 2 ;;
+  esac
+done
+DIR="${1:?usage: truewealth-restore-verify [options] <backup directory>}"
+MANIFEST="$DIR/manifest.json"
+[ -r "$MANIFEST" ] || { echo "restore-verify: $DIR has no manifest.json" >&2; exit 2; }
 
-jget() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1]));
-for k in sys.argv[2].split("."): d=d[k]
-print(d)' "$MANIFEST" "$1"; }
+private_file() { # a file holding secret material must be ours alone
+  local p
+  p="$(stat -c '%u %a' "$1" 2>/dev/null)" || { echo "restore-verify: $1 is not readable" >&2; exit 2; }
+  case "$p" in "$(id -u) 600"|"$(id -u) 400") ;; *) echo "restore-verify: $1 must be owned by $(id -un) with mode 0600/0400 (is: $p)" >&2; exit 2 ;; esac
+}
+
+jget() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."):
+    d = d.get(k) if isinstance(d, dict) else None
+print("" if d is None else d)' "$MANIFEST" "$1"; }
+
+T="$(mktemp -d)"
+name="twrestore-verify-$(date +%s)-$$"
+cleanup() { docker rm -f -v "$name" >/dev/null 2>&1 || true; rm -rf "$T"; }
+trap cleanup EXIT INT TERM
+fail=0
+check() { # label expected actual
+  if [ "$2" = "$3" ]; then echo "  ok    $1 ($3)"; else echo "  FAIL  $1: expected $2, got $3"; fail=1; fi
+}
+
+# ── 1. The dump: plaintext on the host, or an encrypted (off-host) copy ─────
+if [ -f "$DIR/db.dump" ]; then
+  DUMP="$DIR/db.dump"
+elif [ -f "$DIR/db.dump.age" ]; then
+  [ -n "$IDENTITY" ] || { echo "restore-verify: $DIR holds only an encrypted copy; pass --identity" >&2; exit 2; }
+  private_file "$IDENTITY"
+  # Off-host copies are written dump → manifest → COMPLETE (last). Without the
+  # marker the copy may be partial, whatever its files look like.
+  [ -f "$DIR/COMPLETE" ] || { echo "restore-verify: FAIL $DIR has no COMPLETE marker: an interrupted or partial copy" >&2; exit 4; }
+  want_enc="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["db.dump.age"])' "$DIR/COMPLETE" 2>/dev/null || true)"
+  have_enc="$(sha256sum "$DIR/db.dump.age" | cut -d' ' -f1)"
+  [ -n "$want_enc" ] && [ "$want_enc" = "$have_enc" ] || { echo "restore-verify: FAIL the encrypted copy does not match its COMPLETE record" >&2; exit 4; }
+  [ "$(jget encryptedCopy.sha256)" = "$have_enc" ] || { echo "restore-verify: FAIL the encrypted copy does not match the manifest" >&2; exit 1; }
+  echo "restore-verify: encrypted copy complete and matches the manifest"
+  age --decrypt -i "$IDENTITY" -o "$T/db.dump" "$DIR/db.dump.age" 2> "$T/age.err" \
+    || { echo "restore-verify: FAIL cannot decrypt with this identity ($(head -c 200 "$T/age.err"))" >&2; exit 3; }
+  DUMP="$T/db.dump"
+  echo "restore-verify: decrypted with the separately held identity"
+else
+  echo "restore-verify: $DIR has neither db.dump nor db.dump.age" >&2; exit 2
+fi
 
 want_sha="$(jget database.sha256)"
 have_sha="$(sha256sum "$DUMP" | cut -d' ' -f1)"
 [ "$want_sha" = "$have_sha" ] || { echo "restore-verify: FAIL dump sha256 $have_sha != manifest $want_sha" >&2; exit 1; }
 echo "restore-verify: dump digest matches the manifest"
 
-image="${TW_RESTORE_IMAGE:-$(docker inspect --format '{{ '{{' }}.Config.Image{{ '}}' }}' "$PG_CONTAINER")}"
-name="twrestore-verify-$(date +%s)-$$"
+# ── 2. Restore into a throwaway PostgreSQL with no network ─────────────────
+image="${TW_RESTORE_IMAGE:-$(docker inspect --format '{{ '{{' }}.Config.Image{{ '}}' }}' "$PG_CONTAINER" 2>/dev/null || true)}"
+[ -n "$image" ] || { echo "restore-verify: no PostgreSQL image (set TW_RESTORE_IMAGE)" >&2; exit 2; }
 pw="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-cleanup() { docker rm -f -v "$name" >/dev/null 2>&1 || true; }
-trap cleanup EXIT INT TERM
-
-docker run -d --name "$name" --label io.truewealth.task=restore-verify --network none \
-  -e POSTGRES_USER=truewealth -e POSTGRES_DB=truewealth -e POSTGRES_PASSWORD="$pw" "$image" >/dev/null
+printf 'POSTGRES_USER=truewealth\nPOSTGRES_DB=truewealth\nPOSTGRES_PASSWORD=%s\n' "$pw" > "$T/pg.env"
+printf 'TW_DB_HOST=127.0.0.1\nTW_DB_PORT=5432\nTW_DB_USER=truewealth\nTW_DB_NAME=truewealth\nTW_DB_PASSWORD=%s\n' "$pw" > "$T/verifier.env"
 unset pw
+docker run -d --name "$name" --label io.truewealth.task=restore-verify --network none --env-file "$T/pg.env" "$image" >/dev/null
+rm -f "$T/pg.env"
 for _ in $(seq 1 60); do
   docker exec "$name" pg_isready -U truewealth -d truewealth >/dev/null 2>&1 && break
   sleep 1
 done
 docker exec "$name" pg_isready -U truewealth -d truewealth >/dev/null
-
 docker exec -i "$name" pg_restore -U truewealth -d truewealth --no-owner --no-privileges --exit-on-error < "$DUMP"
 echo "restore-verify: restored into isolated container $name ($image)"
 
 q() { docker exec "$name" psql -U truewealth -d truewealth -AtX -v ON_ERROR_STOP=1 -c "$1"; }
-fail=0
-check() { # label expected actual
-  if [ "$2" = "$3" ]; then echo "  ok    $1 ($3)"; else echo "  FAIL  $1: expected $2, got $3"; fail=1; fi
-}
 
-check "applied migrations" "$(jget schemaState.appliedMigrations)" "$(q 'SELECT count(*) FROM public._tw_migrations')"
-check "users"              "$(jget counts.users)"                  "$(q 'SELECT count(*) FROM core.users')"
-check "households"         "$(jget counts.households)"             "$(q 'SELECT count(*) FROM core.households')"
+# ── 3. Schema and counts: the manifest read them in the dump's own snapshot ─
+check "applied migrations" "$(jget snapshot.appliedMigrations)" "$(q 'SELECT count(*) FROM public._tw_migrations')"
+check "last migration"     "$(jget snapshot.lastMigration)"     "$(q 'SELECT max(name) FROM public._tw_migrations')"
+check "users"              "$(jget snapshot.users)"             "$(q 'SELECT count(*) FROM core.users')"
+check "households"         "$(jget snapshot.households)"        "$(q 'SELECT count(*) FROM core.households')"
+
+# Representative application tables, counted in the same snapshot as the
+# dump (manifests from before truewealth-backup/2 do not have them).
+for t in $(python3 -c 'import json,sys; print(" ".join(sorted((json.load(open(sys.argv[1])).get("snapshot") or {}).get("representative") or {})))' "$MANIFEST"); do
+  case "$t" in *[!a-z_.]*) echo "  FAIL  unexpected table name in the manifest"; fail=1; continue ;; esac
+  want="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshot"]["representative"][sys.argv[2]])' "$MANIFEST" "$t")"
+  check "rows in $t" "$want" "$(q "SELECT count(*) FROM $t")"
+done
 
 orphans() { check "no orphaned $1" 0 "$(q "$2")"; }
 orphans "household members"  "SELECT count(*) FROM core.household_members m LEFT JOIN core.users u ON u.id=m.user_id LEFT JOIN core.households h ON h.id=m.household_id WHERE u.id IS NULL OR h.id IS NULL"
@@ -71,13 +138,68 @@ orphans "asset valuations"   "SELECT count(*) FROM wealth.asset_valuations v LEF
 orphans "positions"          "SELECT count(*) FROM wealth.positions p LEFT JOIN wealth.accounts a ON a.id=p.account_id LEFT JOIN wealth.securities s ON s.id=p.security_id WHERE a.id IS NULL OR s.id IS NULL"
 orphans "snapshot items"     "SELECT count(*) FROM wealth.snapshot_items i LEFT JOIN wealth.snapshots s ON s.id=i.snapshot_id WHERE s.id IS NULL"
 
+# Presence and shape only. A well-formed hash is NOT proof that anyone can
+# sign in; the key check below can verify one known account's password.
 users_total="$(q 'SELECT count(*) FROM core.users')"
 with_hash="$(q "SELECT count(*) FROM core.users WHERE password_hash LIKE 'scrypt\$%'")"
-if [ "$users_total" -gt 0 ] && [ "$with_hash" -gt 0 ]; then
-  echo "  ok    sign-in material present ($with_hash of $users_total users have scrypt password hashes)"
-else
-  echo "  FAIL  no user can sign in (password hashes: $with_hash of $users_total)"; fail=1
-fi
+echo "  info  password hashes: $with_hash of $users_total users have a well-formed scrypt hash (presence only, not proof of sign-in)"
 
-if [ "$fail" -ne 0 ]; then echo "restore-verify: FAILED" >&2; exit 1; fi
-echo "restore-verify: PASSED — $DIR restores cleanly and is internally consistent"
+# ── 4. Keys: the right secret, and the application can decrypt with it ─────
+kc=0
+if [ "$KEY_CHECK" -eq 1 ]; then
+  src="${KEY_FILE:-$ENV_FILE}"
+  private_file "$src"
+  key="$(sed -n 's/^TW_KEY_SECRET=//p' "$src" | head -1)"
+  llm="$(sed -n 's/^TW_SECRET_KEY=//p' "$src" | head -1)"
+  fp="$(printf '%s' "tw-key:$key" | sha256sum | cut -c1-16)"
+  want_fp="$(jget keys.TW_KEY_SECRET.fingerprint)"
+  if [ -z "$key" ]; then
+    echo "  FAIL  no TW_KEY_SECRET in $src"; kc=3
+  elif [ "$fp" != "$want_fp" ]; then
+    echo "  FAIL  the TW_KEY_SECRET held does not match this backup (fingerprint $fp, backup $want_fp)"; kc=3
+  else
+    echo "  ok    TW_KEY_SECRET fingerprint matches the backup ($fp)"
+    app_image="${TW_RESTORE_APP_IMAGE:-}"
+    if [ -z "$app_image" ] && [ -r "$DEPLOYMENT" ]; then
+      app_image="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["loadedIds"]["migrator"])' "$DEPLOYMENT" 2>/dev/null || true)"
+    fi
+    if [ -z "$app_image" ]; then
+      echo "  FAIL  no application image to run the decryption check (set TW_RESTORE_APP_IMAGE)"; kc=7
+    else
+      {
+        printf 'TW_KEY_SECRET=%s\n' "$key"
+        [ -n "$llm" ] && printf 'TW_SECRET_KEY=%s\n' "$llm"
+        if [ -n "$CHECK_EMAIL" ]; then
+          if [ -n "$CHECK_PW_FILE" ]; then private_file "$CHECK_PW_FILE"; cpw="$(head -1 "$CHECK_PW_FILE")"
+          else read -rsp "Password for $CHECK_EMAIL (hidden): " cpw </dev/tty; echo >&2; fi
+          printf 'CHECK_EMAIL=%s\nCHECK_PASSWORD=%s\n' "$CHECK_EMAIL" "$cpw"
+          unset cpw
+        fi
+      } > "$T/keys"
+      unset key llm
+      set +e
+      out="$(docker run --rm -i --network "container:$name" --env-file "$T/verifier.env" \
+               --label io.truewealth.task=restore-verify "$app_image" node dist/ops/verify-restore.mjs < "$T/keys" 2>&1)"
+      rc=$?
+      set -e
+      rm -f "$T/keys"
+      summary="$(printf '%s\n' "$out" | grep '^{"schema":"truewealth-verify-restore/1"' | tail -1)"
+      echo "  key   application check: ${summary:-no summary (exit $rc)}"
+      case "$rc" in
+        0) echo "  ok    every encrypted value decrypts with the held keys" ;;
+        3) echo "  FAIL  the held key decrypts none of the encrypted values"; kc=3 ;;
+        5) echo "  FAIL  encrypted values only partly decrypt (mixed keys or corruption)"; kc=5 ;;
+        6) echo "  FAIL  the known account's password did not verify"; kc=6 ;;
+        7) echo "  UNPROVEN nothing encrypted to test in this backup"; kc=7 ;;
+        *) echo "  FAIL  the decryption check could not run (exit $rc)"; kc=2 ;;
+      esac
+    fi
+  fi
+else
+  echo "  UNPROVEN key check skipped (--no-key-check)"; kc=7
+fi
+rm -f "$T/verifier.env"
+
+if [ "$fail" -ne 0 ]; then echo "restore-verify: FAILED (data/integrity)" >&2; exit 1; fi
+if [ "$kc" -ne 0 ]; then echo "restore-verify: NOT PROVEN — data checks passed, key check exit $kc" >&2; exit "$kc"; fi
+echo "restore-verify: PASSED — $DIR restores cleanly, is internally consistent, and its encrypted fields decrypt with the held keys"

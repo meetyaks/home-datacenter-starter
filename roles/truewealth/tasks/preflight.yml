@@ -11,19 +11,20 @@
       roles/caddy has not run in this play. playbooks/truewealth.yml includes it
       first; do not run this role on its own.
     quiet: true
+  when: truewealth_manage_ingress | bool
 
 - name: The host must be x86-64 (the images are linux/amd64)
   ansible.builtin.assert:
     that:
-      - ansible_architecture == 'x86_64'
+      - ansible_architecture == truewealth_expected_architecture
     fail_msg: "{{ inventory_hostname }} is {{ ansible_architecture }}; the verified images are {{ truewealth_platform }}."
     quiet: true
 
 - name: /srv/data must be its own mounted filesystem
   ansible.builtin.assert:
     that:
-      - ansible_mounts | selectattr('mount', 'equalto', '/srv/data') | list | length == 1
-    fail_msg: /srv/data is not a mount point; persistent data would land on the root filesystem.
+      - ansible_mounts | selectattr('mount', 'equalto', truewealth_data_mount) | list | length == 1
+    fail_msg: "{{ truewealth_data_mount }} is not a mount point; persistent data would land on the root filesystem."
     quiet: true
 
 - name: Read the Docker and Compose versions
@@ -56,7 +57,7 @@
 - name: Which containers of our project already run
   ansible.builtin.command:
     argv: [docker, ps, --filter, "label=com.docker.compose.project={{ truewealth_project }}", --format, "{{ '{{' }}.Names{{ '}}' }}"]
-  register: truewealth_running
+  register: truewealth_project_containers
   changed_when: false
   failed_when: false
   check_mode: false
@@ -64,7 +65,7 @@
 - name: The web port must be free or already ours
   ansible.builtin.assert:
     that:
-      - truewealth_port_holders.stdout | trim == '' or (truewealth_running.stdout | trim) != ''
+      - truewealth_port_holders.stdout | trim == '' or (truewealth_project_containers.stdout | trim) != ''
       - truewealth_port_holders.stdout is not search('0\.0\.0\.0:' ~ truewealth_web_loopback_port)
     fail_msg: >-
       127.0.0.1:{{ truewealth_web_loopback_port }} is held by something that is
@@ -82,12 +83,14 @@
   # The Redis password file is group-readable by this GID (the containers'
   # gid). If a host group already uses it for something else, its members
   # could read the secret.
-  # getent keys its result by the group NAME even when asked by GID.
+  # getent keys its result by the group NAME even when asked by GID, and
+  # reports an ABSENT key as {"<gid>": null} (fail_key: false) — which is
+  # the free case, not a clash.
   ansible.builtin.assert:
     that:
-      - (ansible_facts.getent_group | default({}) | list) in [[], [truewealth_runtime_group]]
+      - (ansible_facts.getent_group | default({}) | dict2items | rejectattr('value', 'none') | map(attribute='key') | list) in [[], [truewealth_runtime_group]]
     fail_msg: >-
       GID {{ truewealth_runtime_gid }} already belongs to group(s)
-      {{ ansible_facts.getent_group | default({}) | list }}.
+      {{ ansible_facts.getent_group | default({}) | dict2items | rejectattr('value', 'none') | map(attribute='key') | list }}.
       Refusing to make a secret readable by it.
     quiet: true

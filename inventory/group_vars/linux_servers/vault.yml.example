@@ -78,3 +78,7 @@ truewealth_vault_redis_password: ""
 # truewealth_vault_smtp_pass: ""
 # truewealth_vault_smtp_from: ""
 # truewealth_vault_audit_signing_secret: ""
+# TW_SECRET_KEY encrypts stored LLM provider API keys (ai.providers). Without
+# it the application refuses to store them; once set, a restore needs the SAME
+# value (fingerprint in the backup manifest). Back it up with TW_KEY_SECRET.
+# truewealth_vault_secret_key: ""

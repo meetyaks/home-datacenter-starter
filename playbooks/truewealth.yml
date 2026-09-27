@@ -4,13 +4,20 @@
 # (dc1-arm-1), which holds the vault and the verified transfer bundle.
 #
 #   check    ansible-playbook playbooks/truewealth.yml --check --diff --ask-become-pass \
-#              -e truewealth_commit=<sha> -e truewealth_transfer_dir=<dir>
-#   deploy   ansible-playbook playbooks/truewealth.yml --ask-become-pass \
-#              -e truewealth_commit=<sha> -e truewealth_transfer_dir=<dir>
+#              -e truewealth_commit=<sha> -e truewealth_transfer_dir=<dir> \
+#              -e truewealth_run_id=<id> -e truewealth_run_attempt=<n>
+#   deploy   (the same, without --check --diff)
 #   backup   ansible-playbook playbooks/truewealth.yml --tags backup-now ...
 #
 # <dir> is the output of scripts/release/fetch-verify.mjs (TrueWealth
-# repository) for the approved commit and CI run.
+# repository) for the approved commit and CI run; the role refuses a bundle
+# from any other run/attempt, and anything but native linux/amd64 CI
+# evidence. None of these arguments is a secret; secrets come only from the
+# vault (never -e).
+#
+# A re-run of the same deployment is a no-op: it converges and verifies and
+# writes no record. A changed deployment writes DEPLOYMENT_ATTEMPT.json when
+# it starts and DEPLOYMENT_MANIFEST.json only after every verification.
 #
 # ⚠️ NOT in site.yml, and never runs host bootstrap roles (docker, common,
 # storage): a TrueWealth deploy must not restart Docker or change Keel. The
