@@ -530,7 +530,8 @@ else
   # own ssh invocation — which meant the suite could only run from a controller
   # whose ssh config happened to match. CI_RUNNER_HOST overrides the address for
   # a controller that cannot resolve the inventory name.
-  vm=$(awk '/^ci_vm_name:/{print $2; exit}' "$ROLE/defaults/main.yml")
+  # CI_RUNNER_VM selects another instance of the role (e.g. dc1-ci-tw-1).
+  vm="${CI_RUNNER_VM:-$(awk '/^ci_vm_name:/{print $2; exit}' "$ROLE/defaults/main.yml")}"
   AOPT=(-i inventory/hosts.yml linux_servers -b)
   [ -n "${CI_RUNNER_HOST:-}" ] && AOPT+=(-e "ansible_host=${CI_RUNNER_HOST}")
 
