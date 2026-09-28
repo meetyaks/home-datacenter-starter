@@ -459,5 +459,11 @@ missing.
 
 `tests/run-ci-runner-truewealth.sh` §12 loads both rendered policies and both
 appliers together in network namespaces (both orders, re-application) and
-checks exactly these invariants with real packets; the snapshot above is
-how the same invariants are observed on the live host.
+checks exactly these invariants with real packets. What it proves is limited
+to the policies **rendered from the tested revision** against a **simulated**
+host: Docker's and Tailscale's chains are stand-ins (no dockerd, tailscaled
+or LXD runs), so their own later rule rewrites are not exercised. It does
+**not** prove what dc1-x86 is running: that Keel's policy renders the same
+at an earlier revision says nothing about the files, tables or rules actually
+loaded there. Live equality is established only by the before/after
+snapshots above, taken on the host.
