@@ -87,6 +87,120 @@ ci_egress_denied_cidrs:
   - 169.254.0.0/16     # link-local, incl. cloud metadata conventions
 ci_egress_allowed_ports: [80, 443]
 
+# ── Host-side names, one set per runner instance ───────────────────────────
+#
+# Every host object the egress stage creates is named here so that a SECOND,
+# independent runner VM on the same host (its own pool, bridge and subnet) gets
+# its own table, policy file, applier and unit instead of overwriting the
+# first one's. The defaults are the names the first instance was built with,
+# so an instance that does not override them renders exactly as before.
+ci_egress_table: ci_egress
+ci_egress_policy_file: /etc/nftables.d/ci-egress.nft
+ci_egress_applier: /usr/local/sbin/ci-egress-apply
+ci_egress_unit: ci-egress
+
+# ⚠️ OPT-IN, AND ON FOR EVERY INSTANCE THAT SHARES A HOST WITH ANOTHER CI VM.
+# With a sibling bridge on the same host, two gaps open that a single instance
+# never had: the sibling VM can open connections INTO this bridge (the host
+# forwards between its own bridges), and this VM can ask the sibling bridge's
+# resolver on the host for names. When true, the policy drops every NEW
+# connection forwarded into this bridge, and accepts DNS only when it is
+# addressed to this bridge's own gateway. Off by default so an existing
+# instance's rendered policy is unchanged.
+ci_egress_sibling_isolation: false
+ci_lxd_gateway: "{{ ci_lxd_subnet | regex_replace('/.*$', '') }}"
+
+# ⚠️ OPT-IN HARDENING, OFF BY DEFAULT ONLY SO AN EXISTING INSTANCE'S RENDERED
+# POLICY AND UNITS STAY BYTE-IDENTICAL. Enabling it for dc1-ci-1 as well is
+# recommended; it is a separate, reviewed change to that runner. When true:
+#
+#   - EVERY packet from the CI bridge is judged by the interface it arrived on,
+#     not by its source address. The default rules match `ip saddr <subnet>`;
+#     a guest that sends from a spoofed source matches none of them and falls
+#     through to the chains' `accept` policy (forwarded to the LAN one-way, or
+#     delivered to host services).
+#   - IPv6 from or into the bridge is dropped outright. The bridge is created
+#     with ipv6.address=none, but the IPv4-only rules would pass any IPv6 that
+#     appeared later (a hand-edited bridge, a link-local address) untouched.
+#   - A pre-existing bridge must have exactly the configuration this role
+#     creates (no IPv6, NAT, this subnet); it is never silently adopted.
+#   - The nftables policy is also loaded by an early unit ordered BEFORE LXD,
+#     so an autostarted VM never runs before the host policy exists, and
+#     stopping Docker no longer deletes the policy (the default unit's
+#     ExecStop removes the table, and `PartOf=docker.service` stops the unit
+#     whenever Docker stops, leaving host services open to the VM for as long
+#     as Docker is down).
+ci_isolation_hardening: false
+# The unit names LXD may run under (snap or deb); ordering against a unit that
+# does not exist is a no-op, so both are listed.
+ci_lxd_service_units: [snap.lxd.daemon.service, lxd.service, lxd.socket]
+
+# ── Other runner instances on the same hypervisor ──────────────────────────
+#
+# Preflight refuses to touch LXD if it holds an instance this role did not
+# create. With more than one runner VM on a host, each instance's run has to
+# recognise the others as siblings rather than strangers:
+#   - instances named here are siblings (for VMs built before the marker below
+#     existed — nothing is written to them to make them recognisable);
+#   - any instance carrying `ci_lxd_owner_key` = "true" is a sibling. New
+#     instances opt in by listing the key in their own `ci_vm_settings`.
+# Anything else is a stranger, and preflight still stops.
+ci_lxd_sibling_instances: []
+ci_lxd_owner_key: user.home-datacenter.ci-runner
+
+# `lxc list --format json`, parsed by preflight. Evaluated lazily so the
+# stranger computation below is testable without a hypervisor.
+ci_lxd_instances_json: "[]"
+ci_lxd_foreign_instances: >-
+  {%- set out = [] -%}
+  {%- for i in (ci_lxd_instances_json | default('[]', true) | from_json) -%}
+  {%-   if i.name != ci_vm_name
+          and i.name not in ci_lxd_sibling_instances
+          and ((i.config | default({})).get(ci_lxd_owner_key) | default('') | string) != 'true' -%}
+  {%-     set _ = out.append(i.name) -%}
+  {%-   endif -%}
+  {%- endfor -%}
+  {{ out }}
+
+# ── Host capacity, accounted for before a VM is added (opt-in) ─────────────
+#
+# ⚠️ AN LXD VM'S MEMORY IS ALLOCATED AT BOOT, so a second CI VM is felt by
+# production, not by CI. When enabled, preflight reads the LIVE host — total
+# memory and vCPUs, and the limits of every OTHER instance already defined —
+# and refuses to proceed unless this instance fits with the reserves below
+# left for the host and production. It never trusts a number written here
+# about what the host has. Off by default, so an existing instance's run is
+# unchanged.
+ci_capacity_check: false
+ci_capacity_reserve_memory_mib: 6144
+ci_capacity_reserve_cpu: 4
+# Extents the volume group must still have free AFTER this instance's volume.
+ci_vg_reserve_g: 0
+
+# `limits.memory` → MiB. Accepts <n>MiB|MB|GiB|GB; anything else (a
+# percentage, no limit at all) yields -1, which the capacity check treats as
+# "cannot account for this instance" and refuses.
+ci_capacity_instances: >-
+  {%- set out = [] -%}
+  {%- for i in (ci_lxd_instances_json | default('[]', true) | from_json) -%}
+  {%-   if i.name != ci_vm_name -%}
+  {%-     set cfg = i.config | default({}) -%}
+  {%-     set m = cfg.get('limits.memory', '') | string -%}
+  {%-     set mm = m | regex_search('^([0-9]+) ?(MiB|MB|GiB|GB)$', '\\1', '\\2') -%}
+  {%-     set mib = -1 if not mm else ((mm[0] | int) * 1024 if mm[1] in ['GiB', 'GB'] else (mm[0] | int)) -%}
+  {%-     set cpu = cfg.get('limits.cpu', '') | string -%}
+  {%-     set _ = out.append({'name': i.name, 'memory_mib': mib, 'cpu': (cpu | int if cpu is match('^[0-9]+$') else -1)}) -%}
+  {%-   endif -%}
+  {%- endfor -%}
+  {{ out }}
+ci_vm_memory_mib: >-
+  {%- set mm = (ci_vm_memory | string) | regex_search('^([0-9]+) ?(MiB|MB|GiB|GB)$', '\\1', '\\2') -%}
+  {{ -1 if not mm else ((mm[0] | int) * 1024 if mm[1] in ['GiB', 'GB'] else (mm[0] | int)) }}
+
+# How the operator invokes this instance's playbook, for the messages the role
+# prints. Nothing is executed from it.
+ci_runner_playbook: playbooks/ci-runner.yml
+
 # ── The runner service account ──────────────────────────────────────────────
 #
 # Unprivileged, and NOT in the guest's sudo group. It is in `docker` because the
@@ -157,8 +271,9 @@ ci_runner_sha256: "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816
 # ── Registration ───────────────────────────────────────────────────────────
 #
 # ⚠️ NEVER COMMITTED, NEVER PRINTED, NEVER DEFAULTED. The registration token is
-# single-use and short-lived; it is supplied on the command line for one run and
-# the only task that touches it is `no_log`.
+# single-use and short-lived; it is supplied through the controller environment
+# (CI_RUNNER_TOKEN, set with `read -rs`) or a hidden prompt, never on the command
+# line — see tasks/token-input.yml for where it travels.
 #
 # ⚠️ EPHEMERAL IS OFF, AND THAT IS A DELIBERATE REVERSAL OF THE OBVIOUS ANSWER.
 #

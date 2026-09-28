@@ -1,0 +1,82 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# TrueWealth's self-hosted CI runner: dc1-ci-tw-1, a second, independent VM on
+# dc1-x86 built by the same roles/ci_runner as Keel's dc1-ci-1.
+#
+#   check       ansible-playbook playbooks/ci-runner-truewealth.yml --check --diff \
+#                 --ask-become-pass -e ci_tw_host_lan_ip=<dc1-x86 LAN IPv4>
+#   provision   ansible-playbook playbooks/ci-runner-truewealth.yml \
+#                 --ask-become-pass -e ci_tw_host_lan_ip=<dc1-x86 LAN IPv4>
+#   register    ansible-playbook playbooks/ci-runner-truewealth.yml --tags register \
+#                 --ask-become-pass -e ci_tw_host_lan_ip=<…>
+#               (token: `read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN` first,
+#               or leave it unset to be prompted; never -e — see tasks/token-input.yml)
+#   remove      ansible-playbook playbooks/ci-runner-truewealth.yml --tags unregister \
+#                 --ask-become-pass -e ci_tw_host_lan_ip=<…>
+#               (token: CI_RUNNER_REMOVAL_TOKEN exported the same way, or the prompt)
+#   rebuild     ansible-playbook playbooks/ci-runner-truewealth.yml --tags rebuild \
+#                 --ask-become-pass -e ci_tw_host_lan_ip=<…> -e ci_rebuild_confirm=dc1-ci-tw-1
+#
+# ⚠️ NOT IN site.yml, and independent of playbooks/ci-runner.yml: running one
+# never touches the other's VM, volume, pool, bridge, egress table or runner.
+# Every value that differs from Keel's instance is in
+# playbooks/vars/ci-runner-truewealth.yml, loaded by this play only.
+#
+# The same `never` tags and `apply:` discipline as playbooks/ci-runner.yml —
+# see the notes there.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Provision and manage the TrueWealth CI runner VM
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+  vars_files:
+    - vars/ci-runner-truewealth.yml
+
+  pre_tasks:
+    - name: The host's LAN address must be supplied, as an address
+      # The isolation probes are built from it, and the started hook fails
+      # every job on a probe that is not an IP. Refuse here instead, before
+      # anything is built.
+      ansible.builtin.assert:
+        that:
+          - ci_tw_host_lan_ip is defined
+          - ci_tw_host_lan_ip is match('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+        fail_msg: >-
+          Pass -e ci_tw_host_lan_ip=<dc1-x86's LAN IPv4>. It is not recorded in
+          this repository and must come from the host (see the activation
+          checklist), not from a guess.
+        quiet: true
+      tags: [always]
+
+  tasks:
+    - name: Build the CI VM and install the runner
+      ansible.builtin.include_role:
+        name: ci_runner
+        apply:
+          tags: [provision]
+      tags: [provision]
+
+    - name: Register the runner with GitHub
+      ansible.builtin.include_role:
+        name: ci_runner
+        tasks_from: register.yml
+        apply:
+          tags: [register]
+      tags: [register, never]
+
+    - name: Remove the runner from GitHub
+      ansible.builtin.include_role:
+        name: ci_runner
+        tasks_from: unregister.yml
+        apply:
+          tags: [unregister]
+      tags: [unregister, never]
+
+    - name: Destroy and rebuild the CI VM
+      ansible.builtin.include_role:
+        name: ci_runner
+        tasks_from: rebuild.yml
+        apply:
+          tags: [rebuild]
+      tags: [rebuild, never]

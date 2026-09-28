@@ -8,7 +8,7 @@
   # The nft file deletes its own table before redefining it, so this is atomic
   # and idempotent — see the create-then-delete idiom at the top of the template.
   ansible.builtin.command:
-    argv: [/usr/local/sbin/ci-egress-apply]
+    argv: ["{{ ci_egress_applier }}"]
   changed_when: true
 
 - name: Reload systemd for the egress unit

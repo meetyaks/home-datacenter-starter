@@ -69,8 +69,8 @@
       - ci_rebuild_registered.rc != 0
     fail_msg: >-
       {{ ci_vm_name }} still has a registered runner. Remove it first:
-      ansible-playbook playbooks/ci-runner.yml --tags unregister
-      -e ci_runner_removal_token=<token>
+      ansible-playbook {{ ci_runner_playbook }} --tags unregister (with the removal
+      token exported as CI_RUNNER_REMOVAL_TOKEN via `read -rs`, or at the prompt).
       Only then rebuild.
     quiet: true
 

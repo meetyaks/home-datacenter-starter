@@ -93,8 +93,9 @@ host — with no path to the production Keel deployment that shares it.
 
 ```bash
 ansible-playbook playbooks/ci-runner.yml --ask-become-pass            # provision
+read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN                   # token: never argv/history
 ansible-playbook playbooks/ci-runner.yml --tags register \
-  --ask-become-pass -e ci_runner_token=<one-time token>               # register
+  --ask-become-pass; unset CI_RUNNER_TOKEN                            # register
 tests/run-ci-runner-isolation.sh                                      # verify
 ```
 

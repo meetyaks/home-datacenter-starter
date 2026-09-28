@@ -1,0 +1,114 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Obtain a one-time GitHub runner token WITHOUT it ever being a process
+# argument, a shell-history entry, a file, a log line or a diff.
+#
+# Parameters (include_tasks vars):
+#   ci_token_kind      "registration" | "removal"   (wording only)
+#   ci_token_env       controller environment variable that may carry it
+#   ci_token_legacy    the old extra-var name, refused if it is set
+#
+# Sources, in order:
+#   1. the controller environment variable ci_token_env, set WITHOUT the value
+#      touching argv or history:
+#          read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN
+#          ansible-playbook … --tags register ; unset CI_RUNNER_TOKEN
+#      (a process's environment is readable only by its own user and root,
+#      unlike its arguments, which every local user can read with `ps`);
+#   2. otherwise a hidden interactive prompt.
+#
+# Result: the fact `ci_runner_token_input` (never printed; every task that
+# touches it is no_log). `no_log` hides values from Ansible's output and
+# callbacks; it does NOT hide process arguments, which is why no task here or
+# downstream ever puts the value in one.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Refuse a token passed as a variable
+  # `-e ci_runner_token=…` puts the value in ansible-playbook's argv (visible
+  # to every local user via ps/proc) and in shell history. The check reads
+  # only whether the variable is defined, never its value.
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', ci_token_legacy, default='__absent__') == '__absent__'
+    fail_msg: >-
+      {{ ci_token_legacy }} was supplied as a variable (for example with -e on
+      the command line). That exposes the token in process arguments and shell
+      history, so it is refused. Treat that token as disclosed: discard it,
+      generate a new one, and supply it with
+      `read -rs {{ ci_token_env }} && export {{ ci_token_env }}` before running
+      the playbook (or leave it unset to be prompted without echo).
+    quiet: true
+
+- name: Refuse a controller configured to keep remote module files
+  # The token reaches the host as a module argument (stdin of `lxc exec`).
+  # The tasks that carry it force pipelining, so the module is streamed and
+  # never written to the host's temporary directory — unless the operator has
+  # asked Ansible to keep remote files, which would leave it on disk.
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'ANSIBLE_KEEP_REMOTE_FILES', default='') | string | lower in ['', '0', 'false', 'no']
+    fail_msg: >-
+      ANSIBLE_KEEP_REMOTE_FILES is set; it would leave the {{ ci_token_kind }}
+      token in a module file on the host. Unset it for this run.
+    quiet: true
+
+- name: Probe that modules reach the host streamed, not as a file
+  # The token-carrying task forces ansible_pipelining, but an extra var
+  # (-e ansible_pipelining=false) outranks task vars, and some connection
+  # setups cannot pipeline. So test the EFFECTIVE behaviour with the same
+  # settings, before any token is read: this module's parent process on the
+  # host is the Python running it — started from a module FILE
+  # (…/AnsiballZ_command.py, which would hold the arguments) or from stdin.
+  ansible.builtin.command:
+    argv: [/bin/sh, -c, 'tr "\000" " " < /proc/$PPID/cmdline']
+  vars:
+    ansible_pipelining: true
+  register: ci_pipelining_probe
+  changed_when: false
+  check_mode: false
+
+- name: Refuse a run whose modules would be written to disk on the host
+  ansible.builtin.assert:
+    that:
+      - ci_pipelining_probe.stdout is not search('AnsiballZ_')
+    fail_msg: >-
+      Modules are not being pipelined on {{ inventory_hostname }} (the probe
+      ran from a module file). The {{ ci_token_kind }} token would be written
+      to that host's temporary directory, so this run is refused. Remove any
+      ansible_pipelining=false override; check that sudo does not require a TTY.
+    quiet: true
+
+- name: Read the {{ ci_token_kind }} token from the controller environment
+  ansible.builtin.set_fact:
+    ci_runner_token_input: "{{ lookup('ansible.builtin.env', ci_token_env, default='') | trim }}"
+  no_log: true
+
+- name: Otherwise ask for it, without echo
+  ansible.builtin.pause:
+    prompt: >-
+      Paste the one-time {{ ci_token_kind }} token for {{ ci_runner_name }}
+      (input is hidden; it is not stored)
+    echo: false
+  register: ci_token_prompt
+  no_log: true
+  when: ci_runner_token_input | length == 0
+
+- name: Take the prompted value
+  ansible.builtin.set_fact:
+    ci_runner_token_input: "{{ ci_token_prompt.user_input | default('') | trim }}"
+  no_log: true
+  when: ci_runner_token_input | length == 0
+
+- name: A {{ ci_token_kind }} token must have been supplied
+  # Length and character set only — the assertion never renders the value,
+  # in success or in failure.
+  ansible.builtin.assert:
+    that:
+      - ci_runner_token_input | length > 10
+      - ci_runner_token_input is match('^[A-Za-z0-9_-]+$')
+    fail_msg: >-
+      No usable {{ ci_token_kind }} token (empty, too short, or containing
+      characters a GitHub token never has). Generate one at
+      {{ ci_runner_scope_url }}/settings/actions/runners and supply it through
+      {{ ci_token_env }} or the prompt.
+    quiet: true

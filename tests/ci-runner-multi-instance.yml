@@ -1,0 +1,204 @@
+---
+# Two runner instances of roles/ci_runner on one hypervisor: the preflight
+# decisions that make that safe, evaluated with the ROLE'S OWN expressions
+# (ci_lxd_foreign_instances, ci_capacity_instances, ci_vm_memory_mib) against
+# fabricated `lxc list --format json` output. No hypervisor is involved.
+#
+# `import_role … when: false` loads the role's defaults at their real (lowest)
+# precedence without running anything, so each scenario's task `vars:` can
+# stand in for what the host would report.
+#
+# ⚠️ KEEL SCENARIOS FIRST. The second play `include_vars` the TrueWealth play
+# vars, and include_vars persists for the rest of the run.
+
+- name: Keel's instance (role defaults) beside a TrueWealth sibling
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    keel_only: '[{"name":"dc1-ci-1","config":{"limits.cpu":"8","limits.memory":"14GiB"}}]'
+    both: >-
+      [{"name":"dc1-ci-1","config":{"limits.cpu":"8","limits.memory":"14GiB"}},
+       {"name":"dc1-ci-tw-1","config":{"limits.cpu":"4","limits.memory":"6GiB","user.home-datacenter.ci-runner":"true"}}]
+    unmarked_tw: >-
+      [{"name":"dc1-ci-1","config":{}},
+       {"name":"dc1-ci-tw-1","config":{"limits.cpu":"4","limits.memory":"6GiB"}}]
+    stranger: >-
+      [{"name":"dc1-ci-1","config":{}},
+       {"name":"someone-elses-vm","config":{}}]
+
+  tasks:
+    - name: Load the role's defaults without running it
+      ansible.builtin.import_role:
+        name: ci_runner
+      when: false
+
+    - name: Keel — alone on the host, nothing foreign (unchanged behaviour)
+      ansible.builtin.assert:
+        that: ci_lxd_foreign_instances == []
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ keel_only }}"
+
+    - name: Keel — an empty or failed `lxc list` reads as nothing foreign (unchanged behaviour)
+      ansible.builtin.assert:
+        that: ci_lxd_foreign_instances == []
+        quiet: true
+      vars:
+        ci_lxd_instances_json: ""
+
+    - name: Keel — the marked TrueWealth VM is a sibling, not a stranger
+      ansible.builtin.assert:
+        that: ci_lxd_foreign_instances == []
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ both }}"
+
+    - name: Keel — an UNMARKED instance is still a stranger
+      ansible.builtin.assert:
+        that: ci_lxd_foreign_instances == ['dc1-ci-tw-1']
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ unmarked_tw }}"
+
+    - name: Keel — a stranger stops preflight
+      ansible.builtin.assert:
+        that: ci_lxd_foreign_instances == ['someone-elses-vm']
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ stranger }}"
+
+    - name: Keel — the capacity check and VG reserve are OFF by default (unchanged behaviour)
+      ansible.builtin.assert:
+        that:
+          - not (ci_capacity_check | bool)
+          - (ci_vg_reserve_g | float) == 0
+          - not (ci_egress_sibling_isolation | bool)
+          - ci_lxd_sibling_instances == []
+        quiet: true
+
+    - name: Keel — the host-side names are exactly the ones dc1-ci-1 was built with
+      ansible.builtin.assert:
+        that:
+          - ci_egress_table == 'ci_egress'
+          - ci_egress_policy_file == '/etc/nftables.d/ci-egress.nft'
+          - ci_egress_applier == '/usr/local/sbin/ci-egress-apply'
+          - ci_egress_unit == 'ci-egress'
+          - ci_lxd_gateway == '10.71.0.1'
+          - ci_runner_playbook == 'playbooks/ci-runner.yml'
+        quiet: true
+
+- name: The TrueWealth instance (play vars) beside Keel's dc1-ci-1
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    keel_only: '[{"name":"dc1-ci-1","config":{"limits.cpu":"8","limits.memory":"14GiB"}}]'
+    keel_unlimited: '[{"name":"dc1-ci-1","config":{"limits.cpu":"8","limits.memory":"50%"}}]'
+    stranger: >-
+      [{"name":"dc1-ci-1","config":{"limits.cpu":"8","limits.memory":"14GiB"}},
+       {"name":"someone-elses-vm","config":{"limits.cpu":"1","limits.memory":"1GiB"}}]
+    # The host figures the repository records (defaults/main.yml): 16 vCPU and
+    # "27 GiB". MemTotal is somewhat under the nominal size; 27 GiB = 27648 MiB.
+    recorded_mem_mib: 27648
+    recorded_vcpus: 16
+    fits: >-
+      {{ (ansible_memtotal_mb | int) - (ci_capacity_instances | map(attribute='memory_mib') | sum)
+         - (ci_vm_memory_mib | int) >= (ci_capacity_reserve_memory_mib | int)
+         and (ansible_processor_vcpus | int) - (ci_capacity_instances | map(attribute='cpu') | sum)
+         - (ci_vm_cpu | int) >= (ci_capacity_reserve_cpu | int) }}
+
+  tasks:
+    - name: Load the role's defaults without running it
+      ansible.builtin.import_role:
+        name: ci_runner
+      when: false
+
+    - name: Overlay the TrueWealth play vars
+      ansible.builtin.include_vars:
+        file: ../playbooks/vars/ci-runner-truewealth.yml
+
+    - name: TrueWealth — Keel's unmarked dc1-ci-1 is a named sibling
+      ansible.builtin.assert:
+        that: ci_lxd_foreign_instances == []
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ keel_only }}"
+
+    - name: TrueWealth — a stranger still stops preflight
+      ansible.builtin.assert:
+        that: ci_lxd_foreign_instances == ['someone-elses-vm']
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ stranger }}"
+
+    - name: TrueWealth — the new VM carries the ownership marker
+      ansible.builtin.assert:
+        that: >-
+          ci_vm_settings | selectattr('k', 'equalto', ci_lxd_owner_key)
+          | selectattr('v', 'equalto', 'true') | list | length == 1
+        quiet: true
+
+    - name: TrueWealth — memory limits are parsed to MiB
+      ansible.builtin.assert:
+        that:
+          - (ci_vm_memory_mib | int) == 6144
+          - "ci_capacity_instances == [{'name': 'dc1-ci-1', 'memory_mib': 14336, 'cpu': 8}]"
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ keel_only }}"
+
+    - name: TrueWealth — fits on the host as the repository records it (to be re-measured live)
+      ansible.builtin.assert:
+        that: fits | bool
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ keel_only }}"
+        ansible_memtotal_mb: "{{ recorded_mem_mib }}"
+        ansible_processor_vcpus: "{{ recorded_vcpus }}"
+
+    - name: TrueWealth — refused when production's memory reserve is not there
+      ansible.builtin.assert:
+        that: not (fits | bool)
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ keel_only }}"
+        ansible_memtotal_mb: 24000
+        ansible_processor_vcpus: "{{ recorded_vcpus }}"
+
+    - name: TrueWealth — refused when the CPU reserve is not there
+      ansible.builtin.assert:
+        that: not (fits | bool)
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ keel_only }}"
+        ansible_memtotal_mb: "{{ recorded_mem_mib }}"
+        ansible_processor_vcpus: 12
+
+    - name: TrueWealth — an instance whose memory cannot be accounted for is flagged
+      ansible.builtin.assert:
+        that: (ci_capacity_instances | selectattr('memory_mib', 'lt', 0) | list | length) == 1
+        quiet: true
+      vars:
+        ci_lxd_instances_json: "{{ keel_unlimited }}"
+
+    - name: TrueWealth — the capacity check, VG reserve and sibling isolation are ON
+      ansible.builtin.assert:
+        that:
+          - ci_capacity_check | bool
+          - (ci_vg_reserve_g | float) == 20
+          - ci_egress_sibling_isolation | bool
+          - ci_lxd_gateway == '10.72.0.1'
+        quiet: true
+
+    - name: TrueWealth — the play's LAN-address guard accepts an IPv4 and refuses the rest
+      ansible.builtin.assert:
+        that:
+          - "'10.0.0.10' is match('^([0-9]{1,3}\\.){3}[0-9]{1,3}$')"
+          - "'dc1-x86' is not match('^([0-9]{1,3}\\.){3}[0-9]{1,3}$')"
+          - "'' is not match('^([0-9]{1,3}\\.){3}[0-9]{1,3}$')"
+        quiet: true

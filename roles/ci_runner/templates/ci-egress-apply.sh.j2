@@ -31,7 +31,7 @@
 set -euo pipefail
 
 BRIDGE='{{ ci_lxd_bridge }}'
-POLICY=/etc/nftables.d/ci-egress.nft
+POLICY={{ ci_egress_policy_file }}
 
 # ── 1. The policy that decides ──────────────────────────────────────────────
 # The file declares an empty table, deletes it, then defines the real one, so
@@ -49,4 +49,4 @@ if ! iptables -C DOCKER-USER -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLI
   iptables -I DOCKER-USER -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 fi
 
-echo "CI egress policy applied: inet ci_egress loaded, DOCKER-USER permits ${BRIDGE}."
+echo "CI egress policy applied: inet {{ ci_egress_table }} loaded, DOCKER-USER permits ${BRIDGE}."

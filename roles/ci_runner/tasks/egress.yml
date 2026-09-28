@@ -32,7 +32,7 @@
   # malformed rule set can never be the thing that is loaded. `-c` is check-only.
   ansible.builtin.template:
     src: ci-egress.nft.j2
-    dest: /etc/nftables.d/ci-egress.nft
+    dest: "{{ ci_egress_policy_file }}"
     owner: root
     group: root
     mode: "0600"
@@ -49,7 +49,7 @@
   # anything actually does.
   ansible.builtin.template:
     src: ci-egress-apply.sh.j2
-    dest: /usr/local/sbin/ci-egress-apply
+    dest: "{{ ci_egress_applier }}"
     owner: root
     group: root
     mode: "0700"
@@ -64,7 +64,7 @@
   # green through the exact failure it exists to catch.
   ansible.builtin.shell:
     cmd: >-
-      nft list table inet ci_egress >/dev/null 2>&1 &&
+      nft list table inet {{ ci_egress_table }} >/dev/null 2>&1 &&
       iptables -C DOCKER-USER -i {{ ci_lxd_bridge }} -j ACCEPT 2>/dev/null
   register: ci_egress_loaded
   changed_when: false
@@ -73,7 +73,7 @@
 
 - name: Apply the policy
   ansible.builtin.command:
-    argv: [/usr/local/sbin/ci-egress-apply]
+    argv: ["{{ ci_egress_applier }}"]
   when: ci_egress_loaded.rc != 0
   changed_when: true
 
@@ -81,7 +81,7 @@
   # A one-shot unit rather than editing /etc/nftables.conf, which belongs to the
   # distribution and may already be carrying Tailscale's rules.
   ansible.builtin.copy:
-    dest: /etc/systemd/system/ci-egress.service
+    dest: "/etc/systemd/system/{{ ci_egress_unit }}.service"
     owner: root
     group: root
     mode: "0644"
@@ -110,12 +110,61 @@
       [Service]
       Type=oneshot
       RemainAfterExit=yes
-      ExecStart=/usr/local/sbin/ci-egress-apply
-      ExecStop=/usr/sbin/nft delete table inet ci_egress
+      ExecStart={{ ci_egress_applier }}
+      {% if not (ci_isolation_hardening | bool) %}
+      ExecStop=/usr/sbin/nft delete table inet {{ ci_egress_table }}
+      {% endif %}
 
       [Install]
       WantedBy=multi-user.target
   notify: Reload systemd for the egress unit
+
+- name: Load the nftables half before LXD can start the VM (hardening)
+  # The unit above runs after Docker (it must: DOCKER-USER only exists once
+  # Docker has started). An autostarted VM would otherwise boot with no host
+  # policy: forwarded traffic still meets Docker's FORWARD DROP, but INPUT to
+  # the host — every host service on the bridge address — is open until then.
+  # This unit loads only the nftables file, ordered before LXD; it has no
+  # ExecStop, so nothing but an explicit role change removes the policy.
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ ci_egress_unit }}-early.service"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by roles/ci_runner (home-datacenter-starter). Do not edit here.
+      [Unit]
+      Description=CI egress policy for {{ ci_vm_name }}, loaded before LXD (nftables only)
+      DefaultDependencies=no
+      After=local-fs.target
+      Before={{ (ci_lxd_service_units + ['network-pre.target']) | join(' ') }}
+      Wants=network-pre.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f {{ ci_egress_policy_file }}
+
+      [Install]
+      WantedBy=sysinit.target
+  when: ci_isolation_hardening | bool
+  notify: Reload systemd for the egress unit
+
+- name: Observe whether the early unit file is on disk
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ ci_egress_unit }}-early.service"
+  register: ci_egress_early_file
+  check_mode: false
+  when: ci_isolation_hardening | bool
+
+- name: Enable the early unit
+  ansible.builtin.systemd_service:
+    name: "{{ ci_egress_unit }}-early"
+    enabled: true
+    daemon_reload: true
+  when:
+    - ci_isolation_hardening | bool
+    - ci_egress_early_file.stat.exists or not ansible_check_mode
 
 - name: Observe whether the unit file is on disk
   # ⚠️ `systemd_service` FAILS IN CHECK MODE ON A UNIT THAT DOES NOT EXIST YET —
@@ -124,13 +173,13 @@
   # PREDICTS the unit under --check, so enabling it is gated on the file being
   # real.
   ansible.builtin.stat:
-    path: /etc/systemd/system/ci-egress.service
-  register: ci_egress_unit
+    path: "/etc/systemd/system/{{ ci_egress_unit }}.service"
+  register: ci_egress_unit_file
   check_mode: false
 
 - name: Enable the egress unit
   ansible.builtin.systemd_service:
-    name: ci-egress
+    name: "{{ ci_egress_unit }}"
     enabled: true
     daemon_reload: true
-  when: ci_egress_unit.stat.exists or not ansible_check_mode
+  when: ci_egress_unit_file.stat.exists or not ansible_check_mode

@@ -1,0 +1,128 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# The TrueWealth CI runner: a SECOND, independent instance of roles/ci_runner
+# on dc1-x86, beside Keel's dc1-ci-1 and production.
+#
+# ⚠️ PLAY VARS, NOT INVENTORY. These are loaded only by
+# playbooks/ci-runner-truewealth.yml. Putting them in host_vars or group_vars
+# would change what playbooks/ci-runner.yml (Keel's runner) renders and does,
+# because both plays target the same host.
+#
+# ⚠️ WHY A SEPARATE VM AND NOT A SECOND RUNNER IN dc1-ci-1. Keel's completed
+# hook removes every container and volume on its VM's Docker daemon after each
+# job. A TrueWealth job on that daemon would be destroyed by Keel's cleanup and
+# vice versa, and a second user or work directory does not change that. Here
+# the boundary is the hypervisor: own kernel, own Docker daemon, own disk, own
+# bridge, own egress table, own runner registration. The role's hooks, which
+# clean their daemon globally, therefore only ever clean THIS VM.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Identity and scope ─────────────────────────────────────────────────────
+ci_vm_name: dc1-ci-tw-1
+ci_runner_name: dc1-ci-tw-1
+ci_runner_labels: "self-hosted,linux,x64,local-dc-ci"
+# Repository-scoped: no other repository can target this runner.
+ci_runner_scope_url: "https://github.com/meetyaks/truewealth"
+ci_runner_playbook: playbooks/ci-runner-truewealth.yml
+
+# ── Resources ──────────────────────────────────────────────────────────────
+#
+# ⚠️ ESTIMATES, NOT MEASUREMENTS ON THIS HOST. The TrueWealth validation runs
+# its stages one after another (install, lint, vitest, one image build at a
+# time, a compose stack of five small services, one Chromium). It completed
+# on a development machine; peak memory on dc1-x86 has not been measured.
+#
+# What the repository records about the host (roles/ci_runner/defaults,
+# written when dc1-ci-1 was built — NOT re-verified): 16 vCPU, 27 GiB RAM,
+# production Keel ~2-3 GiB, dc1-ci-1 = 8 vCPU / 14 GiB. On those figures this
+# instance leaves ~7 GiB and 4 vCPU for the host and production. The preflight
+# capacity check below reads the LIVE host and refuses if the reserve is not
+# actually there, so nothing here is trusted about what the host has.
+ci_vm_cpu: 4
+ci_vm_memory: 6GiB
+ci_capacity_check: true
+ci_capacity_reserve_memory_mib: 6144
+ci_capacity_reserve_cpu: 4
+
+ci_vm_settings:
+  - { k: "limits.cpu", v: "{{ ci_vm_cpu }}" }
+  - { k: "limits.memory", v: "{{ ci_vm_memory }}" }
+  - { k: "boot.autostart", v: "true" }
+  # Marks this VM as built by roles/ci_runner, so Keel's instance of the role
+  # recognises it as a sibling rather than a stranger (see ci_lxd_owner_key).
+  - { k: "user.home-datacenter.ci-runner", v: "true" }
+
+# Keel's VM predates the ownership marker and is left untouched, so it is
+# named explicitly as a sibling.
+ci_lxd_sibling_instances: [dc1-ci-1]
+
+# ── Storage: its own logical volume and pool ───────────────────────────────
+#
+# ⚠️ 50 GiB, AND THE FREE SPACE IS UNVERIFIED. The repository last recorded
+# `ubuntu-vg` with 74.68 GiB free after dc1-ci-1's 180 GiB volume. 50 + a
+# 20 GiB reserve needs 70 GiB free; preflight measures the live VG and
+# refuses otherwise. TrueWealth's peak use (base images incl. Playwright's,
+# four built images, two dependency installs, build cache) is estimated at
+# 25-35 GiB; the completed hook prunes the build cache above 80 %.
+ci_lv_name: ci-tw-lxd
+ci_lv_size: 50g
+ci_vg_reserve_g: 20
+ci_lv_mount: /var/lib/ci-tw-lxd
+ci_vm_root_size: 45GiB
+ci_lxd_pool: ci-tw-pool
+
+# ── Network: its own NAT bridge and subnet ─────────────────────────────────
+#
+# 10.72.0.0/24 does not overlap anything the repository records (lab LAN
+# 10.0.0.0/24, dc1-ci-1 10.71.0.0/24, Docker 172.16/12, Tailscale
+# 100.64/10). The live host's routes have NOT been checked; see the
+# activation checklist.
+# LAN ranges this repository records (NOT verified live); the read-only
+# preflight (playbooks/ci-runner-truewealth-preflight.yml) also checks every
+# live address and route in every table.
+ci_preflight_lan_cidrs: [10.0.0.0/24]
+ci_lxd_bridge: citwbr0
+ci_lxd_subnet: 10.72.0.1/24
+ci_lxd_subnet_cidr: 10.72.0.0/24
+
+# ── Egress: its own table, file, applier and unit ──────────────────────────
+ci_egress_table: ci_egress_tw
+ci_egress_policy_file: /etc/nftables.d/ci-egress-tw.nft
+ci_egress_applier: /usr/local/sbin/ci-egress-tw-apply
+ci_egress_unit: ci-egress-tw
+# Drop NEW connections into this bridge and answer DNS only from its own
+# gateway — the two paths a sibling CI VM on the same host would otherwise have.
+ci_egress_sibling_isolation: true
+# Interface-keyed rules (no spoofed-source bypass), IPv6 dropped, the bridge's
+# configuration verified, and the policy loaded before LXD and kept when Docker
+# stops. See roles/ci_runner/defaults/main.yml.
+ci_isolation_hardening: true
+# Wider than Keel's list: ALL of 10.0.0.0/8, which covers the lab LAN AND
+# dc1-ci-1's subnet, so this VM cannot open a connection to the sibling.
+ci_egress_denied_cidrs:
+  - 10.0.0.0/8
+  - 100.64.0.0/10
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - 169.254.0.0/16
+
+# ── Isolation probes, run inside the VM before every job ───────────────────
+#
+# ⚠️ ADDRESSES ONLY — the started hook fails a job on a name, because an
+# unresolvable probe proves nothing. The host's LAN address is NOT recorded
+# in this repository (`ansible_host` is the name `dc1-x86`), so it must be
+# supplied at provisioning time as `ci_tw_host_lan_ip`; the play refuses
+# without it.
+#   <host LAN>:443   production Caddy
+#   <host LAN>:5432  production Postgres
+#   10.71.0.1:53     dc1-ci-1's bridge resolver (sibling isolation)
+#   <own gw>:443     host services on this bridge's own address
+ci_isolation_denied_probes:
+  - "{{ ci_tw_host_lan_ip }}:443"
+  - "{{ ci_tw_host_lan_ip }}:5432"
+  - "10.71.0.1:53"
+  - "{{ ci_lxd_gateway }}:443"
+
+# Scratch on the host while rendering guest files — separate from Keel's so
+# the two plays can never remove each other's staging directory.
+ci_stage_dir: /run/ci-runner-stage-tw

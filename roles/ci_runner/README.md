@@ -146,13 +146,17 @@ ansible-playbook playbooks/ci-runner.yml --ask-become-pass
 # dry run
 ansible-playbook playbooks/ci-runner.yml --check --diff --ask-become-pass
 
-# register — needs a one-time token you generate in the repository settings
-ansible-playbook playbooks/ci-runner.yml --tags register \
-  --ask-become-pass -e ci_runner_token=<token>
+# register — needs a one-time token you generate in the repository settings.
+# Never pass it with -e (argv and shell history; the role refuses it): export it
+# from a hidden read, or leave it unset and answer the hidden prompt.
+read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN
+ansible-playbook playbooks/ci-runner.yml --tags register --ask-become-pass
+unset CI_RUNNER_TOKEN
 
 # remove — needs a one-time removal token from the runner's Remove button
-ansible-playbook playbooks/ci-runner.yml --tags unregister \
-  --ask-become-pass -e ci_runner_removal_token=<token>
+read -rs CI_RUNNER_REMOVAL_TOKEN && export CI_RUNNER_REMOVAL_TOKEN
+ansible-playbook playbooks/ci-runner.yml --tags unregister --ask-become-pass
+unset CI_RUNNER_REMOVAL_TOKEN
 
 # destroy and rebuild the VM (refuses while a runner is registered)
 ansible-playbook playbooks/ci-runner.yml --tags rebuild \
@@ -259,3 +263,348 @@ The same probes run again before **every job**, in the started hook: if
 `/srv/data` becomes visible, if a production container appears, or if the host
 answers on 443 or 5432, the job fails before the first step instead of quietly
 succeeding with a path to production.
+
+## A second instance: TrueWealth's runner (dc1-ci-tw-1)
+
+`playbooks/ci-runner-truewealth.yml` builds a **second, independent** runner VM
+from this role for `meetyaks/truewealth`. Every value that differs from
+dc1-ci-1 lives in `playbooks/vars/ci-runner-truewealth.yml` — play vars, not
+inventory, so `playbooks/ci-runner.yml` renders and behaves exactly as before
+(`tests/run-ci-runner-truewealth.sh` proves Keel's artefacts are
+byte-identical to 934ca20).
+
+**Why a VM and not a second runner in dc1-ci-1.** Keel's completed hook removes
+every container and volume on its daemon after each job; a TrueWealth job on
+that daemon would be destroyed by Keel's cleanup, and vice versa. A second
+user or work directory does not change that. The boundary is the hypervisor.
+
+| | dc1-ci-1 (Keel) | dc1-ci-tw-1 (TrueWealth) |
+|---|---|---|
+| scope | `meetyaks/keel` | `meetyaks/truewealth` |
+| labels | `self-hosted,linux,x64,keel-ci` | `self-hosted,linux,x64,local-dc-ci` |
+| vCPU / memory | 8 / 14 GiB | **4 / 6 GiB** (proposed) |
+| logical volume | `ubuntu-vg/ci-lxd` 180g | `ubuntu-vg/ci-tw-lxd` **50g** (+20g VG reserve kept) |
+| root disk | 170 GiB | 45 GiB |
+| LXD pool / bridge | `ci-pool` / `lxdbr0` | `ci-tw-pool` / `citwbr0` |
+| subnet | 10.71.0.0/24 | 10.72.0.0/24 |
+| egress table / unit | `inet ci_egress` / `ci-egress` | `inet ci_egress_tw` / `ci-egress-tw` (+ `ci-egress-tw-early`) |
+| denies | LAN /24, CGNAT, 172.16/12, 192.168/16, link-local | **all of 10/8** (LAN and dc1-ci-1), CGNAT, 172.16/12, 192.168/16, link-local |
+| sibling isolation | off (unchanged) | on: no NEW connection into `citwbr0`; DNS only from its own gateway |
+| hardening (`ci_isolation_hardening`) | off (unchanged) | on: rules keyed on the interface (spoofed sources refused), IPv6 dropped both ways, existing bridge verified, policy loaded before LXD and kept when Docker stops |
+
+Isolation contract it meets: repository-scoped registration; its own kernel,
+Docker daemon, disk, bridge, egress table and runner state; the role's
+job hooks clean only this VM; no host device, production mount, Docker socket,
+secret, SSH key or route to production/administration services; one job at a
+time (one non-ephemeral registration); outbound 80/443 (+NTP) to the public
+internet only, over IPv4 only.
+
+`tests/run-ci-runner-truewealth.sh` section 10 sends real packets through both
+rendered policies in network namespaces (with IPv6 deliberately present on the
+bridge). For dc1-ci-tw-1 every probe is refused except 443 out, its own
+resolver and DHCP. **Recorded finding for Keel's unchanged policy:** IPv6 to
+host services (if the bridge ever carries IPv6) and one-way traffic from a
+spoofed source address to the LAN or the host pass it; enabling
+`ci_isolation_hardening` for dc1-ci-1 is a separate, reviewed change.
+
+**Persistent runner state.** The runner is not ephemeral: a job that gains
+root in the VM (Docker access is enough) can leave state that affects later
+jobs on it. The job hooks remove containers, volumes and the workspace, not
+arbitrary files or processes a job planted. This matters for release builds;
+see the TrueWealth activation runbook (docs/activation.md in that repository).
+
+### Capacity — measure it live before provisioning (read-only, from dc1-arm-1)
+
+The figures above are **proposals**. The host facts in this repository (16
+vCPU, 27 GiB, `ubuntu-vg` 74.68 GiB free after dc1-ci-1) were recorded when
+dc1-ci-1 was built and are **not re-verified**. The preflight playbook reads
+the live host without changing it and decides, failing closed on anything it
+cannot read:
+
+```bash
+ansible-playbook playbooks/ci-runner-truewealth-preflight.yml --ask-become-pass
+```
+
+It checks, on live values: CPU and memory after every other instance's
+**effective** limits (profile-inherited ones included; an instance with no
+limit is UNKNOWN, because it could take the host); production containers'
+observed memory ×1.5 + 2 GiB host overhead inside what VM limits leave; VG free
+≥ 50g + 20g reserve; the volume, pool, bridge, instance and nft table names
+unused; the subnet 10.72.0.0/24 absent from every host address, every route in
+every table (Tailscale's table 52 included), every LXD network and the
+recorded LAN; Docker's FORWARD policy DROP; the LXD unit present. The facts
+and the plan are kept (0700) under `~/ci-preflight/dc1-ci-tw-1/` on the
+controller. If it reports NOT READY, lower `ci_vm_memory` / `ci_lv_size` (not
+the reserves) or free capacity first. The play also needs the host's LAN IPv4
+for the isolation probes: read it from the collected `ip4_addr` section.
+
+### Provisioning and registration (each step a separate authorisation)
+
+```bash
+# 0. read-only preflight (above); stop unless it PASSES
+ansible-playbook playbooks/ci-runner-truewealth-preflight.yml --ask-become-pass
+# 1. dry run (no VM is created; preflight capacity runs on live values)
+ansible-playbook playbooks/ci-runner-truewealth.yml --check --diff \
+  --ask-become-pass -e ci_tw_host_lan_ip=<dc1-x86 LAN IPv4>
+# 2. provision the VM, volume, bridge, egress policy and runner binaries — ONLY through
+#    "Activation from dc1-arm-1" below: exact-commit checkout, verified before snapshot,
+#    explicit confirmation, then tools/ci-activation/provision-truewealth.sh <commit>
+# 3. after snapshot, compare and live checks from inside the VM — the same runbook, step 5
+#    (tools/ci-activation/hostcheck.sh; probes run again before every job). The generic
+#    `CI_RUNNER_LIVE=… tests/run-ci-runner-isolation.sh` probes Keel's target set and needs
+#    passwordless sudo, so it is not the acceptance check for dc1-ci-tw-1.
+# 4. register: mint a ONE-TIME token in
+#    https://github.com/meetyaks/truewealth/settings/actions/runners/new
+#    (expires in 1 h; never paste it into chat, a file or a command line),
+#    then immediately, on the controller:
+read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN      # or skip: hidden prompt
+ansible-playbook playbooks/ci-runner-truewealth.yml --tags register \
+  --ask-become-pass -e ci_tw_host_lan_ip=<…>
+unset CI_RUNNER_TOKEN
+# 5. confirm: runner "dc1-ci-tw-1", labels self-hosted,linux,x64,local-dc-ci,
+#    status Idle, in the TrueWealth repository ONLY:
+gh api repos/meetyaks/truewealth/actions/runners --jq '.runners[] | {name,status,labels:[.labels[].name]}'
+gh api repos/meetyaks/keel/actions/runners --jq '.runners[].name'   # unchanged: dc1-ci-1
+```
+
+Where the token travels (tasks/token-input.yml, tasks/register.yml): the
+controller's environment or a hidden prompt (`-e ci_runner_token` is refused)
+→ a module argument on a task that forces pipelining (a runtime probe refuses
+the run if modules would be written to the host's disk) → stdin of
+`lxc exec -T` → `ACTIONS_RUNNER_INPUT_TOKEN` for the one `config.sh` call
+(never `--token`). `no_log` hides Ansible's output; it does not hide process
+arguments, which is why the value is never one. Section 9 of the test suite
+samples every process's argv and Ansible's temp files during synthetic
+registrations to prove it.
+
+Removal: `--tags unregister` with `CI_RUNNER_REMOVAL_TOKEN` exported the same way (or the prompt); rebuild:
+`--tags rebuild -e ci_rebuild_confirm=dc1-ci-tw-1`.
+
+### Old checkouts and the second VM
+
+Merging this role into `main` does **not** update any existing checkout or
+worktree on the administration plane: a checkout at #2 (`934ca20`) or older
+stays at that code until it is deliberately moved. Once `dc1-ci-tw-1` exists,
+every **provisioning** run of Keel's runner (`playbooks/ci-runner.yml` without
+`--tags`) must use a revision that recognises the marked sibling — `455c088`
+or a later `main` — because the preflight of earlier revisions refuses any
+other LXD instance on the host. Keel's `--tags register|unregister|rebuild`
+do not run preflight and are unaffected. Record the SHA of every
+administration run (below).
+
+### Activation from dc1-arm-1 (operator runbook)
+
+Everything comes from **this repository at one exact commit**, checked out
+fresh on dc1-arm-1. Nothing is copied from another machine, no checksum
+manifest is carried by hand, and the same full commit SHA `C` is recorded by
+every step, in every log and snapshot. Use the commit that carries
+`tools/ci-activation/`: PR #3's head, or the merge commit on `main` once it
+is merged. Its provisioning implementation must equal `455c088`, the
+revision whose live check mode was run (`ok=42 changed=5 unreachable=0
+failed=0`). The wrapper refuses any other implementation.
+
+Each numbered step is a separate authorisation. Paste the steps into Terminal
+on **dc1-arm-1** (zsh or bash). Passwords are only ever typed at prompts.
+
+```bash
+# 0. once per Terminal window
+C=<the 40-character commit>; W="$HOME/preflight/hds-$C"; K="$HOME/.ssh/home_datacenter_admin"; H=labadmin@dc1-x86
+S=(-o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o IdentitiesOnly=yes -i "$K")
+
+# 1. exact-commit checkout in a NEW directory (existing checkouts are not touched)
+git clone --quiet --no-checkout https://github.com/meetyaks/home-datacenter-starter.git "$W" \
+  && git -C "$W" fetch --quiet origin "$C" && git -C "$W" checkout --quiet --detach "$C" \
+  && [ "$(git -C "$W" rev-parse HEAD)" = "$C" ] \
+  && [ -z "$(git -C "$W" status --porcelain --untracked-files=all)" ] && echo "checkout $C: exact and clean"
+
+# 2. stage this checkout's hostcheck.sh on dc1-x86 (files only); the two hashes must be equal
+ssh "${S[@]}" $H 'mkdir -p ~/ci-shared-check && chmod 700 ~/ci-shared-check' \
+  && scp "${S[@]}" "$W/tools/ci-activation/hostcheck.sh" $H:ci-shared-check/hostcheck.sh \
+  && ssh "${S[@]}" $H 'sha256sum ~/ci-shared-check/hostcheck.sh' && shasum -a 256 "$W/tools/ci-activation/hostcheck.sh"
+
+# 3. before snapshot (sudo on dc1-x86 asks for labadmin's password)
+ssh -t "${S[@]}" $H "bash ~/ci-shared-check/hostcheck.sh snapshot before $C"
+#    required: exit 0 and "RESULT: OK — completion record …/COMPLETE"
+
+# 4. provision (within 120 minutes of step 3): confirmation, then labadmin's BECOME password
+/bin/bash "$W/tools/ci-activation/provision-truewealth.sh" "$C"
+#    required: recap failed=0 unreachable=0 and "wrapper exits 0"
+
+# 5. after snapshot, comparison, live checks
+ssh -t "${S[@]}" $H "bash ~/ci-shared-check/hostcheck.sh snapshot after-provision $C"   # RESULT: OK — completion record
+ssh -t "${S[@]}" $H "bash ~/ci-shared-check/hostcheck.sh compare $C"                     # RESULT: OK — no regression
+ssh -t "${S[@]}" $H "bash ~/ci-shared-check/hostcheck.sh probe $C"; echo "probe exit: $?"  # RESULT: OK, exit 0
+gh api repos/meetyaks/keel/actions/runners --jq '.runners[] | {name,status}'   # dc1-ci-1 online (needs gh)
+```
+
+If `$W` already exists from an earlier attempt, reuse it. The wrapper
+re-verifies it, and a directory that is not exactly `C` and clean is refused.
+Registration (step 4 of "Provisioning and registration" above) is **not** part
+of this runbook and needs its own authorisation and a one-time token.
+
+**What `provision-truewealth.sh <C>` checks before it changes anything:**
+- the controller: macOS, account `dc1-arm-1`, the address 10.0.0.22, and a terminal;
+- no token and no `ANSIBLE_*` override in the environment;
+- the checkout it lives in:
+  - HEAD is exactly `C`;
+  - the tree is clean, untracked files included, and holds no vault file;
+  - `C` descends from `455c088`;
+  - `git diff 455c088 C` is empty over everything the play loads: `ansible.cfg`, `requirements.yml`, `inventory/`, the TrueWealth playbook and vars, and `roles/ci_runner` (only its README may differ);
+- SSH to `labadmin@dc1-x86` with the inventory key and an **already-trusted** host key. Ansible gets the same `StrictHostKeyChecking=yes`, `UpdateHostKeys=no` and `IdentitiesOnly=yes`;
+- the staged `~/ci-shared-check/hostcheck.sh` is byte-identical to the checkout's;
+- `hostcheck.sh verify before C 120` accepts the newest before snapshot's completion record;
+- you type `PROVISION dc1-ci-tw-1`.
+
+It then runs `ansible-playbook playbooks/ci-runner-truewealth.yml --limit
+dc1-x86 --diff --ask-become-pass -e ci_tw_host_lan_ip=10.0.0.3` from the
+checkout (no `--check`, no registration). The log goes to
+`~/ci-preflight/provisioning-apply-C-<UTC>.log` (0600). The wrapper exits with
+Ansible's status, or tee's if Ansible succeeded.
+
+**`tools/ci-activation/hostcheck.sh`** runs on dc1-x86 as labadmin. It only
+reads the host, and writes nothing outside `~/ci-shared-check` (0700).
+
+- **`snapshot`** is fail-closed:
+  - each required collector's own exit status and output structure are checked, and stderr is kept in `errors/`;
+  - it requires Keel's DOCKER-USER rules each exactly once, readable unit states with docker, LXD and Caddy active, every Keel container to satisfy the **container contract** (below), and Keel's five health endpoints (below) at 200;
+  - only then does it write `COMPLETE` (format `hostcheck-snapshot v3`), which binds the phase, `C`, the snapshot identity, the creation time and the SHA-256 of all 22 required evidence files, including the deployed Compose file and the inventory derived from it, with an end count;
+  - otherwise it prints `RESULT: INCOMPLETE`, exits 1 and writes no record.
+- **`verify`** checks the **newest** snapshot of a phase, and re-applies the container contract to its bound evidence. An older valid snapshot is never used instead.
+- **`compare`** verifies both records, requires `stable/` to be byte-identical and each `citwbr0` and `lxdbr0` DOCKER-USER rule exactly once. It exits 1 on anything else.
+- **`probe`** judges three sections separately:
+  - **infrastructure readiness:** the instance is a VM and answers; its expanded configuration has no host-path disk, passthrough device or raw override (configuration evidence only); the live `inet ci_egress_tw` equals the reviewed rendering; the DOCKER-USER rules, the units and `citwbr0`;
+  - **Keel preservation:** Keel's table, unit and DOCKER-USER rules, `dc1-ci-1`, the five health endpoints, and the containers under the same container contract;
+  - **TrueWealth isolation coverage:** positive controls, denied targets, IPv6 and guest contents.
+
+**Keel container contract** — the same in `snapshot`, `verify`, `compare` (both records) and `probe`:
+- **The expected inventory comes from Keel's own deployment definition, not from a list here.** `roles/keel` installs `infra/lab/compose.lab.yml` of the built Keel commit, as a plain copy, at `/srv/data/services/keel/compose.lab.yml`. `hostcheck.sh` reads that file and accepts it only if its SHA-256 equals the reviewed file at the pinned `keel_commit` (`9b0d36f0…`, `73a4ac34…`). Every `container_name` under `services:` is then an expected container, required **exactly once**: today postgres, nats, temporal, minio, minio-bucket, bootstrap, gateway, runtime-worker and web.
+  - If the file is unreadable or differs from the reviewed definition, the snapshot is INCOMPLETE and the probe reports INCONCLUSIVE or FAIL.
+  - The copy and the derived `stable/keel-inventory.txt` are bound by the record. `verify` re-derives the inventory and re-checks the hash.
+  - `tests/ci-activation` binds the commit, path and copy task to `roles/keel`. Where the Keel source is available, it re-derives the hash and the inventory from `git show <keel_commit>:infra/lab/compose.lab.yml`.
+- **One-shot jobs** are exactly `bootstrap` and `minio-bucket`: the set `roles/keel/tasks/verify.yml` exempts from "running". In the bound Compose file, they are exactly the services with `restart: 'no'`. They run one command, exit, and gate the gateway through `service_completed_successfully`. If the two sources disagree, the inventory is refused.
+  - Each must have **completed successfully**: `status=exited`, `exit=0`, `oom=false`.
+  - A nonzero exit, an OOM kill, or a `created` or `running` one-shot blocks.
+- **Every other expected container is long-running**: it must be `running`, and `healthy` where it has a health check.
+  - An exited long-running service blocks, even with exit 0.
+  - So does `restarting`, or a health state of `starting` or `unhealthy`.
+- **Also blocking, even when all five HTTP endpoints return 200:**
+  - a missing expected container (a missing worker, postgres or web, for example);
+  - an expected container listed twice;
+  - a `keel-lab-*` container that is not in the inventory.
+- **Also blocking:** a failed `docker inspect` (INCONCLUSIVE in the probe) and any unrecognised state line.
+- **Evidence:** each container's line is kept in the snapshot's `stable/keel-state.txt` as `/<name> restarts=N status=S exit=E oom=B health=H`, and in the probe directory's `keel-state.txt`. It is hash-bound by the record, and compared byte-for-byte before and after, so a one-shot rerun or a changed exit code shows as a regression.
+- HTTP health alone never satisfies the contract.
+- **Keeping the contract honest:** `tests/ci-activation` checks that the one-shot list equals `verify.yml`'s, and that the inventory binding matches `roles/keel`.
+  - Changing the one-shot list needs a matching change to Keel's Compose file and to `verify.yml`.
+  - Moving `keel_commit` needs the new file's hash in `hostcheck.sh`. The drift test fails until it is updated.
+
+**Probe verdicts.**
+- **PASS for a denied target** is an *observed* outcome: the guest got no connection, and the host reached the same address and port. Drop-counter changes are printed as supporting evidence only.
+- **INCONCLUSIVE:** a failed query, a missing tool or address, or a target that does not answer even from the host. It is never a pass.
+- **EXPECTED_UNAVAILABLE:** only for PostgreSQL on 10.0.0.3:5432, which is documented absent because Keel binds it to 127.0.0.1. It is not evidence.
+- **Exit codes:** 0 OK, 1 FAIL, 2 INCONCLUSIVE, 3 evidence-log failure.
+- **Not covered live:** spoofed-source traffic and unsolicited inbound. Those rest on the namespace test (§12 below).
+
+**Every denied target must leave the guest through its external interface.** The probe reads the guest's default route (its external interface, `enp5s0`) and runs `ip -4 route get` in the guest for each destination before probing it.
+- **Rejected as INCONCLUSIVE, never evidence:**
+  - a destination local to the guest (for example `local 172.17.0.1 dev lo`: the guest's own `docker0` holds the host's docker0 address);
+  - one routed via another guest interface (an overlapping network);
+  - one with no route;
+  - a failed route query.
+- **Recorded** with each result: the guest's route, the host control and the guest outcome.
+
+**Host Docker bridge target: discovered, not assumed.** The probe no longer uses a fixed `172.17.0.1`. It reads the host's bridge networks from Docker's metadata (`docker network ls --filter driver=bridge`, `docker network inspect`; read-only), falling back to the bridge interface's own address when IPAM has no gateway. It then tries candidates in order, default bridge first:
+1. The address must belong to the host.
+2. The guest must route it through its external interface.
+3. It must answer a host-side control on `:443`.
+
+The first address that passes all three is probed, and every candidate's identity, route, control and disposition is recorded. With none, this coverage stays INCONCLUSIVE. Nothing is created: no listener, no address and no Docker or firewall change.
+
+**Re-probing an existing deployment with a corrected checker.** The provisioning revision and its snapshots stay the record of the deployment: the before and after snapshots, and `compare`, taken by the checker staged at that revision. A later checker correction does **not** create a new before-provisioning baseline, and does not re-run `compare` or `provision`. It only re-runs `probe`, recording itself separately:
+```bash
+# on dc1-arm-1: an exact, clean checkout of the CHECKER commit K (steps 0-1 above, with C=K and W=$HOME/preflight/hds-$K)
+K=<checker commit>; D=<deployment commit, e.g. 1b7eed2d2a8c41d2b4ce6b84a815aaff8f1f270b>
+scp "${S[@]}" "$HOME/preflight/hds-$K/tools/ci-activation/hostcheck.sh" $H:ci-shared-check/hostcheck-$K.sh \
+  && ssh "${S[@]}" $H "sha256sum ~/ci-shared-check/hostcheck-$K.sh" && shasum -a 256 "$HOME/preflight/hds-$K/tools/ci-activation/hostcheck.sh"
+ssh -t "${S[@]}" $H "bash ~/ci-shared-check/hostcheck-$K.sh probe $D $K"; echo "probe exit: $?"
+```
+- The staged `hostcheck.sh` from the deployment revision stays in place, next to `hostcheck-$K.sh`.
+- The new `probe-<UTC>/` records `INFRA_SHA` = `D` (the deployment), and `CHECKER` = the checker's own SHA-256, commit `K` and path.
+- Earlier probe directories and all snapshots are left as they are.
+
+**Stop at the first of these, and report:**
+- any `STOP:` line;
+- a snapshot `RESULT: INCOMPLETE`;
+- the wrapper exiting nonzero;
+- `compare` or `probe` not ending in `RESULT: OK` with exit 0;
+- `dc1-ci-1` offline;
+- anything unexpected in production.
+
+**On failure, change nothing:**
+- no re-run, rebuild, unregister, `lxc delete`, `lvremove`, `nft delete`, `iptables -D`, `systemctl stop|disable` or rollback of the shared host;
+- take `hostcheck.sh snapshot after-failure $C`. It may itself be INCOMPLETE, which is still evidence; do not retry it;
+- run `probe` if the VM exists;
+- keep the provisioning log and every `~/ci-shared-check/*` directory;
+- report the failing step, the recap line and the `RESULT`, `FAIL` and `STOP` lines.
+
+Any remediation is a separate, reviewed change.
+
+`tests/run-ci-runner-truewealth.sh` §13 tests these tools locally with
+stand-ins. It covers:
+- fail-closed snapshots and damaged or partial records;
+- the gate refusing a fresh snapshot with five HTTP 200s but no record;
+- failed queries never becoming PASS;
+- log failure;
+- checkout verification against real clones: wrong SHA, untracked file, vault file, changed allocation, changed policy template, unrelated history;
+- the wrapper's exit status.
+
+It also loads the freshly rendered policy into a real nft to keep the probe's
+expected table equal to it.
+
+**Shared-host evidence.** The snapshot's `stable/` files hold:
+- Keel's `inet ci_egress` (stateless);
+- `iptables-save` filter and nat, with counters and `citwbr0` lines removed;
+- every other nft table;
+- LXD's `lxdbr0` rules;
+- the units `ci-egress`, `docker`, `snap.lxd.daemon` and `caddy`;
+- `dc1-ci-1`'s expanded configuration without `volatile.*`;
+- `lxdbr0`;
+- the Keel containers, with restart count, state, exit code, OOM flag and health (one-shots included);
+- Keel's health contract from `roles/keel/tasks/verify.yml`:
+  - `http://127.0.0.1:3000/healthz`;
+  - `http://127.0.0.1:3000/readyz`;
+  - `http://127.0.0.1:8080/`;
+  - `https://keel.dc1.lan/`;
+  - `https://keel.dc1.lan/__keel/healthz`.
+
+Memory, VG, `docker stats`, counters and `lxc list` are volatile context. Also
+compare `gh api repos/meetyaks/keel/actions/runners --jq '.runners[] | {name,status}'`:
+`dc1-ci-1` must stay `online`, and `busy` may change with jobs.
+
+**Expected to change (not regressions):** nft and iptables counters (hence
+`-s` and the stripped `[n:m]`); `docker stats`, container uptime; free/available
+memory (lower by what dc1-ci-tw-1 uses); VG free −50 GiB and the new
+`ci-tw-lxd` LV; new objects: bridge `citwbr0`, table `inet ci_egress_tw`,
+`DOCKER-USER` rules `-i citwbr0`/`-o citwbr0` (exactly once each), units
+`ci-egress-tw` / `ci-egress-tw-early`, LXD's own `citwbr0` rules, pool
+`ci-tw-pool`, instance `dc1-ci-tw-1`; the Keel runner's `busy` flag.
+
+**Regressions (stop before registration):** any line of `stable/` differing —
+Keel's table, any non-`citwbr0` iptables rule (Docker's, Tailscale's, Keel's
+`lxdbr0` rules), any other nft table, LXD's `lxdbr0` rules, a unit's enabled
+or active state, `dc1-ci-1`'s configuration or limits, `lxdbr0`, the Keel
+container set, images, a **higher restart count** or non-running/unhealthy
+state, or any Keel health endpoint not `200`; `dc1-ci-1` offline; and in
+`volatile/docker-user.txt` a `citwbr0` rule present twice or a `lxdbr0` rule
+missing.
+
+`tests/run-ci-runner-truewealth.sh` §12 loads both rendered policies and both
+appliers together in network namespaces (both orders, re-application) and
+checks exactly these invariants with real packets. What it proves is limited
+to the policies **rendered from the tested revision** against a **simulated**
+host: Docker's and Tailscale's chains are stand-ins (no dockerd, tailscaled
+or LXD runs), so their own later rule rewrites are not exercised. It does
+**not** prove what dc1-x86 is running: that Keel's policy renders the same
+at an earlier revision says nothing about the files, tables or rules actually
+loaded there. Live equality is established only by the before/after
+snapshots above, taken on the host.

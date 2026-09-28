@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # MANAGED BY roles/ci_runner — runs inside {{ ci_vm_name }}, as root.
 #
-# ⚠️ THE TOKEN ARRIVES ON STDIN AND NOWHERE ELSE. Not in this file, not in the
-# `lxc exec` argument vector, not in an environment variable, not in a file on
-# either machine. It is therefore absent from `ps` on dc1-x86, from the host's
-# shell history and from Ansible's recorded task arguments — and the one task
-# that carries it is `no_log`.
-#
-# The single place it becomes an argument is `config.sh --token` in this guest,
-# for the seconds that call runs. GitHub's runner offers no stdin form; that
-# residue is inside the VM that is already entitled to use the token, and the
-# token is single-use and expires within the hour.
+# ⚠️ THE TOKEN ARRIVES ON STDIN AND IS NEVER A PROCESS ARGUMENT. Not in this
+# file, not in the `lxc exec` argument vector, not in a file on either machine,
+# and not in config.sh's arguments: it is handed to the runner as
+# ACTIONS_RUNNER_INPUT_TOKEN, which actions/runner reads as the --token input,
+# registers with its secret masker and removes from its own environment
+# (src/Runner.Listener/CommandSettings.cs, verified at the pinned version).
+# The variable is exported only for that one call (inherited by runuser and
+# config.sh, both of which run as the entitled principal inside this VM) and
+# unset before anything else runs; the service installed afterwards never
+# sees it.
 set -euo pipefail
 
 RUNNER_USER='{{ ci_runner_user }}'
@@ -34,10 +34,11 @@ if [ -f .runner ]; then
   exit 0
 fi
 
+export ACTIONS_RUNNER_INPUT_TOKEN="$TOKEN"
+unset TOKEN
 runuser -u "$RUNNER_USER" -- ./config.sh \
   --unattended \
   --url '{{ ci_runner_scope_url }}' \
-  --token "$TOKEN" \
   --name '{{ ci_runner_name }}' \
   --labels '{{ ci_runner_labels }}' \
   --work "$RUNNER_WORK" \
@@ -46,7 +47,7 @@ runuser -u "$RUNNER_USER" -- ./config.sh \
   --ephemeral \
 {% endif %}
   --disableupdate
-unset TOKEN
+unset ACTIONS_RUNNER_INPUT_TOKEN
 
 # ⚠️ `--disableupdate` IS NOT LAZINESS. A self-updating runner replaces its own
 # binaries from the internet outside this role's control, which would silently

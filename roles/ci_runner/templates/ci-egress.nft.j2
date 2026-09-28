@@ -12,7 +12,7 @@
 # ⚠️ ITS OWN TABLE, deliberately. dc1-x86 already has an `ip filter` ruleset that
 # belongs to TAILSCALE (ts-input, tailscale0, udp/41641). Adding rules to a table
 # somebody else owns is how one of these gets flushed by the other's next
-# reload. `inet ci_egress` is only ever written by this role.
+# reload. `inet {{ ci_egress_table }}` is only ever written by this role.
 #
 # ⚠️ AND IT IS A SUBNET DENY, NOT A DOMAIN ALLOW-LIST. nftables cannot match
 # hostnames. The honest statement of policy is:
@@ -37,10 +37,10 @@
 # exist, the delete then always succeeds, and nft applies the entire file as ONE
 # ATOMIC TRANSACTION — so the ruleset goes from the old policy to the new one
 # with no moment in between.
-table inet ci_egress {}
-delete table inet ci_egress
+table inet {{ ci_egress_table }} {}
+delete table inet {{ ci_egress_table }}
 
-table inet ci_egress {
+table inet {{ ci_egress_table }} {
 
   # ═══ TRAFFIC ADDRESSED TO THE HOST ITSELF ═══════════════════════════════
   #
@@ -61,33 +61,84 @@ table inet ci_egress {
     # host's `ip filter` ruleset, and this must not become a second opinion
     # about traffic that is nothing to do with CI.
     iifname != "{{ ci_lxd_bridge }}" accept
+{% if ci_isolation_hardening | bool %}
+
+    # No IPv6 at all from the CI bridge — not even replies or link-local. The
+    # bridge has no IPv6 by design; anything IPv6 arriving here is a path the
+    # IPv4 rules below would not see.
+    meta nfproto ipv6 counter drop
+{% endif %}
 
     ct state established,related accept
 
     # The two services the guest legitimately needs FROM the host: LXD's
     # resolver and its DHCP server.
+{% if ci_egress_sibling_isolation | bool %}
+    # Sibling isolation: DNS only from THIS bridge's own resolver. Another CI
+    # bridge's resolver is also a host address, and answering from it would
+    # hand this VM a view of the sibling's network.
+    ip saddr {{ ci_lxd_subnet_cidr }} ip daddr {{ ci_lxd_gateway }} udp dport 53 counter accept
+    ip saddr {{ ci_lxd_subnet_cidr }} ip daddr {{ ci_lxd_gateway }} tcp dport 53 counter accept
+{% if ci_isolation_hardening | bool %}
+    # DHCP by its ports, whatever the source: a DISCOVER comes from 0.0.0.0.
+    udp sport 68 udp dport 67 counter accept
+{% else %}
+    ip saddr {{ ci_lxd_subnet_cidr }} udp dport 67 counter accept
+{% endif %}
+{% else %}
     ip saddr {{ ci_lxd_subnet_cidr }} udp dport { 53, 67 } counter accept
     ip saddr {{ ci_lxd_subnet_cidr }} tcp dport 53 counter accept
+{% endif %}
 
     # Everything else the CI VM aims at this host — every other port, on every
     # address the host owns — is refused.
+{% if ci_isolation_hardening | bool %}
+    # Keyed on the interface alone: a spoofed source address is refused too.
+    counter drop
+{% else %}
     ip saddr {{ ci_lxd_subnet_cidr }} counter drop
+{% endif %}
   }
 
   chain forward {
     # priority -10: ahead of Docker's and LXD's own forward rules, so a DROP here
     # is not overridden by an ACCEPT they install.
     type filter hook forward priority -10; policy accept;
+{% if ci_isolation_hardening | bool %}
+
+    # No IPv6 through the CI bridge in either direction (see the input chain).
+    iifname "{{ ci_lxd_bridge }}" meta nfproto ipv6 counter drop
+    oifname "{{ ci_lxd_bridge }}" meta nfproto ipv6 counter drop
+{% endif %}
 
     # Replies to connections the VM opened. Without this, every allowed outbound
     # connection would stall on its first response packet.
     ct state established,related accept
+{% if ci_egress_sibling_isolation | bool %}
+
+    # Sibling isolation: nothing may OPEN a connection into this bridge — not
+    # the LAN, not another CI VM on this host (the host forwards between its
+    # own bridges, and a sibling's policy may permit 80/443 to any address it
+    # does not list). Replies were accepted just above; a drop is terminal
+    # across tables, so no other chain can re-admit it.
+    oifname "{{ ci_lxd_bridge }}" ct state new counter drop
+{% endif %}
 
     # ── Everything below concerns traffic ORIGINATING in the CI VM ──────────
+{% if ci_isolation_hardening | bool %}
+    # A source outside the bridge's subnet is spoofed: refused before anything
+    # else, and every rule below is keyed on the interface.
+    iifname "{{ ci_lxd_bridge }}" ip saddr != {{ ci_lxd_subnet_cidr }} counter drop
+{% for cidr in ci_egress_denied_cidrs %}
+    # {{ cidr }}
+    iifname "{{ ci_lxd_bridge }}" ip daddr {{ cidr }} counter drop
+{% endfor %}
+{% else %}
 {% for cidr in ci_egress_denied_cidrs %}
     # {{ cidr }}
     iifname "{{ ci_lxd_bridge }}" ip saddr {{ ci_lxd_subnet_cidr }} ip daddr {{ cidr }} counter drop
 {% endfor %}
+{% endif %}
 
     # The public internet, on the ports a build actually needs: package
     # registries, the GitHub API and the Actions service, container registries.
@@ -108,6 +159,10 @@ table inet ci_egress {
 
     # Anything else leaving the CI bridge is refused. Last, so the accepts above
     # are what define the policy.
+{% if ci_isolation_hardening | bool %}
+    iifname "{{ ci_lxd_bridge }}" counter drop
+{% else %}
     iifname "{{ ci_lxd_bridge }}" ip saddr {{ ci_lxd_subnet_cidr }} counter drop
+{% endif %}
   }
 }

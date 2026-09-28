@@ -21,7 +21,7 @@
 - name: LXD — initialise the pool and an isolated NAT bridge
   ansible.builtin.include_tasks: lxd.yml
 
-- name: VM — create dc1-ci-1 with no path to the host
+- name: VM — create {{ ci_vm_name }} with no path to the host
   ansible.builtin.include_tasks: vm.yml
 
 - name: Egress — the outbound policy, enforced on the host
@@ -37,13 +37,15 @@
 - name: What remains for the operator
   ansible.builtin.debug:
     msg:
-      - "dc1-ci-1 is provisioned and the runner binaries are installed."
+      - "{{ ci_vm_name }} is provisioned and the runner binaries are installed."
       - ""
       - "REGISTRATION IS MANUAL, BY DESIGN. The token is single-use, short-lived,"
       - "and must not pass through a playbook's recorded output. Generate one at:"
       - "  {{ ci_runner_scope_url }}/settings/actions/runners/new?arch=x64&os=linux"
       - "then run, on the controller:"
-      - "  ansible-playbook playbooks/ci-runner.yml --tags register \\"
-      - "    -e ci_runner_token=<the token>"
+      - "  read -rs CI_RUNNER_TOKEN && export CI_RUNNER_TOKEN   (or omit: hidden prompt)"
+      - "  ansible-playbook {{ ci_runner_playbook }} --tags register --ask-become-pass"
+      - "  unset CI_RUNNER_TOKEN"
+      - "Never pass it with -e: that puts it in process arguments and shell history."
       - ""
       - "Nothing above this line ever sees that token."

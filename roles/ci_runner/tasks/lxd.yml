@@ -57,3 +57,33 @@
       - ipv6.address=none
   when: ci_net_check.rc != 0
   changed_when: true
+
+- name: Read the bridge's addressing (hardening)
+  # A bridge that already existed is adopted by name above; with hardening it
+  # must also BE what this role would have created. A hand-made or drifted
+  # bridge with IPv6, another subnet or no NAT is refused, never adopted.
+  ansible.builtin.command:
+    argv: [lxc, network, get, "{{ ci_lxd_bridge }}", "{{ item }}"]
+  loop: [ipv4.address, ipv4.nat, ipv6.address]
+  register: ci_net_keys
+  changed_when: false
+  check_mode: false
+  when:
+    - ci_isolation_hardening | bool
+    - ci_net_check.rc == 0
+
+- name: The existing bridge must match this role's configuration exactly
+  ansible.builtin.assert:
+    that:
+      - (ci_net_keys.results[0].stdout | trim) == ci_lxd_subnet
+      - (ci_net_keys.results[1].stdout | trim) == 'true'
+      - (ci_net_keys.results[2].stdout | trim) in ['none', '']
+    fail_msg: >-
+      {{ ci_lxd_bridge }} exists with ipv4.address={{ ci_net_keys.results[0].stdout | trim }},
+      ipv4.nat={{ ci_net_keys.results[1].stdout | trim }},
+      ipv6.address={{ ci_net_keys.results[2].stdout | trim }}; this role requires
+      {{ ci_lxd_subnet }}, true and none. Investigate before changing it.
+    quiet: true
+  when:
+    - ci_isolation_hardening | bool
+    - ci_net_check.rc == 0

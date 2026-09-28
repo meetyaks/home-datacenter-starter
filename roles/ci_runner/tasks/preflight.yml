@@ -9,7 +9,7 @@
     that:
       - ansible_architecture == 'x86_64'
     fail_msg: >-
-      dc1-ci-1 must be x86-64: the runner tarball, the Actions runner itself and
+      {{ ci_vm_name }} must be x86-64: the runner tarball, the Actions runner itself and
       the linux/amd64 images the integration lane builds are all architecture
       specific. Got {{ ansible_architecture }}.
     quiet: true
@@ -56,31 +56,71 @@
   # that has changed, another owner exists and initialising would be taking over
   # somebody else's hypervisor.
   #
-  # ⚠️ `-c n` — THE NAME COLUMN ONLY, AND THAT IS NOT TIDINESS. The full CSV
-  # includes the addresses column, which is QUOTED AND MULTI-LINE once an
-  # instance has an IP: `dc1-ci-1,RUNNING,"10.71.0.60 (enp5s0)` and its
-  # continuation arrive as two entries in `stdout_lines`, and the continuation
-  # matches no instance name. The check duly reported the role's own VM as a
-  # stranger's — `LXD already holds instances this role does not own:
-  # ['10.71.0.60 (enp5s0)",,VIRTUAL-MACHINE,0']` — and refused to re-run. One
-  # column, no commas, no quoting, nothing to misparse.
+  #
+  # ⚠️ JSON, NOT CSV. The CSV form once reported this role's own VM as a
+  # stranger: its addresses column is quoted and multi-line once an instance
+  # has an IP, and the continuation line matched no name. JSON has no such
+  # shape, and it carries each instance's config — which is where a sibling
+  # runner VM's ownership marker lives (see ci_lxd_owner_key).
   ansible.builtin.command:
-    argv: [lxc, list, --format, csv, -c, n]
+    argv: [lxc, list, --format, json]
   register: ci_lxd_instances
   changed_when: false
   failed_when: false
   check_mode: false
 
+- name: Parse what LXD holds
+  ansible.builtin.set_fact:
+    ci_lxd_instances_json: "{{ ci_lxd_instances.stdout | default('[]', true) }}"
+
 - name: No instance may exist that this role did not create
+  # Siblings — other runner VMs this role built on the same host — are not
+  # strangers: see ci_lxd_sibling_instances and ci_lxd_owner_key.
   ansible.builtin.assert:
     that:
-      - (ci_lxd_instances.stdout_lines | map('trim') | select | reject('equalto', ci_vm_name) | list | length) == 0
+      - (ci_lxd_foreign_instances | length) == 0
     fail_msg: >-
       LXD on {{ inventory_hostname }} already holds instances this role does not
-      own: {{ ci_lxd_instances.stdout_lines | reject('search', '^' ~ ci_vm_name ~ ',') | list }}.
+      own: {{ ci_lxd_foreign_instances }}.
       Someone else is using this hypervisor. Stop and establish ownership rather
       than reconfiguring it underneath them.
     quiet: true
+
+# ── Capacity, from the live host (opt-in: ci_capacity_check) ──────────────
+- name: Account for every other instance's limits
+  ansible.builtin.assert:
+    that:
+      - (ci_capacity_instances | selectattr('memory_mib', 'lt', 0) | list | length) == 0
+      - (ci_capacity_instances | selectattr('cpu', 'lt', 0) | list | length) == 0
+      - (ci_vm_memory_mib | int) > 0
+    fail_msg: >-
+      Cannot account for host capacity: every other instance needs a numeric
+      limits.cpu and a limits.memory in MiB/GiB, and so does this one. Found:
+      {{ ci_capacity_instances }}; this instance: {{ ci_vm_memory }}.
+    quiet: true
+  when: ci_capacity_check | bool
+
+- name: This instance must fit beside production and the other instances
+  vars:
+    ci_cap_other_mem: "{{ ci_capacity_instances | map(attribute='memory_mib') | sum }}"
+    ci_cap_other_cpu: "{{ ci_capacity_instances | map(attribute='cpu') | sum }}"
+  ansible.builtin.assert:
+    that:
+      - (ansible_memtotal_mb | int) - (ci_cap_other_mem | int) - (ci_vm_memory_mib | int) >= (ci_capacity_reserve_memory_mib | int)
+      - (ansible_processor_vcpus | int) - (ci_cap_other_cpu | int) - (ci_vm_cpu | int) >= (ci_capacity_reserve_cpu | int)
+    fail_msg: >-
+      {{ ci_vm_name }} ({{ ci_vm_cpu }} vCPU, {{ ci_vm_memory_mib }} MiB) does not
+      fit on {{ inventory_hostname }}: {{ ansible_memtotal_mb }} MiB and
+      {{ ansible_processor_vcpus }} vCPU total, {{ ci_cap_other_mem }} MiB and
+      {{ ci_cap_other_cpu }} vCPU already committed to other instances, and
+      {{ ci_capacity_reserve_memory_mib }} MiB / {{ ci_capacity_reserve_cpu }} vCPU
+      must stay for the host and production. Reduce this instance or free capacity.
+    success_msg: >-
+      Capacity: {{ ansible_memtotal_mb }} MiB / {{ ansible_processor_vcpus }} vCPU
+      total; others {{ ci_cap_other_mem }} MiB / {{ ci_cap_other_cpu }} vCPU;
+      this {{ ci_vm_memory_mib }} MiB / {{ ci_vm_cpu }} vCPU; reserve kept.
+    quiet: true
+  when: ci_capacity_check | bool
 
 - name: Confirm the volume group has room for the CI volume
   ansible.builtin.command:
@@ -109,10 +149,11 @@
   # a full VG cannot grow /srv/data or take a snapshot.
   ansible.builtin.assert:
     that:
-      - (ci_vg_free.stdout | default('0') | trim | float) >= (ci_lv_size | regex_replace('[gG]$', '') | float)
+      - (ci_vg_free.stdout | default('0') | trim | float) >= (ci_lv_size | regex_replace('[gG]$', '') | float) + (ci_vg_reserve_g | float)
     fail_msg: >-
       {{ ci_vg_name }} has {{ ci_vg_free.stdout | default('?') | trim }} GiB free,
-      which is less than the {{ ci_lv_size }} this role wants. Reduce ci_lv_size
+      which is less than the {{ ci_lv_size }} this role wants plus the
+      {{ ci_vg_reserve_g }} GiB that must stay free. Reduce ci_lv_size
       rather than consuming the last extents of a production volume group.
     success_msg: >-
       {{ ci_vg_name }} has {{ ci_vg_free.stdout | default('?') | trim }} GiB free;
