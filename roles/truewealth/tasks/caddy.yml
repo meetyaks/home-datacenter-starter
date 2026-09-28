@@ -1,0 +1,62 @@
+---
+# The TrueWealth route: one drop-in in roles/caddy's conf.d, following the
+# same contract as roles/keel/tasks/caddy.yml. The drop-in is validated on
+# its own when written; roles/caddy's reload-and-verify then validates the
+# WHOLE composed configuration before reloading, and the route must appear in
+# the configuration Caddy has LOADED.
+
+- name: Confirm Caddy's drop-in directory exists
+  ansible.builtin.stat:
+    path: "{{ truewealth_caddy_sites_dir }}"
+  register: truewealth_caddy_dir
+  check_mode: false
+
+- name: Fail when the drop-in directory is missing
+  ansible.builtin.assert:
+    that:
+      - truewealth_caddy_dir.stat.exists | default(false)
+      - truewealth_caddy_dir.stat.isdir | default(false)
+    fail_msg: >-
+      {{ truewealth_caddy_sites_dir }} does not exist although roles/caddy
+      reported success in this play. roles/caddy owns it; investigate there.
+    quiet: true
+  when: caddy_artifacts_real | default(true) | bool
+
+- name: Create the TrueWealth access log owned by Caddy's account
+  # Before validation: root's `caddy validate` would otherwise create it
+  # root-owned and the reload would fail to open it.
+  ansible.builtin.file:
+    path: "{{ truewealth_caddy_log_dir }}/{{ truewealth_hostname }}.log"
+    state: touch
+    owner: "{{ caddy_service_user | default('caddy') }}"
+    group: "{{ caddy_service_group | default('caddy') }}"
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+  when: caddy_artifacts_real | default(true) | bool
+
+- name: Install the TrueWealth route
+  ansible.builtin.template:
+    src: truewealth.caddy.j2
+    dest: "{{ truewealth_caddy_site_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "{{ caddy_binary_path | default('/usr/bin/caddy') }} validate --adapter caddyfile --config %s"
+  notify: Reload Caddy
+
+- name: Apply the pending reload and prove Caddy is serving it
+  ansible.builtin.import_role:
+    name: caddy
+    tasks_from: reload-and-verify
+
+- name: The TrueWealth route must be in the configuration Caddy has LOADED
+  ansible.builtin.assert:
+    that:
+      - truewealth_hostname in (caddy_active_config_json | default(''))
+    fail_msg: >-
+      INGRESS: {{ truewealth_hostname }} is not in Caddy's LOADED configuration
+      although {{ truewealth_caddy_site_file }} is on disk and validates.
+    success_msg: "INGRESS: {{ truewealth_hostname }} is live in Caddy's loaded configuration."
+    quiet: true
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool

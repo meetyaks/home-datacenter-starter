@@ -1,0 +1,56 @@
+---
+# The DR backup timer: a oneshot service and a daily timer (the scripts are
+# installed by tasks/scripts.yml, before the deployment needs them). The first run
+# happens on the timer, or on demand with `systemctl start truewealth-backup`.
+
+- name: Install the backup service and timer
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: truewealth-backup.service
+      content: |
+        # Managed by roles/truewealth (home-datacenter-starter).
+        [Unit]
+        Description=TrueWealth disaster-recovery backup (consistent pg_dump + manifest)
+        After=docker.service
+        Requires=docker.service
+
+        [Service]
+        Type=oneshot
+        ExecStart={{ truewealth_sbin_dir }}/truewealth-backup --reason scheduled
+        Nice=10
+        IOSchedulingClass=idle
+    - name: truewealth-backup.timer
+      content: |
+        # Managed by roles/truewealth (home-datacenter-starter).
+        [Unit]
+        Description=Daily TrueWealth backup
+
+        [Timer]
+        OnCalendar={{ truewealth_backup_on_calendar }}
+        Persistent=true
+        RandomizedDelaySec=300
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  register: truewealth_backup_units
+
+- name: Observe whether the timer unit is on disk
+  ansible.builtin.stat:
+    path: /etc/systemd/system/truewealth-backup.timer
+  register: truewealth_timer_file
+  check_mode: false
+
+- name: Enable the timer
+  ansible.builtin.systemd_service:
+    name: truewealth-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: "{{ truewealth_backup_units is changed }}"
+  when: truewealth_timer_file.stat.exists or not ansible_check_mode

@@ -119,4 +119,10 @@ echo "══ installation identity (7 cases + no committed value) ════�
 ansible-playbook tests/installation-identity.yml
 
 echo
+echo "══ TrueWealth deployment role (controller-side) ════════════════════"
+# Set TW_APP_REPO to a TrueWealth checkout for the compose checks, and
+# TW_BACKUP_LIVE* to exercise backup/restore against a disposable stack.
+tests/run-truewealth-role.sh
+
+echo
 echo "All regression suites passed."

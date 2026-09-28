@@ -1,0 +1,9 @@
+---
+# A dedicated host group at the containers' GID, so the Redis password file
+# can be group-readable by the app containers and by nobody else on the host.
+- name: Reserve the runtime GID for TrueWealth
+  ansible.builtin.group:
+    name: "{{ truewealth_runtime_group }}"
+    gid: "{{ truewealth_runtime_gid }}"
+    system: true
+    state: present

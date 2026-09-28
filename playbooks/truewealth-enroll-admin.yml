@@ -1,0 +1,28 @@
+---
+# The first TrueWealth platform administrator, through the application CLI.
+#
+#   ansible-playbook playbooks/truewealth-enroll-admin.yml --ask-become-pass \
+#     -e truewealth_admin_email=you@example.com
+#
+# A separate playbook (not a tag) because the password prompt would otherwise
+# appear on every deploy. The password is read without echo and passed to the
+# CLI on stdin only, on a pipelined task (never a module file on the host).
+# Never pass it with -e: that is a process argument and a shell-history entry
+# (and it would silently skip the prompt); the role refuses it.
+- name: Enroll a TrueWealth administrator
+  hosts: linux_servers
+  become: true
+  gather_facts: false
+  vars:
+    ansible_remote_tmp: /tmp/ansible-truewealth
+    truewealth_admin_reason: "first administrator, enrolled by {{ lookup('env', 'USER') }} via Ansible"
+  vars_prompt:
+    - name: truewealth_admin_password_input
+      prompt: "New administrator password (min 12 characters)"
+      private: true
+      confirm: true
+  tasks:
+    - name: Enroll
+      ansible.builtin.include_role:
+        name: truewealth
+        tasks_from: enroll-admin

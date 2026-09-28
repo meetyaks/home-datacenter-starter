@@ -1,0 +1,58 @@
+---
+# The explicit, one-shot migration step (only when something is pending).
+# Web and worker refuse to START on a pending migration, so a failure here
+# stops the deployment before `up`. The runner is advisory-locked and applies
+# each migration in its own transaction (TrueWealth db/client.ts): after a
+# failure, earlier migrations of the batch stay applied.
+#
+# Output is REPORTED BOUNDED: the migration names applied/pending and the
+# migrator's one-line failure summary (it prints the error message only,
+# never the error object — db/migrate.ts), truncated, with anything quoted
+# elided. The full output is not echoed: a database error can quote data.
+
+- name: Apply migrations
+  ansible.builtin.command:
+    argv: "{{ (truewealth_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T', 'migrate'] }}"
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_migrate
+  changed_when: truewealth_migrate.rc == 0
+  failed_when: false
+
+- name: What the migration step reported (bounded)
+  ansible.builtin.set_fact:
+    truewealth_migrate_report:
+      exit: "{{ truewealth_migrate.rc }}"
+      applied: "{{ truewealth_migrate.stdout_lines | select('match', '^\\s+applied \\S+$') | map('regex_replace', '^\\s+applied ', '') | list }}"
+      failure: >-
+        {{ ((truewealth_migrate.stderr_lines + truewealth_migrate.stdout_lines)
+            | select('match', '^migrate: FAILED') | list | first | default(''))
+           | regex_replace('\x27[^\x27]*\x27', "'…'")
+           | regex_replace('\\([^)]*\\)=\\([^)]*\\)', '(…)=(…)')
+           | regex_replace('[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+', '[email]')
+           | truncate(300) }}
+
+- name: After a failure, read what is applied and what is still pending
+  ansible.builtin.command:
+    argv: "{{ (truewealth_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T', 'migrate', 'node', 'dist/ops/migrate.mjs', '--status'] }}"
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_mstatus_after
+  changed_when: false
+  failed_when: false
+  when: truewealth_migrate.rc != 0
+
+- name: Stop when migrations failed
+  ansible.builtin.fail:
+    msg:
+      - "Migrations FAILED (exit {{ truewealth_migrate.rc }}): {{ truewealth_migrate_report.failure or 'no failure summary' }}"
+      - "Applied in this run before the failure: {{ truewealth_migrate_report.applied }}"
+      - "Still pending: {{ truewealth_mstatus_after.stdout_lines | default([]) | select('match', '^\\s+pending \\S+$') | map('regex_replace', '^\\s+pending ', '') | list }}"
+      - "Nothing was started. The schema was NOT rolled back and no data was restored."
+  when: truewealth_migrate.rc != 0
+
+- name: Confirm nothing is pending
+  ansible.builtin.command:
+    argv: "{{ (truewealth_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T', 'migrate', 'node', 'dist/ops/migrate.mjs', '--status'] }}"
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_migrate_status
+  changed_when: false
+  failed_when: truewealth_migrate_status.rc != 0 or truewealth_migrate_status.stdout is not search(', 0 pending')

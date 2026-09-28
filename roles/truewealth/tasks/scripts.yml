@@ -1,0 +1,46 @@
+---
+# Operational scripts on the host, installed BEFORE anything is migrated or
+# started: the deployment itself uses them (a pre-migration recovery point,
+# bounded failure diagnostics). They hold no secret; the backup and restore
+# scripts read the env file at run time.
+
+- name: Install age when backups are encrypted for off-host transfer
+  ansible.builtin.apt:
+    name: age
+    state: present
+    update_cache: false
+  when: truewealth_backup_age_recipients | length > 0
+
+- name: Off-host transfer needs recipients to encrypt to
+  ansible.builtin.assert:
+    that:
+      - truewealth_backup_offhost_target == '' or truewealth_backup_age_recipients | length > 0
+      - truewealth_backup_offhost_target == '' or truewealth_backup_offhost_ssh_key != ''
+    fail_msg: >-
+      truewealth_backup_offhost_target is set, but backups can only leave the
+      host encrypted: set truewealth_backup_age_recipients (public keys) and
+      truewealth_backup_offhost_ssh_key.
+    quiet: true
+
+- name: Retention may only delete once its policy is approved
+  ansible.builtin.assert:
+    that:
+      - (truewealth_backup_keep | int) == 0 or (truewealth_backup_retention_approved | bool)
+    fail_msg: >-
+      truewealth_backup_keep is {{ truewealth_backup_keep }} but
+      truewealth_backup_retention_approved is false. Deleting backups needs an
+      approved scope and period; set both deliberately.
+    quiet: true
+
+- name: Install the backup, restore-verification and diagnostics scripts
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ truewealth_sbin_dir }}/{{ item.dest }}"
+    owner: "{{ truewealth_owner }}"
+    group: "{{ truewealth_group }}"
+    mode: "0700"
+    validate: /bin/bash -n %s
+  loop:
+    - { src: truewealth-backup.sh.j2, dest: truewealth-backup }
+    - { src: truewealth-restore-verify.sh.j2, dest: truewealth-restore-verify }
+    - { src: truewealth-diagnose.sh.j2, dest: truewealth-diagnose }

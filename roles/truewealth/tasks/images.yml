@@ -1,0 +1,114 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Load the VERIFIED archives and accept only the recorded identities.
+#
+# Docker reports `.Id` as the image CONFIG digest (classic image store) or the
+# manifest/index digest (containerd image store). transfer.json lists exactly
+# which values are acceptable for each image; anything else is refused, and
+# the labels must name this commit. An archive is copied only when the image
+# is not already present with an accepted identity.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Inspect any image already under each expected tag
+  ansible.builtin.command:
+    argv: [docker, image, inspect, --format, "{{ '{{' }}.Id{{ '}}' }}", "{{ item.value.localTag }}"]
+  register: truewealth_present
+  loop: "{{ truewealth_images | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  changed_when: false
+  failed_when: false
+
+- name: Images whose tag is absent must be transferred and loaded
+  ansible.builtin.set_fact:
+    truewealth_need: "{{ truewealth_present.results | selectattr('rc', 'ne', 0) | map(attribute='item.key') | list }}"
+
+- name: A present image under our tag must already have an accepted identity
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim in truewealth_images[item.item.key].acceptLoadedIds
+    fail_msg: >-
+      {{ item.item.value.localTag }} exists on the host as {{ item.stdout | trim }},
+      which is not an identity recorded for it. Something else wrote this tag.
+      Remove it deliberately (docker image rm {{ item.item.value.localTag }})
+      after investigating; this role will not overwrite it.
+    quiet: true
+  loop: "{{ truewealth_present.results | selectattr('rc', 'equalto', 0) | list }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Copy the archives that are needed
+  ansible.builtin.copy:
+    src: "{{ truewealth_transfer_dir }}/{{ truewealth_images[item].archive }}"
+    dest: "{{ truewealth_images_dir }}/{{ truewealth_images[item].archive }}"
+    owner: "{{ truewealth_owner }}"
+    group: "{{ truewealth_group }}"
+    mode: "0600"
+  loop: "{{ truewealth_need }}"
+
+- name: Hash them again on the host
+  ansible.builtin.stat:
+    path: "{{ truewealth_images_dir }}/{{ truewealth_images[item].archive }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: truewealth_host_archive
+  loop: "{{ truewealth_need }}"
+
+- name: Each transferred archive must hash to the verified value
+  ansible.builtin.assert:
+    that:
+      - ('sha256:' ~ item.stat.checksum) == truewealth_images[item.item].archiveSha256
+    fail_msg: "{{ item.item }}: the archive changed in transfer."
+    quiet: true
+  loop: "{{ truewealth_host_archive.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Load them
+  ansible.builtin.command:
+    argv: [docker, load, --quiet, --input, "{{ truewealth_images_dir }}/{{ truewealth_images[item].archive }}"]
+  register: truewealth_loaded
+  loop: "{{ truewealth_need }}"
+  changed_when: true
+
+- name: Read every image's identity and labels after loading
+  ansible.builtin.command:
+    argv: [docker, image, inspect, --format, "{{ '{{' }}json .{{ '}}' }}", "{{ item.value.localTag }}"]
+  register: truewealth_after
+  loop: "{{ truewealth_images | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  changed_when: false
+
+- name: Every image must have an accepted identity and name this commit
+  vars:
+    img: "{{ item.stdout | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - img.Id in truewealth_images[item.item.key].acceptLoadedIds
+      - img.Os ~ '/' ~ img.Architecture == truewealth_platform
+      - img.Config.Labels['org.opencontainers.image.revision'] == truewealth_commit
+      - img.Config.Labels['io.truewealth.source.tree-state'] == 'clean'
+      - img.Config.Labels['org.opencontainers.image.title'] == 'truewealth-' ~ item.item.key
+    fail_msg: >-
+      {{ item.item.value.localTag }} loaded as {{ img.Id }} ({{ img.Os }}/{{ img.Architecture }},
+      revision {{ img.Config.Labels['org.opencontainers.image.revision'] | default('none') }}),
+      which is not the verified image for {{ truewealth_commit }}. Refusing to deploy it.
+    quiet: true
+  loop: "{{ truewealth_after.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Record the identities the running containers must match
+  ansible.builtin.set_fact:
+    truewealth_loaded_ids: >-
+      {{ dict(truewealth_after.results | map(attribute='item.key')
+         | zip(truewealth_after.results | map(attribute='stdout') | map('from_json') | map(attribute='Id'))) }}
+
+- name: Remove the transferred archives once loaded
+  # The images are in Docker's store; keeping ~1-2 GB of archives per
+  # release on /srv/data buys nothing the transfer directory does not have.
+  ansible.builtin.file:
+    path: "{{ truewealth_images_dir }}/{{ truewealth_images[item].archive }}"
+    state: absent
+  loop: "{{ truewealth_need }}"

@@ -1,0 +1,39 @@
+---
+# Everything under /srv/data/services/truewealth. Ownership by NUMBER: the
+# container users (postgres 70, redis 999) have no host accounts, and check
+# mode must not depend on a group this play has only predicted.
+
+- name: Root-owned directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ truewealth_root }}", mode: "0755" }
+    - { path: "{{ truewealth_data_root }}", mode: "0755" }
+    - { path: "{{ truewealth_env_dir }}", mode: "0700" }
+    - { path: "{{ truewealth_images_dir }}", mode: "0700" }
+    - { path: "{{ truewealth_backup_dir }}", mode: "0700" }
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: The secrets directory is readable by the runtime group only
+  ansible.builtin.file:
+    path: "{{ truewealth_secrets_dir }}"
+    state: directory
+    owner: root
+    group: "{{ truewealth_runtime_gid }}"
+    mode: "0750"
+
+- name: Data directories owned by their container users
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ truewealth_data_dirs }}"
+  loop_control:
+    label: "{{ item.path }}"

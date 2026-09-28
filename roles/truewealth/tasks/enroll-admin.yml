@@ -1,0 +1,81 @@
+---
+# First platform administrator, through the application's own CLI
+# (dist/ops/platform-admin.mjs in the migrator image). The password travels
+# ONLY on stdin: never an argument, never in output (every task that holds it
+# is no_log). Registration is invite-only; this is the supported first-admin
+# path.
+
+- name: The email must look like an address
+  ansible.builtin.assert:
+    that:
+      - truewealth_admin_email is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
+    fail_msg: Pass -e truewealth_admin_email=<address>.
+    quiet: true
+
+- name: Refuse a password passed as a variable
+  # -e truewealth_admin_password=… is visible in ps and shell history.
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.vars', 'truewealth_admin_password', default='__absent__') == '__absent__'
+    fail_msg: >-
+      truewealth_admin_password was supplied as a variable (e.g. -e). That exposes
+      it in process arguments and shell history; it is refused. Treat it as
+      disclosed, choose another, and answer the hidden prompt instead.
+    quiet: true
+
+- name: A password must have been entered
+  ansible.builtin.assert:
+    that:
+      - truewealth_admin_password_input | default('') | length >= 12
+    fail_msg: The administrator password must be at least 12 characters.
+    quiet: true
+  no_log: true
+
+- name: The stack must be deployed (the CLI runs against its database)
+  ansible.builtin.stat:
+    path: "{{ truewealth_env_file }}"
+  register: truewealth_enroll_env
+  check_mode: false
+
+- name: Refuse before a deployment exists
+  ansible.builtin.assert:
+    that:
+      - truewealth_enroll_env.stat.exists
+    fail_msg: Deploy TrueWealth first (playbooks/truewealth.yml).
+    quiet: true
+
+- name: Modules must reach the host streamed before the password is sent
+  ansible.builtin.include_tasks: pipelining-probe.yml
+  vars:
+    truewealth_probe_purpose: the administrator password
+  when: not ansible_check_mode
+
+- name: Enroll the administrator
+  ansible.builtin.command:
+    argv: >-
+      {{ (truewealth_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T', 'migrate',
+         'node', 'dist/ops/platform-admin.mjs', 'enroll',
+         '--email', truewealth_admin_email, '--reason', truewealth_admin_reason] }}
+    chdir: "{{ truewealth_root }}"
+    stdin: "{{ truewealth_admin_password_input }}"
+    stdin_add_newline: true
+  vars:
+    ansible_pipelining: true
+  register: truewealth_enroll
+  changed_when: truewealth_enroll.rc == 0
+  failed_when: false
+  no_log: true
+  when: not ansible_check_mode
+
+- name: Report the outcome (the CLI prints no secret)
+  ansible.builtin.debug:
+    msg: "{{ (truewealth_enroll.stdout | default('')) ~ ' ' ~ (truewealth_enroll.stderr | default('')) }}"
+  when: not ansible_check_mode
+
+- name: Enrollment must have succeeded
+  ansible.builtin.assert:
+    that:
+      - truewealth_enroll.rc == 0
+    fail_msg: Enrollment failed; see the message above.
+    quiet: true
+  when: not ansible_check_mode

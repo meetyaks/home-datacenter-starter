@@ -1,0 +1,15 @@
+---
+# The REAL roles/truewealth, end to end, against the local Docker engine with
+# STAND-IN application images (tests/fixtures/tw-standin) and a real Caddy
+# ingress with an internal CA. Driven by tests/truewealth-deploy-harness.sh
+# inside a Linux container; every value that differs from production comes
+# from the harness's vars file (-e @vars.yml).
+- name: Deploy TrueWealth (test)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  tasks:
+    - name: TrueWealth
+      ansible.builtin.include_role:
+        name: truewealth

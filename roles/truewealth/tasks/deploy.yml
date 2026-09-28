@@ -1,0 +1,84 @@
+---
+# Start (or converge) the stack from the loaded images only, wait for real
+# health, and prove the running containers are the verified images.
+#
+# ⚠️ NO `compose down`, AND NO `--remove-orphans`, IN A ROUTINE DEPLOY. `up`
+# recreates only what changed. A container of this project that the compose
+# file does not define is REPORTED, never removed: it may be an operator's
+# one-off, a forensic leftover or somebody else's mistake, and deleting it is
+# a decision.
+
+- name: Start the stack and wait for every health check
+  ansible.builtin.command:
+    argv: >-
+      {{ (truewealth_compose_cmd | split) + ['up', '-d', '--pull', 'never', '--wait',
+         '--wait-timeout', truewealth_wait_timeout_seconds | string]
+         + (['--scale', 'worker=0'] if truewealth_hold_worker | bool else []) }}
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_up
+  changed_when: truewealth_up.stderr is search('(Recreate|Creat|Start|Stopp|Remov)')
+  failed_when: false
+
+- name: When the stack did not become healthy, collect bounded diagnostics and stop
+  when: truewealth_up.rc != 0
+  block:
+    - name: Bounded diagnostics (states, health, exit codes; no log content by default)
+      ansible.builtin.command:
+        argv: "{{ [truewealth_sbin_dir ~ '/truewealth-diagnose'] + (['--log-excerpt'] if truewealth_diagnostics_log_excerpt | bool else []) }}"
+      register: truewealth_diag
+      changed_when: false
+      failed_when: false
+    - name: Stop
+      ansible.builtin.fail:
+        msg: "{{ ['The stack did not become healthy within ' ~ truewealth_wait_timeout_seconds ~ 's (compose exit ' ~ truewealth_up.rc ~ ').'] + truewealth_diag.stdout_lines + ['Full logs, deliberately, on the host: docker compose -p ' ~ truewealth_project ~ ' logs <service>'] }}"
+
+- name: Read the image each running service uses
+  ansible.builtin.command:
+    argv: [docker, inspect, --format, "{{ '{{' }}.Image{{ '}}' }}", "{{ truewealth_project }}-{{ item }}-1"]
+  register: truewealth_running_images
+  loop: "{{ ['web', 'compute'] + ([] if truewealth_hold_worker | bool else ['worker']) }}"
+  changed_when: false
+
+- name: Every running container must be the verified, loaded image
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim == truewealth_loaded_ids[item.item]
+    fail_msg: >-
+      {{ item.item }} runs {{ item.stdout | trim }}, not the loaded
+      {{ truewealth_loaded_ids[item.item] }}.
+    quiet: true
+  loop: "{{ truewealth_running_images.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: A held worker must not be running
+  ansible.builtin.command:
+    argv: [docker, ps, -q, --filter, "label=com.docker.compose.project={{ truewealth_project }}", --filter, "label=com.docker.compose.service=worker"]
+  register: truewealth_worker_running
+  changed_when: false
+  failed_when: truewealth_worker_running.stdout | length > 0
+  when: truewealth_hold_worker | bool
+
+- name: Containers of this project the compose file does not define
+  ansible.builtin.command:
+    argv: [docker, ps, -a, --filter, "label=com.docker.compose.project={{ truewealth_project }}", --format,
+           "{{ '{{' }}.Names{{ '}}' }} {{ '{{' }}.Label \"com.docker.compose.service\"{{ '}}' }} {{ '{{' }}.Label \"com.docker.compose.oneoff\"{{ '}}' }} {{ '{{' }}.Status{{ '}}' }}"]
+  register: truewealth_all_containers
+  changed_when: false
+
+- name: Classify them
+  ansible.builtin.set_fact:
+    # A one-off (`compose run`) container still present, or a service the
+    # rendered configuration does not have, is unexpected.
+    truewealth_unexpected: >-
+      {{ truewealth_all_containers.stdout_lines
+         | select('regex', '^\S+ (?!(' ~ (truewealth_cfg_facts.services | reject('equalto', 'migrate') | join('|')) ~ ') False )')
+         | list }}
+
+- name: Report unexpected containers (NOT removed)
+  ansible.builtin.debug:
+    msg:
+      - "WARNING: {{ truewealth_unexpected | length }} container(s) in project {{ truewealth_project }} are not part of this deployment."
+      - "They were NOT removed. Investigate, then remove deliberately (docker rm <name>) if appropriate:"
+      - "{{ truewealth_unexpected }}"
+  when: truewealth_unexpected | length > 0

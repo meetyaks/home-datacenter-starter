@@ -1,0 +1,70 @@
+---
+# Before migrating a database that already holds data:
+#
+#   1. a RECOVERY POINT — a consistent backup of the pre-migration state
+#      (truewealth-backup --reason pre-migration, kept outside retention);
+#   2. the WORKER STOPPED — scheduled jobs, broker sync and any trading
+#      activity must not run against a schema that is changing. The web
+#      container keeps serving on the release that is running now; migrations
+#      must therefore be backward-compatible with it (add, backfill, and only
+#      remove in a LATER release), which is the application's migration
+#      contract. The migrator itself is advisory-locked.
+#
+# Nothing here, or later, rolls the schema back or restores data
+# automatically: after a failure the recovery point is an INPUT to an approved
+# restore procedure (README: Restore), never an automatic action.
+
+- name: A recovery point is required before migrating existing data
+  ansible.builtin.assert:
+    that:
+      - (truewealth_premigration_backup | bool) or (truewealth_allow_migration_without_recovery_point | bool)
+    fail_msg: >-
+      {{ truewealth_pending | length }} migration(s) are pending on a database
+      that holds data, and the pre-migration recovery point is disabled.
+      Enable truewealth_premigration_backup, or record the decision to proceed
+      without one by setting truewealth_allow_migration_without_recovery_point.
+    quiet: true
+
+- name: Take the pre-migration recovery point
+  ansible.builtin.command:
+    argv: ["{{ truewealth_sbin_dir }}/truewealth-backup", --reason, pre-migration]
+  register: truewealth_recovery
+  changed_when: truewealth_recovery.rc == 0
+  failed_when: false
+  when: truewealth_premigration_backup | bool
+
+- name: Stop if there is no recovery point
+  ansible.builtin.fail:
+    msg: >-
+      The pre-migration backup failed (exit {{ truewealth_recovery.rc }}:
+      {{ (truewealth_recovery.stderr_lines | select('match', '^truewealth-backup:') | list | last | default('no message')) | truncate(300) }}).
+      Nothing was migrated and the running release is untouched.
+  when:
+    - truewealth_premigration_backup | bool
+    - truewealth_recovery.rc != 0
+
+- name: Record where it is
+  ansible.builtin.set_fact:
+    truewealth_recovery_point: >-
+      {{ (truewealth_recovery.stdout | regex_search('truewealth-backup: (\S+) \(', '\1') | first)
+         if (truewealth_premigration_backup | bool) else 'none (explicitly allowed)' }}
+
+- name: Note it in the attempt record
+  ansible.builtin.include_tasks: attempt.yml
+  vars:
+    truewealth_attempt_update:
+      preMigrationRecoveryPoint: "{{ truewealth_recovery_point }}"
+
+- name: Stop the worker before the schema changes
+  ansible.builtin.command:
+    argv: "{{ (truewealth_compose_cmd | split) + ['stop', 'worker'] }}"
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_worker_stop
+  changed_when: true
+  when: "'worker' in truewealth_running"
+
+- name: Note the stopped worker in the attempt record
+  ansible.builtin.include_tasks: attempt.yml
+  vars:
+    truewealth_attempt_update:
+      workerStoppedForMigration: "{{ 'worker' in truewealth_running }}"

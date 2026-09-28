@@ -1,0 +1,169 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# TrueWealth on dc1-x86 — deployed from VERIFIED images, never built here.
+#
+# The images were built once and tested natively on the CI runner (release.yml,
+# no write credential), exported as that run's artifact, and verified on the
+# admin plane by scripts/release/fetch-verify.mjs (TrueWealth repository)
+# against the GitHub API and GitHub's artifact digest; it wrote a transfer
+# directory: <role>.tar archives, evidence.json and transfer.json (schema 2). This role copies
+# those archives to the host, checks their SHA-256 again, loads them, and
+# refuses any image whose loaded identity is not the one recorded. The host
+# never pulls TrueWealth images and never holds a registry credential.
+#
+# Sibling of roles/keel: its own compose project (`truewealth`), directory
+# tree, secrets, loopback port, Caddy drop-in, backups — nothing shared with
+# Keel except the host's Docker daemon and the canonical Caddy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── What to deploy (both REQUIRED, no defaults that could be deployed) ─────
+# The full application commit that was approved and validated.
+truewealth_commit: ""
+# On the controller (admin plane): the directory fetch-verify.mjs wrote.
+truewealth_transfer_dir: ""
+# On the controller: a clone of the TrueWealth repository containing
+# truewealth_commit. The compose file is read from that exact commit.
+truewealth_source_repo: "{{ lookup('env', 'HOME') }}/Projects/truewealth"
+truewealth_compose_path_in_repo: infra/dc1/compose.dc1.yml
+truewealth_platform: linux/amd64
+truewealth_sbin_dir: /usr/local/sbin
+# Host expectations checked by preflight (production values; the role's own
+# tests run on other hardware and override them).
+truewealth_expected_architecture: x86_64
+truewealth_data_mount: /srv/data
+# The approved CI run the bundle must come from (fetch-verify.mjs records it
+# in transfer.json). Both REQUIRED; the deployment refuses a bundle from any
+# other run or attempt.
+truewealth_run_id: ""
+truewealth_run_attempt: ""
+# Evidence classes a production deployment accepts. Only "ci" (native
+# linux/amd64 on the CI runner). Tests of this role override it; a
+# production inventory must never.
+truewealth_accept_evidence_classes: [ci]
+truewealth_image_roles: [web, worker, compute, migrator]
+
+# ── Layout under /srv/data/services/truewealth ─────────────────────────────
+truewealth_root: /srv/data/services/truewealth
+truewealth_data_root: "{{ truewealth_root }}/data"
+truewealth_env_dir: "{{ truewealth_root }}/env"
+truewealth_env_file: "{{ truewealth_env_dir }}/truewealth.env"
+truewealth_secrets_dir: "{{ truewealth_root }}/secrets"
+truewealth_redis_password_file: "{{ truewealth_secrets_dir }}/redis_password"
+truewealth_images_dir: "{{ truewealth_root }}/images"
+truewealth_backup_dir: "{{ truewealth_root }}/backups"
+truewealth_compose_file: "{{ truewealth_root }}/compose.dc1.yml"
+truewealth_deployment_manifest: "{{ truewealth_root }}/DEPLOYMENT_MANIFEST.json"
+truewealth_rollback_file: "{{ truewealth_root }}/ROLLBACK_PREVIOUS.json"
+# The attempt currently (or last) being deployed: written when a CHANGED
+# deployment starts, closed as succeeded or failed. DEPLOYMENT_MANIFEST.json
+# is written ONLY after every verification passed; ROLLBACK_PREVIOUS.json
+# holds the last DISTINCT successful deployment before it.
+truewealth_attempt_file: "{{ truewealth_root }}/DEPLOYMENT_ATTEMPT.json"
+truewealth_project: truewealth
+# Owner of the non-secret files the role writes (tests override it).
+truewealth_owner: root
+truewealth_group: root
+truewealth_compose_cmd: >-
+  docker compose --project-name {{ truewealth_project }}
+  --env-file {{ truewealth_env_file }} -f {{ truewealth_compose_file }}
+
+# The compose file's data paths (hard-coded there) and the users that own them.
+truewealth_data_dirs:
+  - { path: "{{ truewealth_data_root }}/postgres", owner: "70", group: "70", mode: "0700" }
+  - { path: "{{ truewealth_data_root }}/redis", owner: "999", group: "999", mode: "0700" }
+
+# The app containers run as uid/gid 1001 and must read the Redis password
+# file. The host group with that GID must be ours (created here if absent);
+# preflight refuses if a different group holds it.
+truewealth_runtime_gid: 1001
+truewealth_runtime_group: truewealth-runtime
+
+# ── Network and ingress ─────────────────────────────────────────────────────
+# Loopback only; Keel holds 3000 and 8080.
+truewealth_web_loopback_port: 3100
+truewealth_hostname: tw.dc1.lan
+# The role owns its Caddy drop-in (roles/caddy must have run in the play).
+# Only the role's own tests turn this off, supplying their own TLS ingress.
+truewealth_manage_ingress: true
+truewealth_caddy_sites_dir: /etc/caddy/conf.d
+truewealth_caddy_site_file: "{{ truewealth_caddy_sites_dir }}/truewealth.caddy"
+truewealth_caddy_log_dir: /var/log/caddy
+
+# ── Secrets (from the Ansible Vault on the admin plane) ────────────────────
+# inventory/group_vars/linux_servers/vault.yml; see vault.yml.example.
+truewealth_required_vault_vars:
+  - truewealth_vault_db_password
+  - truewealth_vault_key_secret
+  - truewealth_vault_compute_token
+  - truewealth_vault_redis_password
+# Optional provider keys; empty means the feature stays off.
+truewealth_optional_env:
+  TW_SMTP_HOST: "{{ truewealth_vault_smtp_host | default('') }}"
+  TW_SMTP_PORT: "{{ truewealth_vault_smtp_port | default('') }}"
+  TW_SMTP_USER: "{{ truewealth_vault_smtp_user | default('') }}"
+  TW_SMTP_PASS: "{{ truewealth_vault_smtp_pass | default('') }}"
+  TW_SMTP_FROM: "{{ truewealth_vault_smtp_from | default('') }}"
+  TW_AUDIT_SIGNING_SECRET: "{{ truewealth_vault_audit_signing_secret | default('') }}"
+  # Encrypts stored LLM provider API keys (ai.providers); without it the
+  # application refuses to store them. A restore needs the SAME value.
+  TW_SECRET_KEY: "{{ truewealth_vault_secret_key | default('') }}"
+
+# ── Health ──────────────────────────────────────────────────────────────────
+truewealth_wait_timeout_seconds: 300
+truewealth_health_retries: 30
+truewealth_health_delay_seconds: 10
+
+# ── Migrations on an existing deployment ────────────────────────────────────
+# Before pending migrations run against a database that already holds data,
+# the role takes a pre-migration recovery point (truewealth-backup --reason
+# pre-migration) and stops the worker; the web container keeps serving on
+# the previous release while the migration runs (migrations must be
+# backward-compatible with the release that is running — expand, then
+# contract in a later release). Neither the schema nor the data is ever
+# rolled back automatically. Turning the recovery point off requires an
+# explicit, recorded decision.
+truewealth_premigration_backup: true
+truewealth_allow_migration_without_recovery_point: false
+
+# Start the stack WITHOUT the worker (scheduled jobs, broker sync, trading).
+# Used after a restore, until jobs and broker state are reconciled (README:
+# Redis loss and job reconciliation). Web and compute still start.
+truewealth_hold_worker: false
+
+# Failure diagnostics print metadata only (states, health, exit codes, log
+# line counts). true adds a short redacted log excerpt per service; the
+# redactor reduces exposure but cannot guarantee it.
+truewealth_diagnostics_log_excerpt: false
+
+# ── Disaster-recovery backups (infrastructure-owned) ────────────────────────
+#
+# A consistent PostgreSQL dump (pg_dump, one transaction) plus a secret-free
+# manifest, written root-only on the host daily. PostgreSQL is the only
+# authoritative store in this deployment: the compose file mounts no other
+# persistent volume except Redis (see the Redis decision below).
+truewealth_backup_enabled: true
+truewealth_backup_on_calendar: "*-*-* 03:40:00 UTC"
+# ⚠️ RETENTION IS DISABLED until its scope and period are approved: nothing is
+# deleted unless truewealth_backup_retention_approved is true AND keep > 0.
+# Even then only scheduled local backups are pruned — never pre-migration
+# recovery points, never off-host copies.
+truewealth_backup_keep: 0
+truewealth_backup_retention_approved: false
+# How long a backup waits for another one (timer vs pre-migration) to finish.
+truewealth_backup_lock_wait_seconds: 900
+# Off-host copies are ENCRYPTED to these age recipients (public keys; the
+# private key never touches this host) and sent with rsync over SSH to the
+# target. Both are operator inputs with NO default: nothing leaves the host
+# until they are set.
+truewealth_backup_age_recipients: []
+truewealth_backup_offhost_target: ""        # e.g. backup@nas.lan:/volume1/truewealth
+truewealth_backup_offhost_ssh_key: ""       # path on the host, root-only
+# Redis holds BullMQ queues and schedules only. It is NOT backed up or
+# restored: after a restore the worker re-registers every schedule at start,
+# and a stale queue replayed onto restored data could execute jobs twice
+# against rows they already touched. In-flight jobs at backup time are lost.
+truewealth_backup_redis_policy: not-restored
+
+# The TrueWealth commit this role's templates were written against, for the
+# record in the backup manifest's `deployment` block.
+truewealth_role_contract: truewealth-deploy/1
