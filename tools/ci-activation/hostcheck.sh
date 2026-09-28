@@ -29,41 +29,86 @@ sha_ok() { [ "${#1}" -eq 40 ] && case "$1" in *[!0-9a-f]*) false;; *) true;; esa
 sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 newest_dir() { ls -1d "$BASE/$1"-2* 2>/dev/null | sort | tail -n 1; }
 
-RECORD_FORMAT="hostcheck-snapshot v2"   # v2: Keel container state carries status, exit code, OOM and health
+
+RECORD_FORMAT="hostcheck-snapshot v3"   # v3: the expected Keel inventory, derived from the bound Compose file
 # Every file a completion record must bind. A snapshot missing any of them is not a baseline.
 REQUIRED_EVIDENCE="INFRA_SHA raw/nft-keel.txt raw/nft-ruleset.txt raw/nft-lxd.txt raw/iptables.txt
-raw/iptables-nat.txt raw/dc1-ci-1.yaml raw/keel-ps.txt stable/keel-nft.txt stable/iptables.txt
+raw/iptables-nat.txt raw/dc1-ci-1.yaml raw/keel-ps.txt raw/keel-compose.yml stable/keel-nft.txt stable/iptables.txt
 stable/iptables-nat.txt stable/nft-other.txt stable/lxd-lxdbr0.txt stable/units.txt stable/dc1-ci-1.txt
-stable/lxdbr0.txt stable/keel-containers.txt stable/keel-state.txt stable/keel-health.txt
+stable/lxdbr0.txt stable/keel-inventory.txt stable/keel-containers.txt stable/keel-state.txt stable/keel-health.txt
 volatile/docker-user.txt"
 KEEL_HEALTH_URLS="http://127.0.0.1:3000/healthz http://127.0.0.1:3000/readyz http://127.0.0.1:8080/
 https://keel.dc1.lan/ https://keel.dc1.lan/__keel/healthz"
 KEEL_DU_RULES=('-A DOCKER-USER -i lxdbr0 -j ACCEPT' '-A DOCKER-USER -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT')
 TW_DU_RULES=('-A DOCKER-USER -i citwbr0 -j ACCEPT' '-A DOCKER-USER -o citwbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT')
 
-# ── Keel's container contract ────────────────────────────────────────────────
+# ── Keel's service inventory and container contract ─────────────────────────
+#
+# THE EXPECTED INVENTORY IS NOT A LIST KEPT HERE. It is derived, on the host, from Keel's own
+# deployment definition: roles/keel/tasks/deploy.yml installs `infra/lab/compose.lab.yml` of the
+# built Keel commit, as a plain copy, at keel_compose_file. That file is accepted only if its
+# SHA-256 equals the reviewed file at the pinned keel_commit (below); every `container_name`
+# under `services:` is then an expected container, required exactly once. tests/ci-activation
+# binds these three values to roles/keel (keel_commit, keel_root/keel_compose_file, the copy
+# task) and, where the Keel source is available, re-derives the hash and the inventory from
+# `git show <keel_commit>:infra/lab/compose.lab.yml`.
+KEEL_COMMIT="9b0d36f008e726f830d96c4a3932b28d13bf68dd"                                  # roles/keel keel_commit
+KEEL_COMPOSE_LIVE="/srv/data/services/keel/compose.lab.yml"                            # keel_compose_file
+KEEL_COMPOSE_SHA256="73a4ac347d5363c2e055db0d91926eefe25bd990de80fa619013bb87b3b872cc" # infra/lab/compose.lab.yml at KEEL_COMMIT
+#
 # ONE-SHOT JOBS are exactly the services roles/keel/tasks/verify.yml exempts from "running"
-# (`^(bootstrap|minio-bucket) `). In Keel's infra/lab/compose.lab.yml at the pinned keel_commit
-# both have `restart: 'no'`, run one command and exit, and gate the gateway (and bootstrap the
-# runtime-worker) through `service_completed_successfully`. A one-shot must have COMPLETED
-# SUCCESSFULLY: present exactly once, exited, exit code 0, not OOM-killed. EVERY OTHER keel-lab
-# container is long-running: running, and healthy where it has a health check. Anything else —
-# a missing one-shot, a failed inspection, a nonzero exit, an unrecognised state — blocks.
-# tests/ci-activation keeps this list equal to verify.yml's.
+# (`^(bootstrap|minio-bucket) `); in the bound Compose file they are the services with
+# `restart: 'no'`, and gate the gateway (and bootstrap the runtime-worker) through
+# `service_completed_successfully`. The two sources must agree, or the inventory is refused.
+# A one-shot must have COMPLETED SUCCESSFULLY: exited, exit code 0, not OOM-killed. Every other
+# expected container is long-running: running, and healthy where it has a health check. A
+# missing or duplicated expected container, an unexpected keel-lab container, a failed
+# inspection, a nonzero exit or an unrecognised state blocks.
 KEEL_ONESHOT_SERVICES="bootstrap minio-bucket"
-KEEL_CONTAINER_PREFIX="keel-lab-"
 # The evidence line for one container; explicit fields so a reader (and the classifier) never guesses.
 KEEL_STATE_FORMAT='{{.Name}} restarts={{.RestartCount}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
-# State lines on stdin -> one line per violation of the contract; no output means the contract holds.
+
+# Compose file on stdin -> "service container_name restart" per service, sorted. A service
+# without a container_name or restart policy yields a line the inventory check rejects.
+keel_inventory() {
+  awk '
+    /^services:[[:space:]]*$/ { in_s = 1; next }
+    in_s && /^[^[:space:]#]/ { in_s = 0 }
+    !in_s { next }
+    /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { if (svc != "") print svc, (cn == "" ? "-" : cn), (rs == "" ? "-" : rs)
+                                         svc = $1; sub(/:$/, "", svc); cn = ""; rs = ""; next }
+    /^    container_name:/ { cn = $2 }
+    /^    restart:/ { rs = $2; gsub(/["\047]/, "", rs) }
+    END { if (svc != "") print svc, (cn == "" ? "-" : cn), (rs == "" ? "-" : rs) }' | sort
+}
+# Inventory on stdin -> one line per defect; no output means it is a usable contract.
+keel_inventory_problems() {
+  awk -v oneshots="$KEEL_ONESHOT_SERVICES" '
+    BEGIN { n = split(oneshots, o, " "); for (i = 1; i <= n; i++) want[o[i]] = 1 }
+    NF == 0 { next }
+    NF != 3 { print "unrecognised inventory line: " $0; next }
+    { rows++ }
+    $2 == "-" { print "service " $1 " has no container_name" }
+    $3 == "-" { print "service " $1 " has no restart policy" }
+    $3 == "no" && !($1 in want) { print "service " $1 " is restart: no but not a one-shot in roles/keel/tasks/verify.yml" }
+    ($1 in want) { got[$1] = 1; if ($3 != "no") print "one-shot " $1 " is not restart: no in the Compose file" }
+    ($2 in cont) { print "container_name " $2 " is used twice" } { cont[$2] = 1 }
+    END { if (rows == 0) print "no services found in the Compose file"
+          for (k in want) if (!(k in got)) print "one-shot " k " is not a service in the Compose file" }'
+}
+# keel_state_problems INVENTORY-FILE < state lines -> one line per violation of the container
+# contract; no output means every expected container is present once and in its required state.
 keel_state_problems() {
-  awk -v oneshots="$KEEL_ONESHOT_SERVICES" -v pfx="$KEEL_CONTAINER_PREFIX" '
-    BEGIN { n = split(oneshots, o, " "); for (i = 1; i <= n; i++) { one["/" pfx o[i]] = 1; seen["/" pfx o[i]] = 0 } }
+  awk -v oneshots="$KEEL_ONESHOT_SERVICES" '
+    BEGIN { n = split(oneshots, o, " "); for (i = 1; i <= n; i++) os[o[i]] = 1 }
+    FNR == NR { if (NF == 3) { c = "/" $2; exp_[c] = ($1 in os) ? "one-shot" : "long-running"; seen[c] = 0; ninv++ }; next }
     NF == 0 { next }
     $0 !~ /^\/[^ ]+ restarts=[0-9]+ status=[a-z]+ exit=-?[0-9]+ oom=(true|false) health=[a-z]+$/ { print "unrecognised state line: " $0; next }
     {
       name = $1; split($3, s, "="); split($4, x, "="); split($5, m, "="); split($6, h, "=")
-      if (name in one) {
-        seen[name]++
+      if (!(name in exp_)) { print "unexpected container " name " (not in the reviewed Compose inventory)"; next }
+      seen[name]++
+      if (exp_[name] == "one-shot") {
         if (s[2] != "exited" || x[2] != "0" || m[2] != "false")
           print "one-shot " name " did not complete successfully: status=" s[2] " exit=" x[2] " oom=" m[2]
       } else if (s[2] != "running") {
@@ -72,7 +117,19 @@ keel_state_problems() {
         print "long-running " name " is not healthy: health=" h[2]
       }
     }
-    END { for (k in seen) { if (seen[k] == 0) print "one-shot " k " is missing"; else if (seen[k] > 1) print "one-shot " k " appears " seen[k] " times" } }'
+    END { if (ninv == 0) print "no expected Keel inventory"
+          for (k in seen) { if (seen[k] == 0) print "expected " exp_[k] " " k " is missing"
+                            else if (seen[k] > 1) print "expected " exp_[k] " " k " appears " seen[k] " times" } }' "$1" -
+}
+# The whole contract for one set of evidence: bound Compose copy + derived inventory + state.
+# keel_evidence_problems COMPOSE-COPY INVENTORY-FILE STATE-FILE
+keel_evidence_problems() {
+  local h
+  h=$(sha256_of "$1" 2>/dev/null | awk '{print $1}')
+  [ "$h" = "$KEEL_COMPOSE_SHA256" ] || echo "the deployed Compose file is not the reviewed definition at keel_commit ${KEEL_COMMIT:0:8} (sha256 ${h:-unreadable})"
+  keel_inventory < "$1" | cmp -s - "$2" || echo "the recorded inventory does not match the Compose file"
+  keel_inventory_problems < "$2"
+  keel_state_problems "$2" < "$3"
 }
 
 # ═══ snapshot ═══════════════════════════════════════════════════════════════
@@ -150,8 +207,15 @@ snapshot() {
   collect stable/lxdbr0.txt sudo lxc network show lxdbr0 && has_line "$D/stable/lxdbr0.txt" '^name: lxdbr0$' \
     || bad_ev "lxc network show lxdbr0 (see errors/)"
 
-  # Keel's containers: every one inspected and judged by the container contract above —
-  # long-running ones running (healthy where checked), one-shots completed with exit 0
+  # Keel's expected inventory, from the deployed Compose file — accepted only as the reviewed
+  # definition at keel_commit (checked with the containers below)
+  if collect raw/keel-compose.yml sudo cat "$KEEL_COMPOSE_LIVE" && [ -s "$D/raw/keel-compose.yml" ]; then
+    keel_inventory < "$D/raw/keel-compose.yml" > "$D/stable/keel-inventory.txt" || bad_ev "derivation of keel-inventory"
+  else bad_ev "read $KEEL_COMPOSE_LIVE (see errors/)"; : > "$D/stable/keel-inventory.txt"; fi
+
+  # Keel's containers: every one inspected and judged by the container contract above — each
+  # expected container exactly once, one-shots completed with exit 0, long-running ones running
+  # (healthy where checked), nothing unexpected
   if collect raw/keel-ps.txt sudo docker ps -a --filter name=keel-lab --format '{{.Names}} {{.Image}} {{.Label "com.docker.compose.project"}}' \
      && [ -s "$D/raw/keel-ps.txt" ]; then
     sort "$D/raw/keel-ps.txt" > "$D/stable/keel-containers.txt" || bad_ev "derivation of keel-containers"
@@ -162,7 +226,7 @@ snapshot() {
     done
     n=$(awk 'END {print NR}' "$D/stable/keel-state.txt"); m=$(awk 'END {print NR}' "$D/stable/keel-containers.txt")
     [ "$n" = "$m" ] || bad_ev "container state for $n of $m Keel containers"
-    bad=$(keel_state_problems < "$D/stable/keel-state.txt")
+    bad=$(keel_evidence_problems "$D/raw/keel-compose.yml" "$D/stable/keel-inventory.txt" "$D/stable/keel-state.txt")
     [ -z "$bad" ] || bad_ev "Keel container contract: $(printf '%s' "$bad" | tr '\n' ';')"
   else bad_ev "docker ps keel-lab: error or no containers (see errors/)"; fi
 
@@ -236,9 +300,9 @@ verify_record() { # dir phase sha [max-age-minutes] -> 0 only if every check pas
   done
   n=$(awk '$2 == "200" {n++} END {print n + 0}' "$d/stable/keel-health.txt" 2>/dev/null)
   [ "$n" = 5 ] || vr_bad "Keel health is $n/5 at 200"
-  # The same container contract the snapshot applied, re-applied to the bound evidence.
-  if [ -f "$d/stable/keel-state.txt" ]; then
-    n=$(keel_state_problems < "$d/stable/keel-state.txt")
+  # The same inventory and container contract the snapshot applied, re-applied to the bound evidence.
+  if [ -f "$d/raw/keel-compose.yml" ] && [ -f "$d/stable/keel-inventory.txt" ] && [ -f "$d/stable/keel-state.txt" ]; then
+    n=$(keel_evidence_problems "$d/raw/keel-compose.yml" "$d/stable/keel-inventory.txt" "$d/stable/keel-state.txt")
     [ -z "$n" ] || vr_bad "Keel container contract: $(printf '%s' "$n" | tr '\n' ';')"
   fi
   if [ -n "$max" ]; then
@@ -560,20 +624,24 @@ probe_body() {
     elif [ "$rc" -eq 0 ] && [ "$code" = 200 ]; then rec keel PASS "health $u 200"
     else rec keel FAIL "health $u: HTTP ${code:-none}, curl exit $rc"; fi
   done
-  # The same container contract as the snapshot: one-shots completed (exit 0), the rest running/healthy.
+  # The same inventory and container contract as the snapshot: the deployed Compose file must be the
+  # reviewed definition; every expected container exactly once; one-shots completed (exit 0); the
+  # rest running and healthy where checked; nothing unexpected.
   qry sudo docker ps -a --filter name=keel-lab --format '{{.Names}}'
-  if [ "$QRC" -ne 0 ]; then rec keel INCONCLUSIVE "docker ps keel-lab failed: $QOUT"
-  elif [ -z "$QOUT" ]; then rec keel FAIL "no keel-lab containers found"
+  if ! sudo cat "$KEEL_COMPOSE_LIVE" > "$D/keel-compose.yml" 2> "$D/keel-compose.err" || [ ! -s "$D/keel-compose.yml" ]; then
+    rec keel INCONCLUSIVE "cannot read the deployed Compose file $KEEL_COMPOSE_LIVE; the expected inventory is unknown"
+  elif [ "$QRC" -ne 0 ]; then rec keel INCONCLUSIVE "docker ps keel-lab failed: $QOUT"
   else
+    keel_inventory < "$D/keel-compose.yml" > "$D/keel-inventory.txt"
     iok=1; : > "$D/keel-state.txt"
     for u in $(printf '%s\n' "$QOUT" | sort); do
       sudo docker inspect --format "$KEEL_STATE_FORMAT" "$u" >> "$D/keel-state.txt" 2>>"$D/keel-state.err" || iok=0
     done
     if [ "$iok" != 1 ]; then rec keel INCONCLUSIVE "docker inspect failed for a keel-lab container (see $D/keel-state.err)"
     else
-      problems=$(keel_state_problems < "$D/keel-state.txt")
+      problems=$(keel_evidence_problems "$D/keel-compose.yml" "$D/keel-inventory.txt" "$D/keel-state.txt")
       if [ -n "$problems" ]; then rec keel FAIL "Keel container contract: $(printf '%s' "$problems" | tr '\n' ';')"
-      else rec keel PASS "Keel containers: one-shots ($KEEL_ONESHOT_SERVICES) completed with exit 0; the other $(awk 'END {print NR - 2}' "$D/keel-state.txt") running and healthy where checked"; fi
+      else rec keel PASS "Keel containers: all $(awk 'END {print NR}' "$D/keel-inventory.txt") services of the reviewed Compose file present once; one-shots ($KEEL_ONESHOT_SERVICES) completed with exit 0; the rest running and healthy where checked"; fi
     fi
   fi
 
@@ -637,7 +705,7 @@ probe() {
   return "$body"
 }
 
-if [ "${HOSTCHECK_LIB:-0}" != 1 ]; then
+hostcheck_main() {
   case "${1:-}" in
     snapshot) shift; snapshot "$@"; exit $? ;;
     verify)   shift; verify_cmd "$@"; exit $? ;;
@@ -645,4 +713,5 @@ if [ "${HOSTCHECK_LIB:-0}" != 1 ]; then
     probe)    shift; probe "$@"; exit $? ;;
     *) die "usage: hostcheck.sh snapshot <phase> <sha> | verify <phase> <sha> [max-min] | compare <sha> | probe <sha>" ;;
   esac
-fi
+}
+if [ "${HOSTCHECK_LIB:-0}" != 1 ]; then hostcheck_main "$@"; fi

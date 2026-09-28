@@ -467,7 +467,7 @@ reads the host, and writes nothing outside `~/ci-shared-check` (0700).
 - **`snapshot`** is fail-closed:
   - each required collector's own exit status and output structure are checked, and stderr is kept in `errors/`;
   - it requires Keel's DOCKER-USER rules each exactly once, readable unit states with docker, LXD and Caddy active, every Keel container to satisfy the **container contract** (below), and Keel's five health endpoints (below) at 200;
-  - only then does it write `COMPLETE` (format `hostcheck-snapshot v2`), which binds the phase, `C`, the snapshot identity, the creation time and the SHA-256 of all 20 required evidence files, with an end count;
+  - only then does it write `COMPLETE` (format `hostcheck-snapshot v3`), which binds the phase, `C`, the snapshot identity, the creation time and the SHA-256 of all 22 required evidence files, including the deployed Compose file and the inventory derived from it, with an end count;
   - otherwise it prints `RESULT: INCOMPLETE`, exits 1 and writes no record.
 - **`verify`** checks the **newest** snapshot of a phase, and re-applies the container contract to its bound evidence. An older valid snapshot is never used instead.
 - **`compare`** verifies both records, requires `stable/` to be byte-identical and each `citwbr0` and `lxdbr0` DOCKER-USER rule exactly once. It exits 1 on anything else.
@@ -477,12 +477,26 @@ reads the host, and writes nothing outside `~/ci-shared-check` (0700).
   - **TrueWealth isolation coverage:** positive controls, denied targets, IPv6 and guest contents.
 
 **Keel container contract** — the same in `snapshot`, `verify`, `compare` (both records) and `probe`:
-- **One-shot jobs** are exactly `bootstrap` and `minio-bucket`: the set `roles/keel/tasks/verify.yml` exempts from "running". In Keel's `infra/lab/compose.lab.yml` at the pinned `keel_commit`, both have `restart: 'no'`, run one command and exit, and gate the gateway through `service_completed_successfully`. Each must be present exactly once and have **completed successfully**: `status=exited`, `exit=0`, `oom=false`. A nonzero exit, an OOM kill, a `created` or `running` one-shot, a missing one-shot, or a duplicate blocks.
-- **Every other `keel-lab-*` container is long-running**: it must be `running`, and `healthy` where it has a health check. An exited long-running service blocks, even with exit 0, and so do `restarting` or a health state of `starting` or `unhealthy`.
+- **The expected inventory comes from Keel's own deployment definition, not from a list here.** `roles/keel` installs `infra/lab/compose.lab.yml` of the built Keel commit, as a plain copy, at `/srv/data/services/keel/compose.lab.yml`. `hostcheck.sh` reads that file and accepts it only if its SHA-256 equals the reviewed file at the pinned `keel_commit` (`9b0d36f0…`, `73a4ac34…`). Every `container_name` under `services:` is then an expected container, required **exactly once**: today postgres, nats, temporal, minio, minio-bucket, bootstrap, gateway, runtime-worker and web.
+  - If the file is unreadable or differs from the reviewed definition, the snapshot is INCOMPLETE and the probe reports INCONCLUSIVE or FAIL.
+  - The copy and the derived `stable/keel-inventory.txt` are bound by the record. `verify` re-derives the inventory and re-checks the hash.
+  - `tests/ci-activation` binds the commit, path and copy task to `roles/keel`. Where the Keel source is available, it re-derives the hash and the inventory from `git show <keel_commit>:infra/lab/compose.lab.yml`.
+- **One-shot jobs** are exactly `bootstrap` and `minio-bucket`: the set `roles/keel/tasks/verify.yml` exempts from "running". In the bound Compose file, they are exactly the services with `restart: 'no'`. They run one command, exit, and gate the gateway through `service_completed_successfully`. If the two sources disagree, the inventory is refused.
+  - Each must have **completed successfully**: `status=exited`, `exit=0`, `oom=false`.
+  - A nonzero exit, an OOM kill, or a `created` or `running` one-shot blocks.
+- **Every other expected container is long-running**: it must be `running`, and `healthy` where it has a health check.
+  - An exited long-running service blocks, even with exit 0.
+  - So does `restarting`, or a health state of `starting` or `unhealthy`.
+- **Also blocking, even when all five HTTP endpoints return 200:**
+  - a missing expected container (a missing worker, postgres or web, for example);
+  - an expected container listed twice;
+  - a `keel-lab-*` container that is not in the inventory.
 - **Also blocking:** a failed `docker inspect` (INCONCLUSIVE in the probe) and any unrecognised state line.
 - **Evidence:** each container's line is kept in the snapshot's `stable/keel-state.txt` as `/<name> restarts=N status=S exit=E oom=B health=H`, and in the probe directory's `keel-state.txt`. It is hash-bound by the record, and compared byte-for-byte before and after, so a one-shot rerun or a changed exit code shows as a regression.
 - HTTP health alone never satisfies the contract.
-- **Keeping the list honest:** `tests/ci-activation` checks that the one-shot list equals `verify.yml`'s. Changing it needs a matching change to Keel's Compose contract and `verify.yml`.
+- **Keeping the contract honest:** `tests/ci-activation` checks that the one-shot list equals `verify.yml`'s, and that the inventory binding matches `roles/keel`.
+  - Changing the one-shot list needs a matching change to Keel's Compose file and to `verify.yml`.
+  - Moving `keel_commit` needs the new file's hash in `hostcheck.sh`. The drift test fails until it is updated.
 
 **Probe verdicts.**
 - **PASS for a denied target** is an *observed* outcome: the guest got no connection, and the host reached the same address and port. Drop-counter changes are printed as supporting evidence only.

@@ -214,24 +214,30 @@ case "$name" in
     esac;;
   docker)
     case "$a" in
-      # Containers: keel-lab-api / keel-lab-db (long-running, health-checked), keel-lab-worker
-      # (long-running, no health check), keel-lab-bootstrap / keel-lab-minio-bucket (one-shots).
-      # STUB_UNHEALTHY, STUB_LONGRUN_EXITED, STUB_BOOTSTRAP_EXIT, STUB_BOOTSTRAP_OOM,
+      # The nine containers of Keel's Compose file: postgres, nats, temporal, minio and gateway
+      # (long-running, health-checked), runtime-worker and web (long-running, no health check),
+      # bootstrap and minio-bucket (one-shots). STUB_MISSING (names to omit), STUB_EXTRA (a name
+      # to add), STUB_UNHEALTHY, STUB_LONGRUN_EXITED, STUB_BOOTSTRAP_EXIT, STUB_BOOTSTRAP_OOM,
       # STUB_BOOTSTRAP_STATUS, STUB_NO_BOOTSTRAP and STUB_INSPECT_FAIL inject faults.
       inspect*) c=${!#}
         if [ -n "${STUB_INSPECT_FAIL:-}" ] && [ "$c" = keel-lab-minio-bucket ]; then echo "Error: No such object: $c" >&2; exit 1; fi
         case "$c" in
           keel-lab-bootstrap) echo "/$c restarts=0 status=${STUB_BOOTSTRAP_STATUS:-exited} exit=${STUB_BOOTSTRAP_EXIT:-0} oom=${STUB_BOOTSTRAP_OOM:-false} health=none";;
           keel-lab-minio-bucket) echo "/$c restarts=0 status=exited exit=0 oom=false health=none";;
-          keel-lab-api) if [ -n "${STUB_LONGRUN_EXITED:-}" ]; then echo "/$c restarts=0 status=exited exit=0 oom=false health=none"
-                        else echo "/$c restarts=0 status=running exit=0 oom=false health=healthy"; fi;;
-          keel-lab-db) echo "/$c restarts=0 status=running exit=0 oom=false health=$([ -n "${STUB_UNHEALTHY:-}" ] && echo unhealthy || echo healthy)";;
+          keel-lab-gateway) if [ -n "${STUB_LONGRUN_EXITED:-}" ]; then echo "/$c restarts=0 status=exited exit=0 oom=false health=none"
+                            else echo "/$c restarts=0 status=running exit=0 oom=false health=healthy"; fi;;
+          keel-lab-postgres) echo "/$c restarts=0 status=running exit=0 oom=false health=$([ -n "${STUB_UNHEALTHY:-}" ] && echo unhealthy || echo healthy)";;
+          keel-lab-nats|keel-lab-temporal|keel-lab-minio) echo "/$c restarts=0 status=running exit=0 oom=false health=healthy";;
           *) echo "/$c restarts=0 status=running exit=0 oom=false health=none";;
         esac;;
-      *Image*) printf 'keel-lab-api keel/api:1 keel\nkeel-lab-db postgres:16 keel\nkeel-lab-worker keel/api:1 keel\nkeel-lab-minio-bucket minio-mc:1 keel\n'
-               [ -n "${STUB_NO_BOOTSTRAP:-}" ] || printf 'keel-lab-bootstrap keel/api:1 keel\n';;
-      *Names*) printf 'keel-lab-api\nkeel-lab-db\nkeel-lab-worker\nkeel-lab-minio-bucket\n'; [ -n "${STUB_NO_BOOTSTRAP:-}" ] || echo keel-lab-bootstrap;;
-      stats*) echo "keel-lab-api 1.00% 100MiB / 27GiB";;
+      *Image*|*Names*)
+        for c in postgres nats temporal minio minio-bucket bootstrap gateway runtime-worker web ${STUB_EXTRA:-}; do
+          case "$c" in keel-lab-*) ;; *) c=keel-lab-$c;; esac
+          case " ${STUB_MISSING:-} " in *" $c "*) continue;; esac
+          [ "$c" = keel-lab-bootstrap ] && [ -n "${STUB_NO_BOOTSTRAP:-}" ] && continue
+          case "$a" in *Image*) echo "$c image:1 keel";; *) echo "$c";; esac
+        done;;
+      stats*) echo "keel-lab-gateway 1.00% 100MiB / 27GiB";;
       *) echo "stub docker: unhandled [$a]" >&2; exit 99;;
     esac;;
   curl) printf '%s' "${STUB_CURL_CODE:-200}";;
@@ -246,8 +252,20 @@ STUB
 chmod +x "$T/bin/stub"
 for c in sudo nft iptables-save iptables systemctl lxc docker curl free vgs lvs ip timeout ping; do ln -s stub "$T/bin/$c"; done
 ln -s ../bin/stub "$T/teefail/tee"
+# hostcheck.sh binds its expected Keel inventory to the SHA-256 of the reviewed Compose file. The
+# stand-ins run it against a synthetic Compose file instead: the wrappers below source the (staged)
+# script and point the binding at TEST_COMPOSE / TEST_COMPOSE_SHA256. The script itself honours no
+# such override; D1/D2 test the real binding.
+cat > "$T/hc-run.sh" <<'RUN'
+HOSTCHECK_LIB=1 . "$1"; shift
+[ -n "${TEST_COMPOSE:-}" ] && KEEL_COMPOSE_LIVE=$TEST_COMPOSE
+[ -n "${TEST_COMPOSE_SHA256:-}" ] && KEEL_COMPOSE_SHA256=$TEST_COMPOSE_SHA256
+hostcheck_main "$@"
+RUN
 cat > "$T/probe-run.sh" <<'RUN'
 HOSTCHECK_LIB=1 . "$1"
+[ -n "${TEST_COMPOSE:-}" ] && KEEL_COMPOSE_LIVE=$TEST_COMPOSE
+[ -n "${TEST_COMPOSE_SHA256:-}" ] && KEEL_COMPOSE_SHA256=$TEST_COMPOSE_SHA256
 host_tcp() { if [ "$2" = 5432 ]; then echo 124; else echo 0; fi; }   # PostgreSQL is not on the LAN
 host_icmp() { echo 0; }
 is_local() { case "$1" in 10.0.0.3|10.72.0.1|10.71.0.1|172.17.0.1|100.79.95.22) return 0;; esac; return 1; }
@@ -255,13 +273,66 @@ probe "$2"
 RUN
 cat > "$T/gate-run.sh" <<'RUN'
 PROVISION_LIB=1 . "$1"
-rsh() { local c=${1//\~/$HOME}; case "$c" in sha256sum*) shasum -a 256 ${c#sha256sum };; *) eval "$c";; esac; }
+# shellcheck disable=SC2086
+rsh() { local c=${1//\~/$HOME}; case "$c" in sha256sum*) shasum -a 256 ${c#sha256sum };;
+                                             "bash "*) set -- ${c#bash }; "$BASH" "$HC_RUN" "$@";; *) eval "$c";; esac; }
 require_before_record "$2" "$3"
 echo "GATE PASSED $BEFORE_DIR"
 RUN
 # The stand-in dc1-x86 home holds a staged copy of hostcheck.sh, as the runbook's staging step leaves it.
 newhome() { H="$T/home$1"; mkdir -p "$H/ci-shared-check"; cp "$HC" "$H/ci-shared-check/hostcheck.sh"; }
-hc() { HOME="$H" PATH="$T/bin:$PATH" STUB_DIR="$T" "$BASH" "$HC" "$@" 2>&1; }
+hc() { HOME="$H" PATH="$T/bin:$PATH" STUB_DIR="$T" "$BASH" "$T/hc-run.sh" "$HC" "$@" 2>&1; }
+export HC_RUN="$T/hc-run.sh"
+# A synthetic Compose file shaped like Keel's: an anchor block, comments, nine services with
+# container_name and restart, and the two one-shots with restart: 'no'.
+cat > "$T/compose.lab.yml" <<'YML'
+name: keel-lab
+x-keel-env: &keel-env
+  KEEL_LOG_LEVEL: info
+services:
+  # ── data ──
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: keel-lab-postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'pg_isready']
+  nats:
+    container_name: keel-lab-nats
+    restart: unless-stopped
+  temporal:
+    container_name: keel-lab-temporal
+    restart: unless-stopped
+  minio:
+    container_name: keel-lab-minio
+    restart: unless-stopped
+  minio-bucket:
+    container_name: keel-lab-minio-bucket
+    restart: 'no'
+    depends_on:
+      minio:
+        condition: service_healthy
+  bootstrap:
+    container_name: keel-lab-bootstrap
+    restart: 'no'
+    environment:
+      <<: *keel-env
+  gateway:
+    container_name: keel-lab-gateway
+    restart: unless-stopped
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+  runtime-worker:
+    container_name: keel-lab-runtime-worker
+    restart: unless-stopped
+  web:
+    container_name: keel-lab-web
+    restart: unless-stopped
+# No named volumes.
+YML
+export TEST_COMPOSE="$T/compose.lab.yml"
+TEST_COMPOSE_SHA256=$(shasum -a 256 "$TEST_COMPOSE" | awk '{print $1}'); export TEST_COMPOSE_SHA256
 probe_run() { HOME="$H" PATH="$T/bin:$PATH" STUB_DIR="$T" STUB_PHASE=after "$BASH" "$T/probe-run.sh" "$HC" "$SHA" 2>&1; }
 gate() { HOME="$H" PATH="$T/bin:$PATH" STUB_DIR="$T" "$BASH" "$T/gate-run.sh" "$PROV" "$HC" "$SHA" 2>&1; }
 newest() { ls -1d "$H/ci-shared-check/$1"-2* 2>/dev/null | sort | tail -n 1; }
@@ -330,11 +401,11 @@ out=$(hc verify before "$SHA" 120); rc=$?; eq "newest snapshot incomplete, older
 echo "── E4 container health failure despite five HTTP 200s"
 newhome 5
 out=$(STUB_PHASE=before STUB_UNHEALTHY=1 hc snapshot before "$SHA"); rc=$?
-eq "snapshot exits nonzero" "$rc" 1; has "unhealthy container named" "$out" "long-running /keel-lab-db is not healthy: health=unhealthy"
+eq "snapshot exits nonzero" "$rc" 1; has "unhealthy container named" "$out" "long-running /keel-lab-postgres is not healthy: health=unhealthy"
 B=$(newest before); eq "all five endpoints were 200" "$(grep -c ' 200$' "$B/stable/keel-health.txt")" 5
 [ ! -e "$B/COMPLETE" ] && ok "no completion record" || bad "no completion record" "found"
 out=$(STUB_UNHEALTHY=1 probe_run); rc=$?; eq "probe with an unhealthy Keel container -> FAIL (1)" "$rc" 1
-has "probe names it in Keel preservation" "$out" "long-running /keel-lab-db is not healthy"
+has "probe names it in Keel preservation" "$out" "long-running /keel-lab-postgres is not healthy"
 
 echo "── E5 failed configuration queries never become PASS"
 newhome 6
@@ -352,13 +423,34 @@ newhome 7
 out=$(HOME="$H" PATH="$T/teefail:$T/bin:$PATH" STUB_DIR="$T" STUB_PHASE=after "$BASH" "$T/probe-run.sh" "$HC" "$SHA" 2>&1); rc=$?
 eq "tee failure -> exit 3" "$rc" 3; has "log failure named" "$out" "RESULT: LOG FAILURE"
 
-echo "── K1 Keel container contract: one-shot jobs vs long-running services (pure)"
-OK1='/keel-lab-api restarts=0 status=running exit=0 oom=false health=healthy
-/keel-lab-worker restarts=2 status=running exit=0 oom=false health=none
-/keel-lab-bootstrap restarts=0 status=exited exit=0 oom=false health=none
-/keel-lab-minio-bucket restarts=0 status=exited exit=0 oom=false health=none'
-kp() { printf '%s\n' "$1" | keel_state_problems; }
-eq "one-shots exited 0, long-running running/healthy -> no problems" "$(kp "$OK1")" ""
+echo "── I1 the expected Keel inventory comes from the Compose file (pure)"
+INV="$T/inventory.txt"; keel_inventory < "$TEST_COMPOSE" > "$INV"
+eq "nine services derived, sorted, with container and restart policy" "$(tr '\n' ';' < "$INV")" \
+   "bootstrap keel-lab-bootstrap no;gateway keel-lab-gateway unless-stopped;minio keel-lab-minio unless-stopped;minio-bucket keel-lab-minio-bucket no;nats keel-lab-nats unless-stopped;postgres keel-lab-postgres unless-stopped;runtime-worker keel-lab-runtime-worker unless-stopped;temporal keel-lab-temporal unless-stopped;web keel-lab-web unless-stopped;"
+eq "a usable inventory has no defects" "$(keel_inventory_problems < "$INV")" ""
+ip_() { printf '%s\n' "$1" | keel_inventory | keel_inventory_problems; }
+has "a restart: no service that verify.yml does not name -> refused" "$(ip_ "$(sed "s/  web:/  migrate:\n    container_name: keel-lab-migrate\n    restart: 'no'\n  web:/" "$TEST_COMPOSE")")" \
+    "service migrate is restart: no but not a one-shot in roles/keel/tasks/verify.yml"
+has "a one-shot that is long-running in the file -> refused" "$(ip_ "$(awk '/container_name: keel-lab-bootstrap/ {print; getline; print "    restart: unless-stopped"; next} {print}' "$TEST_COMPOSE")")" \
+    "one-shot bootstrap is not restart: no"
+has "a one-shot absent from the file -> refused" "$(ip_ "$(awk '/^  minio-bucket:/ {skip=1; next} skip && /^  [a-z]/ {skip=0} !skip' "$TEST_COMPOSE")")" \
+    "one-shot minio-bucket is not a service in the Compose file"
+has "a service without container_name -> refused" "$(ip_ "$(grep -v 'container_name: keel-lab-web' "$TEST_COMPOSE")")" "service web has no container_name"
+has "two services, one container_name -> refused" "$(ip_ "$(sed 's/container_name: keel-lab-web/container_name: keel-lab-gateway/' "$TEST_COMPOSE")")" "used twice"
+has "no services at all -> refused" "$(ip_ "name: x")" "no services found"
+
+echo "── K1 Keel container contract over the inventory: one-shot jobs vs long-running services (pure)"
+OK1='/keel-lab-bootstrap restarts=0 status=exited exit=0 oom=false health=none
+/keel-lab-gateway restarts=0 status=running exit=0 oom=false health=healthy
+/keel-lab-minio restarts=0 status=running exit=0 oom=false health=healthy
+/keel-lab-minio-bucket restarts=0 status=exited exit=0 oom=false health=none
+/keel-lab-nats restarts=0 status=running exit=0 oom=false health=healthy
+/keel-lab-postgres restarts=0 status=running exit=0 oom=false health=healthy
+/keel-lab-runtime-worker restarts=2 status=running exit=0 oom=false health=none
+/keel-lab-temporal restarts=0 status=running exit=0 oom=false health=healthy
+/keel-lab-web restarts=0 status=running exit=0 oom=false health=none'
+kp() { printf '%s\n' "$1" | keel_state_problems "$INV"; }
+eq "every expected container once, one-shots exited 0, the rest running/healthy -> no problems" "$(kp "$OK1")" ""
 has "one-shot nonzero exit -> blocked" "$(kp "${OK1/bootstrap restarts=0 status=exited exit=0/bootstrap restarts=0 status=exited exit=1}")" \
     "one-shot /keel-lab-bootstrap did not complete successfully: status=exited exit=1 oom=false"
 has "one-shot OOM-killed -> blocked" "$(kp "${OK1/minio-bucket restarts=0 status=exited exit=0 oom=false/minio-bucket restarts=0 status=exited exit=137 oom=true}")" \
@@ -366,17 +458,64 @@ has "one-shot OOM-killed -> blocked" "$(kp "${OK1/minio-bucket restarts=0 status
 has "one-shot OOM-killed even with exit 0 -> blocked" "$(kp "${OK1/bootstrap restarts=0 status=exited exit=0 oom=false/bootstrap restarts=0 status=exited exit=0 oom=true}")" "oom=true"
 has "one-shot never ran (created) -> blocked" "$(kp "${OK1/bootstrap restarts=0 status=exited/bootstrap restarts=0 status=created}")" "status=created"
 has "one-shot still running -> blocked" "$(kp "${OK1/bootstrap restarts=0 status=exited/bootstrap restarts=0 status=running}")" "status=running"
-has "one-shot missing -> blocked" "$(kp "$(printf '%s\n' "$OK1" | grep -v bootstrap)")" "one-shot /keel-lab-bootstrap is missing"
+has "one-shot missing -> blocked" "$(kp "$(printf '%s\n' "$OK1" | grep -v keel-lab-bootstrap)")" "expected one-shot /keel-lab-bootstrap is missing"
 has "one-shot listed twice -> blocked" "$(kp "$OK1
 /keel-lab-bootstrap restarts=0 status=exited exit=0 oom=false health=none")" "appears 2 times"
-has "long-running exited (even exit 0) -> blocked" "$(kp "${OK1/api restarts=0 status=running/api restarts=0 status=exited}")" \
-    "long-running /keel-lab-api is not running: status=exited exit=0"
+has "long-running exited (even exit 0) -> blocked" "$(kp "${OK1/gateway restarts=0 status=running/gateway restarts=0 status=exited}")" \
+    "long-running /keel-lab-gateway is not running: status=exited exit=0"
 has "long-running restarting -> blocked" "$(kp "${OK1/worker restarts=2 status=running/worker restarts=2 status=restarting}")" "status=restarting"
-has "long-running health starting -> blocked" "$(kp "${OK1/health=healthy/health=starting}")" "is not healthy: health=starting"
-has "long-running unhealthy -> blocked" "$(kp "${OK1/health=healthy/health=unhealthy}")" "is not healthy: health=unhealthy"
+has "long-running health starting -> blocked" "$(kp "${OK1/gateway restarts=0 status=running exit=0 oom=false health=healthy/gateway restarts=0 status=running exit=0 oom=false health=starting}")" "is not healthy: health=starting"
+has "long-running unhealthy -> blocked" "$(kp "${OK1/postgres restarts=0 status=running exit=0 oom=false health=healthy/postgres restarts=0 status=running exit=0 oom=false health=unhealthy}")" "is not healthy: health=unhealthy"
+has "missing long-running runtime-worker -> blocked" "$(kp "$(printf '%s\n' "$OK1" | grep -v keel-lab-runtime-worker)")" "expected long-running /keel-lab-runtime-worker is missing"
+has "missing long-running postgres -> blocked" "$(kp "$(printf '%s\n' "$OK1" | grep -v keel-lab-postgres)")" "expected long-running /keel-lab-postgres is missing"
+has "missing long-running web -> blocked" "$(kp "$(printf '%s\n' "$OK1" | grep -v keel-lab-web)")" "expected long-running /keel-lab-web is missing"
+has "long-running listed twice -> blocked" "$(kp "$OK1
+/keel-lab-nats restarts=0 status=running exit=0 oom=false health=healthy")" "expected long-running /keel-lab-nats appears 2 times"
+has "unexpected keel-lab container -> blocked" "$(kp "$OK1
+/keel-lab-debug restarts=0 status=running exit=0 oom=false health=none")" "unexpected container /keel-lab-debug"
 has "unknown state line (old v1 format) -> blocked" "$(kp "$OK1
 /keel-lab-web restarts=0 running healthy")" "unrecognised state line"
-has "no containers at all -> both one-shots missing" "$(kp "")" "is missing"
+has "no containers at all -> every expected container missing" "$(kp "")" "expected long-running /keel-lab-postgres is missing"
+has "empty inventory -> blocked, never vacuously OK" "$(printf '%s\n' "$OK1" | keel_state_problems /dev/null)" "no expected Keel inventory"
+ep() { ( KEEL_COMPOSE_SHA256=$TEST_COMPOSE_SHA256; keel_evidence_problems "$@" ); }
+printf '%s\n' "$OK1" > "$T/state-ok.txt"
+eq "bound Compose + its inventory + good state -> no problems" "$(ep "$TEST_COMPOSE" "$INV" "$T/state-ok.txt")" ""
+has "Compose file that is not the reviewed definition -> blocked" "$(keel_evidence_problems "$TEST_COMPOSE" "$INV" "$T/state-ok.txt")" \
+    "the deployed Compose file is not the reviewed definition at keel_commit 9b0d36f0"
+grep -v keel-lab-web "$INV" > "$T/inv-short.txt"
+has "recorded inventory that disagrees with the Compose file -> blocked" "$(ep "$TEST_COMPOSE" "$T/inv-short.txt" "$T/state-ok.txt")" \
+    "the recorded inventory does not match the Compose file"
+
+echo "── D1 the inventory binding matches roles/keel (drift)"
+eq "KEEL_COMMIT is roles/keel's keel_commit" "$KEEL_COMMIT" "$(awk '/^keel_commit:/ {print $2}' "$REPO/roles/keel/defaults/main.yml")"
+eq "KEEL_COMPOSE_LIVE is keel_root/compose.lab.yml" "$KEEL_COMPOSE_LIVE" \
+   "$(awk '/^keel_root:/ {print $2}' "$REPO/roles/keel/defaults/main.yml")/compose.lab.yml"
+has "keel_compose_file default names compose.lab.yml under keel_root" "$(grep '^keel_compose_file:' "$REPO/roles/keel/defaults/main.yml")" '"{{ keel_root }}/compose.lab.yml"'
+dep=$(awk '/^- name: Install the stack definition from the built commit/ {p=1} p && /^- name:/ && !/built commit/ {exit} p' "$REPO/roles/keel/tasks/deploy.yml")
+has "deploy.yml installs the file with a plain copy (byte-identical, not templated)" "$dep" "ansible.builtin.copy:"
+has "deploy.yml copies infra/lab/compose.lab.yml of the built commit" "$dep" 'src: "{{ keel_build_dir }}/infra/lab/compose.lab.yml"'
+has "deploy.yml writes it to keel_compose_file" "$dep" 'dest: "{{ keel_compose_file }}"'
+case "$dep" in *template*) bad "not templated" "$dep";; *) ok "not templated";; esac
+
+echo "── D2 the bound hash and inventory re-derived from Keel's source at keel_commit (drift)"
+KSRC="${KEEL_SOURCE_REPO:-$HOME/Projects/keel}"
+if GIT_NO_LAZY_FETCH=1 git -C "$KSRC" cat-file -e "$KEEL_COMMIT:infra/lab/compose.lab.yml" 2>/dev/null; then
+  GIT_NO_LAZY_FETCH=1 git -C "$KSRC" show "$KEEL_COMMIT:infra/lab/compose.lab.yml" > "$T/compose.real.yml"
+  eq "SHA-256 of infra/lab/compose.lab.yml at keel_commit == KEEL_COMPOSE_SHA256" "$(shasum -a 256 "$T/compose.real.yml" | awk '{print $1}')" "$KEEL_COMPOSE_SHA256"
+  keel_inventory < "$T/compose.real.yml" > "$T/inv.real.txt"
+  eq "the real file yields a usable inventory" "$(keel_inventory_problems < "$T/inv.real.txt")" ""
+  eq "its one-shots (restart: no) are exactly verify.yml's" "$(awk '$3 == "no" {print $1}' "$T/inv.real.txt" | tr '\n' ' ')" "bootstrap minio-bucket "
+  eq "the stand-in fixture has the real file's inventory" "$(cat "$T/inv.real.txt")" "$(cat "$INV")"
+  # end to end with the REAL binding: no hash override, the real file as the deployed one
+  newhome real; out=$(TEST_COMPOSE="$T/compose.real.yml" TEST_COMPOSE_SHA256="" STUB_PHASE=before hc snapshot before "$SHA"); rc=$?
+  eq "snapshot against the real, unmodified binding -> OK" "$rc" 0
+  sed 's/keel-lab-web/keel-lab-www/' "$T/compose.real.yml" > "$T/compose.real-edited.yml"
+  newhome real2; out=$(TEST_COMPOSE="$T/compose.real-edited.yml" TEST_COMPOSE_SHA256="" STUB_PHASE=before hc snapshot before "$SHA"); rc=$?
+  eq "one edited byte in the deployed file -> snapshot INCOMPLETE" "$rc" 1; has "binding named" "$out" "is not the reviewed definition"
+else
+  echo "  skip  Keel source not available at $KSRC (set KEEL_SOURCE_REPO): the hash and inventory are bound by D1 only"
+fi
+
 # The one-shot list is the one roles/keel/tasks/verify.yml exempts from "running".
 contract=$(sed -n "s/.*grep -vE '\^(\([a-z|-]*\)) '.*/\1/p" "$REPO/roles/keel/tasks/verify.yml" | tr '|' '\n' | sort | tr '\n' ' ')
 eq "one-shot set equals roles/keel/tasks/verify.yml's exemption" "$contract" "$(printf '%s\n' $KEEL_ONESHOT_SERVICES | sort | tr '\n' ' ')"
@@ -393,7 +532,7 @@ sleep 1; out=$(STUB_PHASE=after hc snapshot after-provision "$SHA"); A=$(newest 
 out=$(hc compare "$SHA"); rc=$?; eq "compare with one-shot evidence on both sides -> OK" "$rc" 0
 has "after snapshot keeps one-shot evidence too" "$(cat "$A/stable/keel-state.txt")" "/keel-lab-minio-bucket restarts=0 status=exited exit=0 oom=false"
 out=$(probe_run); rc=$?; eq "probe with completed one-shots -> OK" "$rc" 0
-has "probe states one-shots completed" "$out" "one-shots (bootstrap minio-bucket) completed with exit 0; the other 3 running"
+has "probe states one-shots completed" "$out" "all 9 services of the reviewed Compose file present once; one-shots (bootstrap minio-bucket) completed with exit 0"
 has "probe keeps container evidence" "$(cat "$(newest probe)/keel-state.txt")" "/keel-lab-bootstrap restarts=0 status=exited exit=0"
 newhome 10
 out=$(STUB_PHASE=before STUB_BOOTSTRAP_EXIT=1 hc snapshot before "$SHA"); rc=$?
@@ -411,7 +550,7 @@ newhome 10e; out=$(STUB_PHASE=before STUB_INSPECT_FAIL=1 hc snapshot before "$SH
 eq "inspection fails -> snapshot INCOMPLETE" "$rc" 1; has "inspection failure named" "$out" "docker inspect keel-lab-minio-bucket"
 out=$(STUB_INSPECT_FAIL=1 probe_run); rc=$?; eq "inspection fails -> probe INCONCLUSIVE (2)" "$rc" 2
 newhome 10f; out=$(STUB_PHASE=before STUB_LONGRUN_EXITED=1 hc snapshot before "$SHA"); rc=$?
-eq "exited long-running service -> snapshot INCOMPLETE" "$rc" 1; has "exited long-running named" "$out" "long-running /keel-lab-api is not running: status=exited"
+eq "exited long-running service -> snapshot INCOMPLETE" "$rc" 1; has "exited long-running named" "$out" "long-running /keel-lab-gateway is not running: status=exited"
 out=$(STUB_LONGRUN_EXITED=1 probe_run); rc=$?; eq "exited long-running service -> probe FAIL (1)" "$rc" 1
 out=$(hc verify before "$SHA" 120); rc=$?; eq "only failed snapshots in this home -> verify refuses" "$rc" 1
 # verify re-applies the contract to bound evidence: a record written over a failed one-shot is refused
@@ -424,6 +563,40 @@ out=$(hc verify before "$SHA" 120); rc=$?
 eq "record over a failed one-shot -> verify refuses" "$rc" 1; has "verify names the contract" "$out" "Keel container contract: one-shot /keel-lab-bootstrap did not complete successfully"
 sed -i.v1 '1s/.*/hostcheck-snapshot v1/' "$B/COMPLETE"
 out=$(hc verify before "$SHA" 120); rc=$?; eq "v1 record (old state format) -> refused" "$rc" 1; has "format named" "$out" "unknown format"
+
+echo "── M1 a missing expected service fails even when all five HTTP endpoints return 200"
+for gone in keel-lab-runtime-worker keel-lab-postgres keel-lab-web keel-lab-nats; do
+  newhome "m-$gone"
+  out=$(STUB_PHASE=before STUB_MISSING="$gone" hc snapshot before "$SHA"); rc=$?
+  eq "$gone missing -> snapshot INCOMPLETE" "$rc" 1
+  has "$gone missing -> named" "$out" "expected long-running /$gone is missing"
+  B=$(newest before); eq "$gone missing -> all five endpoints were still 200" "$(grep -c ' 200$' "$B/stable/keel-health.txt")" 5
+  [ ! -e "$B/COMPLETE" ] && ok "$gone missing -> no completion record" || bad "$gone missing -> no record" "found"
+  out=$(STUB_MISSING="$gone" probe_run); rc=$?
+  eq "$gone missing -> probe FAIL (1)" "$rc" 1; has "$gone missing -> probe names it" "$out" "expected long-running /$gone is missing"
+done
+newhome m-gate; out=$(STUB_PHASE=before STUB_MISSING=keel-lab-runtime-worker hc snapshot before "$SHA")
+out=$(gate); rc=$?; eq "missing worker -> provision gate refuses" "$rc" 1
+newhome m-extra; out=$(STUB_PHASE=before STUB_EXTRA=keel-lab-debug hc snapshot before "$SHA"); rc=$?
+eq "unexpected keel-lab container -> snapshot INCOMPLETE" "$rc" 1; has "unexpected named" "$out" "unexpected container /keel-lab-debug"
+out=$(STUB_EXTRA=keel-lab-debug probe_run); rc=$?; eq "unexpected keel-lab container -> probe FAIL (1)" "$rc" 1
+sed 's/keel-lab-web$/keel-lab-www/' "$TEST_COMPOSE" > "$T/compose.edited.yml"
+newhome m-edit; out=$(TEST_COMPOSE="$T/compose.edited.yml" STUB_PHASE=before hc snapshot before "$SHA"); rc=$?
+eq "deployed Compose file differs from the bound one -> snapshot INCOMPLETE" "$rc" 1; has "binding named" "$out" "is not the reviewed definition"
+out=$(TEST_COMPOSE="$T/compose.edited.yml" probe_run); rc=$?; eq "deployed Compose file differs -> probe FAIL (1)" "$rc" 1
+newhome m-unread; out=$(TEST_COMPOSE="$T/no-such-compose.yml" STUB_PHASE=before hc snapshot before "$SHA"); rc=$?
+eq "deployed Compose file unreadable -> snapshot INCOMPLETE" "$rc" 1; has "unreadable named" "$out" "read $T/no-such-compose.yml"
+out=$(TEST_COMPOSE="$T/no-such-compose.yml" probe_run); rc=$?; eq "deployed Compose file unreadable -> probe INCONCLUSIVE (2)" "$rc" 2
+# verify re-derives the inventory from the bound Compose copy: a record over a shortened inventory is refused
+newhome m-inv; STUB_PHASE=before hc snapshot before "$SHA" >/dev/null; B=$(newest before)
+grep -v keel-lab-web "$B/stable/keel-inventory.txt" > "$B/inv.tmp" && mv "$B/inv.tmp" "$B/stable/keel-inventory.txt"
+grep -v keel-lab-web "$B/stable/keel-state.txt" > "$B/st.tmp" && mv "$B/st.tmp" "$B/stable/keel-state.txt"
+# shellcheck disable=SC1090
+( HOSTCHECK_LIB=1 . "$HC"; write_record "$B" before "$SHA" ) || bad "re-record" "write_record failed"
+out=$(hc verify before "$SHA" 120); rc=$?
+eq "record over an inventory without web -> verify refuses" "$rc" 1; has "inventory mismatch named" "$out" "the recorded inventory does not match the Compose file"
+sed -i.v2 '1s/.*/hostcheck-snapshot v2/' "$B/COMPLETE"
+out=$(hc verify before "$SHA" 120); rc=$?; eq "v2 record (no bound inventory) -> refused" "$rc" 1
 
 echo "── E7 the provision gate uses the checkout's own hostcheck.sh"
 newhome 8
