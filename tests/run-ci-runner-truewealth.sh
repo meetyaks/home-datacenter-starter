@@ -396,6 +396,28 @@ if [ -n "$TOOLS_IMAGE" ]; then
 else
   skip "combined policies" "needs Docker (privileged, network namespaces)"
 fi
+
+echo
+echo "── 13. activation tooling: tools/ci-activation (stand-ins; no host contact) ──"
+# hostcheck.sh (fail-closed snapshots, completion records, compare, probe verdicts) and
+# provision-truewealth.sh (exact-commit checkout, implementation unchanged from the checked
+# revision, the before-record gate, exit-status propagation).
+if bash tests/ci-activation/test-activation.sh > "$R/activation.log" 2>&1; then
+  ok "activation tooling: $(grep -o '[0-9]* passed, [0-9]* failed' "$R/activation.log" | tail -1)"
+else
+  bad "activation tooling" "$(grep -A1 'FAIL' "$R/activation.log" | head -12)"
+fi
+if [ -n "$TOOLS_IMAGE" ]; then
+  if docker run --rm --privileged --network none --label twtask=hds-activation-test -v "$R/tw:/t:ro" \
+       -v "$PWD/tools/ci-activation:/a:ro" -v "$PWD/tests/ci-activation:/ta:ro" "$TOOLS_IMAGE" \
+       bash /ta/policy-listing.sh /t /a/hostcheck.sh > "$R/activation-listing.log" 2>&1; then
+    ok "the probe's expected table equals the rendered policy as a real nft lists it"
+  else
+    bad "the probe's expected table matches the rendered policy" "$(head -30 "$R/activation-listing.log")"
+  fi
+else
+  skip "probe's expected table vs a real nft listing" "needs Docker (privileged)"
+fi
 echo
 printf '── %d passed, %d failed ──\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
