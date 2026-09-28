@@ -96,6 +96,10 @@ guest_tcp() { echo "$GT"; }; host_tcp() { echo "$HT"; }
 guest_icmp() { echo "$GT"; }; host_icmp() { echo "$HT"; }
 is_local() { [ "$1" = 10.0.0.3 ]; }
 drop_packets() { local c; c=$(( $(cat "$CF") + 2 )); echo "$c" > "$CF"; echo "$c"; }   # runs in $(…): state in a file
+# Every destination leaves the stand-in guest through enp5s0 here; R1/R2 cover the other routes.
+# shellcheck disable=SC2034  # read by the sourced probe_target
+GUEST_EXTIF=enp5s0
+guest_route() { printf '%s via 10.72.0.1 dev enp5s0 src 10.72.0.226 uid 0\nRC=0\n' "$1"; }
 # shellcheck disable=SC2034  # R_SEC is read by the sourced rec/summarize
 pt() { ( R_SEC=(); R_ST=(); R_MSG=(); probe_target "$@" >/dev/null; echo "${R_ST[0]}|${R_MSG[0]}|${R_MSG[1]:-}" ); }
 r=$(GT=124 HT=0 pt required tcp 10.0.0.3 443 "host Caddy")
@@ -184,9 +188,24 @@ case "$name" in
       shift 4; g="$*"
       case "$g" in
         "sh -c echo __ALIVE__") echo __ALIVE__;;
+        # The guest's routes, as observed live: its own docker0 holds 172.17.0.1 (a local route).
+        # STUB_NO_DEFAULT, STUB_ROUTE_FAIL and STUB_OVERLAP_18 (the guest also has 172.18/16) vary them.
+        *"ip -4 route show default"*) [ -n "${STUB_NO_DEFAULT:-}" ] || echo "default via 10.72.0.1 dev enp5s0 proto dhcp src 10.72.0.226 metric 100";;
+        *"ip -4 route get"*) ip=${!#}
+          if [ -n "${STUB_ROUTE_FAIL:-}" ]; then echo "RTNETLINK answers: Operation not permitted"; echo RC=2
+          elif [ "$ip" = 172.17.0.1 ]; then echo "local 172.17.0.1 dev lo table local src 172.17.0.1 uid 0"; echo RC=0
+          elif [ "$ip" = 172.18.0.1 ] && [ -n "${STUB_OVERLAP_18:-}" ]; then echo "172.18.0.1 dev br-0badc0ffee src 172.18.0.1 uid 0"; echo RC=0
+          elif [ "$ip" = 10.72.0.1 ]; then echo "10.72.0.1 dev enp5s0 src 10.72.0.226 uid 0"; echo RC=0
+          else echo "$ip via 10.72.0.1 dev enp5s0 src 10.72.0.226 uid 0"; echo RC=0; fi;;
         *MISSING=*) [ -n "${STUB_GUEST_TOOLQ_FAIL:-}" ] && { echo "Error: websocket: close 1006" >&2; exit 1; }; echo "MISSING=";;
         */dev/tcp/*) ip=$(eval echo "\${$(($# - 1))}"); port=$(eval echo "\${$#}")
-                     if [ "$ip:$port" = 10.72.0.1:53 ]; then echo RC=0; else echo RC=124; fi;;
+                     # the guest's own resolver answers; so does its OWN docker0 address (a guest-local
+                     # listener) — which must never be probed as a host target; STUB_ALT_OPEN lets the
+                     # guest reach the host bridge 172.18.0.1 (forbidden connectivity)
+                     if [ "$ip:$port" = 10.72.0.1:53 ]; then echo RC=0
+                     elif [ "$ip" = 172.17.0.1 ]; then echo "RC=${STUB_GUEST_DOCKER0_RC:-0}"
+                     elif [ "$ip" = 172.18.0.1 ] && [ -n "${STUB_ALT_OPEN:-}" ]; then echo RC=0
+                     else echo RC=124; fi;;
         *ping*) echo RC=1;;
         *curl*) echo RC=0;;
         *"ip -6"*) echo __OK__;;
@@ -214,6 +233,13 @@ case "$name" in
     esac;;
   docker)
     case "$a" in
+      # The host's bridge networks: the default bridge (docker0, 172.17.0.1) and Keel's compose
+      # network (no bridge-name option, 172.18.0.1). STUB_NET_FAIL / STUB_NO_ALT vary them.
+      "network ls --filter driver=bridge --format {{.ID}}") [ -n "${STUB_NET_FAIL:-}" ] && { echo "permission denied" >&2; exit 1; }
+                                                            echo aaa111bbb222ccc; [ -n "${STUB_NO_ALT:-}" ] || echo ddd333eee444fff;;
+      "network inspect"*) [ -n "${STUB_NET_FAIL:-}" ] && exit 1
+                          echo "aaa111bbb222ccc|bridge|docker0|172.17.0.1 "
+                          [ -n "${STUB_NO_ALT:-}" ] || echo "ddd333eee444fff|keel-lab_default|<no value>|$([ -n "${STUB_NO_GW:-}" ] || echo "172.18.0.1 ")";;
       # The nine containers of Keel's Compose file: postgres, nats, temporal, minio and gateway
       # (long-running, health-checked), runtime-worker and web (long-running, no health check),
       # bootstrap and minio-bucket (one-shots). STUB_MISSING (names to omit), STUB_EXTRA (a name
@@ -243,7 +269,8 @@ case "$name" in
   curl) printf '%s' "${STUB_CURL_CODE:-200}";;
   free) echo "Mem: 27000 9000";;
   vgs|lvs) echo "ubuntu-vg $(after && echo 24.68g || echo 74.68g)";;
-  ip) [ "$a" = "-4 -o addr show dev tailscale0" ] && echo "7: tailscale0    inet 100.79.95.22/32 scope global tailscale0";;
+  ip) case "$a" in "-4 -o addr show dev tailscale0") echo "7: tailscale0    inet 100.79.95.22/32 scope global tailscale0";;
+        "-4 -o addr show dev br-ddd333eee444") echo "9: br-ddd333eee444    inet 172.18.0.1/16 brd 172.18.255.255 scope global br-ddd333eee444";; esac;;
   timeout|ping) exit 0;;
   tee) cat >/dev/null; echo "tee: write error: No space left on device" >&2; exit 1;;
   *) echo "stub: unknown command $name" >&2; exit 99;;
@@ -266,10 +293,11 @@ cat > "$T/probe-run.sh" <<'RUN'
 HOSTCHECK_LIB=1 . "$1"
 [ -n "${TEST_COMPOSE:-}" ] && KEEL_COMPOSE_LIVE=$TEST_COMPOSE
 [ -n "${TEST_COMPOSE_SHA256:-}" ] && KEEL_COMPOSE_SHA256=$TEST_COMPOSE_SHA256
-host_tcp() { if [ "$2" = 5432 ]; then echo 124; else echo 0; fi; }   # PostgreSQL is not on the LAN
+# PostgreSQL is not on the LAN; STUB_ALT_NO_LISTENER: nothing answers on the host bridge 172.18.0.1
+host_tcp() { if [ "$2" = 5432 ]; then echo 124; elif [ "$1" = 172.18.0.1 ] && [ -n "${STUB_ALT_NO_LISTENER:-}" ]; then echo 124; else echo 0; fi; }
 host_icmp() { echo 0; }
-is_local() { case "$1" in 10.0.0.3|10.72.0.1|10.71.0.1|172.17.0.1|100.79.95.22) return 0;; esac; return 1; }
-probe "$2"
+is_local() { case "$1" in 10.0.0.3|10.72.0.1|10.71.0.1|172.17.0.1|172.18.0.1|100.79.95.22) return 0;; esac; return 1; }
+probe "$2" "${3:-}"
 RUN
 cat > "$T/gate-run.sh" <<'RUN'
 PROVISION_LIB=1 . "$1"
@@ -563,6 +591,71 @@ out=$(hc verify before "$SHA" 120); rc=$?
 eq "record over a failed one-shot -> verify refuses" "$rc" 1; has "verify names the contract" "$out" "Keel container contract: one-shot /keel-lab-bootstrap did not complete successfully"
 sed -i.v1 '1s/.*/hostcheck-snapshot v1/' "$B/COMPLETE"
 out=$(hc verify before "$SHA" 120); rc=$?; eq "v1 record (old state format) -> refused" "$rc" 1; has "format named" "$out" "unknown format"
+
+echo "── R1 the guest's route decides whether a probe is evidence about the host (pure)"
+eq "via the external interface -> external" "$(route_verdict 0 '10.0.0.3 via 10.72.0.1 dev enp5s0 src 10.72.0.226 uid 0' enp5s0)" external
+eq "direct on the external interface -> external" "$(route_verdict 0 '10.72.0.1 dev enp5s0 src 10.72.0.226 uid 0' enp5s0)" external
+eq "the live 172.17.0.1 route (guest's own docker0) -> guest-local" "$(route_verdict 0 'local 172.17.0.1 dev lo src 172.17.0.1 uid 0' enp5s0)" guest-local
+eq "dev lo without 'local' -> guest-local" "$(route_verdict 0 '172.17.0.1 dev lo src 172.17.0.1' enp5s0)" guest-local
+eq "broadcast -> guest-local" "$(route_verdict 0 'broadcast 172.17.255.255 dev docker0 src 172.17.0.1' enp5s0)" guest-local
+eq "overlapping guest network -> other:<dev>" "$(route_verdict 0 '172.18.0.1 dev br-0badc0ffee src 172.18.0.1 uid 0' enp5s0)" other:br-0badc0ffee
+eq "guest docker0 subnet (not its own address) -> other:docker0" "$(route_verdict 0 '172.17.0.5 dev docker0 src 172.17.0.1' enp5s0)" other:docker0
+eq "unreachable -> no-route" "$(route_verdict 2 'RTNETLINK answers: Network is unreachable' enp5s0)" no-route
+eq "query failed -> unreadable" "$(route_verdict 2 'RTNETLINK answers: Operation not permitted' enp5s0)" unreadable
+eq "no marker (lxc exec failed) -> unreadable" "$(route_verdict '' '' enp5s0)" unreadable
+eq "external interface unknown -> unreadable" "$(route_verdict 0 '10.0.0.3 via 10.72.0.1 dev enp5s0' '')" unreadable
+# probe_target never probes (or counts) a destination that does not leave through the external interface
+guest_route() { printf 'local 172.17.0.1 dev lo src 172.17.0.1 uid 0\nRC=0\n'; }
+r=$(GT=0 HT=0 pt required tcp 172.17.0.1 443 "docker0")
+has "guest-local target with a guest listener -> INCONCLUSIVE, never FAIL or PASS" "$r" "INCONCLUSIVE|docker0 172.17.0.1:443: the address is local to the guest (route: local 172.17.0.1 dev lo"
+guest_route() { printf '172.18.0.1 dev br-0badc0ffee src 172.18.0.1 uid 0\nRC=0\n'; }
+r=$(GT=124 HT=0 pt required tcp 172.18.0.1 443 "bridge")
+has "overlapping target -> INCONCLUSIVE, not PASS" "$r" "INCONCLUSIVE|bridge 172.18.0.1:443: the guest routes it via its own br-0badc0ffee, not enp5s0"
+guest_route() { printf 'RTNETLINK answers: Operation not permitted\nRC=2\n'; }
+r=$(GT=124 HT=0 pt required tcp 10.0.0.3 443 "host Caddy"); has "route query failed -> INCONCLUSIVE" "$r" "INCONCLUSIVE|host Caddy 10.0.0.3:443: the guest's route query failed"
+r=$(GUEST_EXTIF='' GT=124 HT=0 pt required tcp 10.0.0.3 443 "host Caddy"); has "external interface unknown -> INCONCLUSIVE" "$r" "the guest's external interface is unknown"
+guest_route() { printf '%s via 10.72.0.1 dev enp5s0 src 10.72.0.226 uid 0\nRC=0\n' "$1"; }
+r=$(GT=124 HT=0 pt required tcp 10.0.0.3 443 "host Caddy"); has "PASS records the guest route" "$r" "guest route: 10.0.0.3 via 10.72.0.1 dev enp5s0"
+
+echo "── R2 host Docker bridge target: discovered, route-checked, host-controlled (end to end)"
+newhome r
+out=$(probe_run); rc=$?; P=$(newest probe)
+eq "live reproduction + valid alternative -> probe OK (0)" "$rc" 0
+has "172.17.0.1 rejected as guest-local, with identity and route" "$out" "docker bridge bridge (docker0) 172.17.0.1: guest route 'local 172.17.0.1 dev lo table local src 172.17.0.1 uid 0' is guest-local, not via enp5s0; rejected"
+has "alternative selected with route and host control" "$out" "docker bridge keel-lab_default (br-ddd333eee444) 172.18.0.1: guest route '172.18.0.1 via 10.72.0.1 dev enp5s0 src 10.72.0.226 uid 0'; host control :443 connected; selected"
+has "alternative probed: observed outcome and route recorded" "$out" "PASS                  host Docker bridge keel-lab_default (br-ddd333eee444), Caddy 172.18.0.1:443 — observed: guest no response within 4 s; host connected; guest route: 172.18.0.1 via 10.72.0.1 dev enp5s0"
+case "$out" in *"PASS"*"172.17.0.1:443"*|*"FAIL"*"172.17.0.1"*) bad "172.17.0.1 never counted (its guest listener answers)" "$out";; *) ok "172.17.0.1 never counted (its guest listener answers)";; esac
+has "probe log keeps the candidate evidence" "$(cat "$P/probe.txt")" "172.17.0.1: guest route"
+out=$(STUB_NO_ALT=1 probe_run); rc=$?
+eq "only the guest-local docker0 exists -> INCONCLUSIVE (2)" "$rc" 2; has "no valid target named" "$out" "host Docker bridge: no bridge address both leaves the guest via enp5s0 and answers a host-side control"
+out=$(STUB_OVERLAP_18=1 probe_run); rc=$?
+eq "alternative overlaps a guest network -> INCONCLUSIVE (2)" "$rc" 2; has "overlap recorded" "$out" "172.18.0.1: guest route '172.18.0.1 dev br-0badc0ffee src 172.18.0.1 uid 0' is other:br-0badc0ffee"
+out=$(STUB_ALT_NO_LISTENER=1 probe_run); rc=$?
+eq "alternative has no host-side listener -> INCONCLUSIVE (2)" "$rc" 2; has "failed control recorded" "$out" "host control :443 no response within 4 s; rejected (no live host-side target)"
+out=$(STUB_NO_GW=1 probe_run); rc=$?
+eq "no IPAM gateway: the bridge interface's own address is read -> OK (0)" "$rc" 0
+has "fallback address selected" "$out" "docker bridge keel-lab_default (br-ddd333eee444) 172.18.0.1: guest route"
+out=$(STUB_NET_FAIL=1 probe_run); rc=$?
+eq "Docker network discovery fails -> INCONCLUSIVE (2)" "$rc" 2; has "discovery failure named" "$out" "host Docker bridge: discovery failed"
+out=$(STUB_ROUTE_FAIL=1 probe_run); rc=$?
+eq "guest route queries fail -> INCONCLUSIVE (2)" "$rc" 2; has "route failure named for a target" "$out" "host LAN address, Caddy ingress 10.0.0.3:443: the guest's route query failed"
+case "$out" in *"PASS                  host LAN address"*) bad "no denied-target PASS without a route" "$out";; *) ok "no denied-target PASS without a route";; esac
+out=$(STUB_NO_DEFAULT=1 probe_run); rc=$?
+eq "guest default route unreadable -> INCONCLUSIVE (2)" "$rc" 2; has "default route named" "$out" "the guest's default route could not be read"
+out=$(STUB_ALT_OPEN=1 probe_run); rc=$?
+eq "forbidden connectivity to the host bridge -> FAIL (1)" "$rc" 1; has "forbidden connectivity named" "$out" "FAIL                  host Docker bridge keel-lab_default (br-ddd333eee444), Caddy 172.18.0.1:443 — observed: guest connected"
+
+echo "── R3 a corrected checker probes an existing deployment and records itself separately"
+newhome prov; CK=0123456789abcdef0123456789abcdef01234567
+out=$(HOME="$H" PATH="$T/bin:$PATH" STUB_DIR="$T" STUB_PHASE=after "$BASH" "$T/probe-run.sh" "$HC" "$SHA" "$CK" 2>&1); rc=$?; P=$(newest probe)
+eq "probe with a checker commit -> OK" "$rc" 0
+eq "INFRA_SHA stays the deployment's revision" "$(cat "$P/INFRA_SHA")" "$SHA"
+has "CHECKER records the checker commit" "$(cat "$P/CHECKER")" "checker_commit $CK"
+has "CHECKER records the checker's own SHA-256" "$(cat "$P/CHECKER")" "checker_sha256 $(shasum -a 256 "$HC" | awk '{print $1}')"
+has "the header shows both" "$out" "commit $CK; deployment (INFRA_SHA) $SHA"
+out=$(probe_run); P=$(newest probe); has "without a checker commit it is recorded as unrecorded" "$(cat "$P/CHECKER")" "checker_commit unrecorded"
+out=$(HOME="$H" PATH="$T/bin:$PATH" STUB_DIR="$T" STUB_PHASE=after "$BASH" "$T/probe-run.sh" "$HC" "$SHA" "not-a-sha" 2>&1); rc=$?
+eq "a malformed checker commit is refused" "$rc" 1
 
 echo "── M1 a missing expected service fails even when all five HTTP endpoints return 200"
 for gone in keel-lab-runtime-worker keel-lab-postgres keel-lab-web keel-lab-nats; do

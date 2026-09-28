@@ -505,6 +505,33 @@ reads the host, and writes nothing outside `~/ci-shared-check` (0700).
 - **Exit codes:** 0 OK, 1 FAIL, 2 INCONCLUSIVE, 3 evidence-log failure.
 - **Not covered live:** spoofed-source traffic and unsolicited inbound. Those rest on the namespace test (§12 below).
 
+**Every denied target must leave the guest through its external interface.** The probe reads the guest's default route (its external interface, `enp5s0`) and runs `ip -4 route get` in the guest for each destination before probing it.
+- **Rejected as INCONCLUSIVE, never evidence:**
+  - a destination local to the guest (for example `local 172.17.0.1 dev lo`: the guest's own `docker0` holds the host's docker0 address);
+  - one routed via another guest interface (an overlapping network);
+  - one with no route;
+  - a failed route query.
+- **Recorded** with each result: the guest's route, the host control and the guest outcome.
+
+**Host Docker bridge target: discovered, not assumed.** The probe no longer uses a fixed `172.17.0.1`. It reads the host's bridge networks from Docker's metadata (`docker network ls --filter driver=bridge`, `docker network inspect`; read-only), falling back to the bridge interface's own address when IPAM has no gateway. It then tries candidates in order, default bridge first:
+1. The address must belong to the host.
+2. The guest must route it through its external interface.
+3. It must answer a host-side control on `:443`.
+
+The first address that passes all three is probed, and every candidate's identity, route, control and disposition is recorded. With none, this coverage stays INCONCLUSIVE. Nothing is created: no listener, no address and no Docker or firewall change.
+
+**Re-probing an existing deployment with a corrected checker.** The provisioning revision and its snapshots stay the record of the deployment: the before and after snapshots, and `compare`, taken by the checker staged at that revision. A later checker correction does **not** create a new before-provisioning baseline, and does not re-run `compare` or `provision`. It only re-runs `probe`, recording itself separately:
+```bash
+# on dc1-arm-1: an exact, clean checkout of the CHECKER commit K (steps 0-1 above, with C=K and W=$HOME/preflight/hds-$K)
+K=<checker commit>; D=<deployment commit, e.g. 1b7eed2d2a8c41d2b4ce6b84a815aaff8f1f270b>
+scp "${S[@]}" "$HOME/preflight/hds-$K/tools/ci-activation/hostcheck.sh" $H:ci-shared-check/hostcheck-$K.sh \
+  && ssh "${S[@]}" $H "sha256sum ~/ci-shared-check/hostcheck-$K.sh" && shasum -a 256 "$HOME/preflight/hds-$K/tools/ci-activation/hostcheck.sh"
+ssh -t "${S[@]}" $H "bash ~/ci-shared-check/hostcheck-$K.sh probe $D $K"; echo "probe exit: $?"
+```
+- The staged `hostcheck.sh` from the deployment revision stays in place, next to `hostcheck-$K.sh`.
+- The new `probe-<UTC>/` records `INFRA_SHA` = `D` (the deployment), and `CHECKER` = the checker's own SHA-256, commit `K` and path.
+- Earlier probe directories and all snapshots are left as they are.
+
 **Stop at the first of these, and report:**
 - any `STOP:` line;
 - a snapshot `RESULT: INCOMPLETE`;

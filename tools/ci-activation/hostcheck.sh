@@ -24,6 +24,7 @@
 # ICMP echo requests, which targets may log.
 set -uo pipefail
 BASE="$HOME/ci-shared-check"
+HOSTCHECK_SELF="${BASH_SOURCE[0]}"
 die() { echo "STOP: $*" >&2; exit 1; }
 sha_ok() { [ "${#1}" -eq 40 ] && case "$1" in *[!0-9a-f]*) false;; *) true;; esac; }
 sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
@@ -414,6 +415,25 @@ classify() {
   if [ "$class" = expected-absent ]; then echo EXPECTED_UNAVAILABLE; else echo INCONCLUSIVE; fi
 }
 positive_status() { case "$1" in open) echo PASS;; error) echo INCONCLUSIVE;; *) echo FAIL;; esac; }
+# The guest's route to a destination (`ip -4 route get` exit status and first line) against its
+# external interface. Only "external" makes a denied-target probe evidence about the HOST boundary:
+#   guest-local   the address is the guest's own (e.g. its docker0 172.17.0.1) — the probe would test the guest
+#   other:<dev>   the guest routes it via another of its interfaces (an overlapping network)
+#   no-route      the guest has no route at all
+#   unreadable    the query failed or its output is not understood
+route_verdict() { # rc line external-interface
+  local rc=$1 line=$2 ext=$3 dev
+  if [ "$rc" != 0 ]; then case "$line" in *nreachable*|*prohibit*) echo no-route;; *) echo unreadable;; esac; return; fi
+  case "$line" in
+    "local "*|"broadcast "*|"multicast "*) echo guest-local; return;;
+    "unreachable "*|"prohibit "*|"blackhole "*|"throw "*) echo no-route; return;;
+  esac
+  dev=$(printf '%s\n' "$line" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+  if [ -z "$dev" ] || [ -z "$ext" ]; then echo unreadable
+  elif [ "$dev" = lo ]; then echo guest-local
+  elif [ "$dev" = "$ext" ]; then echo external
+  else echo "other:$dev"; fi
+}
 enabled_status() { # systemctl is-enabled output -> verdict
   case "$1" in enabled) echo PASS;; disabled|static|indirect|generated|alias|linked|linked-runtime|masked|masked-runtime|enabled-runtime|transient) echo FAIL;; *) echo INCONCLUSIVE;; esac
 }
@@ -510,6 +530,27 @@ guest_icmp() { X sh -c 'ping -4 -n -c 1 -W 2 "$0" >/dev/null 2>&1; echo "RC=$?"'
 host_tcp()   { timeout 4 bash -c 'exec 3<>/dev/tcp/$0/$1' "$1" "$2" >/dev/null 2>&1; echo $?; }
 host_icmp()  { ping -4 -n -c 1 -W 2 "$1" >/dev/null 2>&1; echo $?; }
 is_local()   { ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -x -- "$1" >/dev/null; }
+# The guest's `ip -4 route get` for one address: its output followed by an RC=<status> marker.
+guest_route() { X sh -c 'ip -4 route get "$0" 2>&1; echo "RC=$?"' "$1" </dev/null 2>/dev/null; }
+route_line_of() { grep -v '^RC=' | sed -n 1p; }
+# The host's Docker bridge networks, from Docker's own metadata (read-only):
+# "network interface address" per line. Returns 1 when discovery itself fails.
+docker_bridge_candidates() {
+  local ids meta line id name opt gws iface a
+  ids=$(sudo docker network ls --filter driver=bridge --format '{{.ID}}' 2>/dev/null) || return 1
+  [ -n "$ids" ] || return 1
+  # shellcheck disable=SC2086
+  # '|'-separated: a missing option renders as "<no value>", which contains a space.
+  meta=$(sudo docker network inspect --format '{{.Id}}|{{.Name}}|{{index .Options "com.docker.network.bridge.name"}}|{{range .IPAM.Config}}{{.Gateway}} {{end}}' $ids 2>/dev/null) || return 1
+  printf '%s\n' "$meta" | while IFS='|' read -r id name opt gws; do
+    [ -n "$id" ] || continue
+    case "$opt" in ''|'<no value>') iface="br-$(printf '%s' "$id" | cut -c1-12)";; *) iface=$opt;; esac
+    a=$(printf '%s\n' $gws | grep -E '^[0-9]+(\.[0-9]+){3}$' | sed -n 1p)
+    # No gateway in IPAM: read the bridge interface's own address (read-only).
+    [ -n "$a" ] || a=$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sed -n 1p)
+    echo "$name $iface ${a:--}"
+  done | sort -k1,1 | awk '$1 == "bridge" {print; next} {rest[NR] = $0} END {for (i = 1; i <= NR; i++) if (i in rest) print rest[i]}'
+}
 drop_packets() { # sum of packets on the drop rules of one chain of inet ci_egress_tw; empty if unreadable
   sudo nft list chain inet ci_egress_tw "$1" 2>/dev/null \
     | awk '/counter packets [0-9]+ bytes [0-9]+ drop/ {for (i = 1; i <= NF; i++) if ($i == "packets") s += $(i + 1); n++} END {if (n) print s + 0}'
@@ -519,17 +560,65 @@ probe_target() { # class kind ip port label
   local class=$1 kind=$2 ip=$3 port=$4 label=$5 chain g h c0 c1 where
   if [ -z "$ip" ]; then rec isolation INCONCLUSIVE "$label: address not found on the host; the check could not run"; return; fi
   where=$ip; [ -n "$port" ] && where="$ip:$port"
+  # The guest must route the destination out through its external interface; otherwise the probe
+  # would test the guest itself (or an overlapping network) and say nothing about the host.
+  local rt rl rv
+  if [ -z "${GUEST_EXTIF:-}" ]; then
+    rec isolation INCONCLUSIVE "$label $where: the guest's external interface is unknown, so its route cannot be checked"; return; fi
+  rt=$(guest_route "$ip"); rl=$(printf '%s\n' "$rt" | route_line_of)
+  rv=$(route_verdict "$(printf '%s\n' "$rt" | rc_of)" "$rl" "$GUEST_EXTIF")
+  case "$rv" in
+    external) ;;
+    guest-local) rec isolation INCONCLUSIVE "$label $where: the address is local to the guest (route: $rl); not evidence about the host boundary"; return;;
+    other:*) rec isolation INCONCLUSIVE "$label $where: the guest routes it via its own ${rv#other:}, not $GUEST_EXTIF (overlapping network; route: $rl); not evidence about the host boundary"; return;;
+    no-route) rec isolation INCONCLUSIVE "$label $where: the guest has no route to it (route: $rl); not evidence about the host boundary"; return;;
+    *) rec isolation INCONCLUSIVE "$label $where: the guest's route query failed (${rl:-no output})"; return;;
+  esac
   if is_local "$ip"; then chain=input; else chain=forward; fi
   c0=$(drop_packets "$chain")
   if [ "$kind" = tcp ]; then g=$(tcp_outcome "$(guest_tcp "$ip" "$port")"); else g=$(icmp_outcome "$(guest_icmp "$ip")"); fi
   c1=$(drop_packets "$chain")
   if [ "$kind" = tcp ]; then h=$(tcp_outcome "$(host_tcp "$ip" "$port")"); else h=$(icmp_outcome "$(host_icmp "$ip")"); fi
-  rec isolation "$(classify "$class" "$g" "$h")" "$label $where — observed: guest $(say_outcome "$kind" "$g"); host $(say_outcome "$kind" "$h")"
+  rec isolation "$(classify "$class" "$g" "$h")" "$label $where — observed: guest $(say_outcome "$kind" "$g"); host $(say_outcome "$kind" "$h"); guest route: $rl"
   if [ -n "$c0" ] && [ -n "$c1" ]; then
     rec evidence INFO "    counters: inet ci_egress_tw $chain drop rules +$((c1 - c0)) packets during the guest attempt (shared; supporting only)"
   else
     rec evidence INFO "    counters: inet ci_egress_tw $chain unreadable"
   fi
+}
+
+# The host-Docker-bridge target is DISCOVERED, never assumed: each bridge network's host address
+# (Docker's metadata) must be an address of this host, must route out through the guest's external
+# interface (a guest-local or overlapping destination is never evidence), and must answer a host-side
+# control on :443. The first such address is probed; with none, the coverage stays INCONCLUSIVE.
+# Every candidate's identity, route, host control and disposition is recorded.
+select_docker_bridge_target() {
+  local cands n i k a rt rl rv h chosen=-1
+  local -a CN=() CI=() CA=()
+  if ! cands=$(docker_bridge_candidates) || [ -z "$cands" ]; then
+    rec isolation INCONCLUSIVE "host Docker bridge: discovery failed (docker network ls/inspect); no target could be selected"; return; fi
+  while read -r n i a; do CN+=("$n"); CI+=("$i"); CA+=("$a"); done <<< "$cands"
+  k=0
+  while [ "$k" -lt "${#CN[@]}" ]; do
+    n=${CN[$k]}; i=${CI[$k]}; a=${CA[$k]}; k=$((k + 1))
+    if [ "$a" = - ]; then rec evidence INFO "    docker bridge $n ($i): no IPv4 address; rejected"; continue; fi
+    if ! is_local "$a"; then rec evidence INFO "    docker bridge $n ($i) $a: not an address of this host; rejected"; continue; fi
+    if [ -z "${GUEST_EXTIF:-}" ]; then rec evidence INFO "    docker bridge $n ($i) $a: guest external interface unknown; rejected"; continue; fi
+    rt=$(guest_route "$a"); rl=$(printf '%s\n' "$rt" | route_line_of)
+    rv=$(route_verdict "$(printf '%s\n' "$rt" | rc_of)" "$rl" "$GUEST_EXTIF")
+    if [ "$rv" != external ]; then
+      rec evidence INFO "    docker bridge $n ($i) $a: guest route '${rl:-none}' is $rv, not via $GUEST_EXTIF; rejected (not evidence about the host)"; continue; fi
+    h=$(tcp_outcome "$(host_tcp "$a" 443)")
+    if [ "$h" != open ]; then
+      rec evidence INFO "    docker bridge $n ($i) $a: guest route '$rl'; host control :443 $(say_outcome tcp "$h"); rejected (no live host-side target)"; continue; fi
+    rec evidence INFO "    docker bridge $n ($i) $a: guest route '$rl'; host control :443 connected; selected"
+    chosen=$((k - 1)); break
+  done
+  if [ "$chosen" -lt 0 ]; then
+    rec isolation INCONCLUSIVE "host Docker bridge: no bridge address both leaves the guest via ${GUEST_EXTIF:-its external interface} and answers a host-side control; coverage not established (candidates above)"
+    return
+  fi
+  probe_target required tcp "${CA[$chosen]}" 443 "host Docker bridge ${CN[$chosen]} (${CI[$chosen]}), Caddy"
 }
 
 unit_check() { # section unit
@@ -649,6 +738,12 @@ probe_body() {
   if [ "$GUEST_OK" != 1 ]; then
     rec isolation INCONCLUSIVE "the guest does not answer; no isolation check could run"
   else
+    # The guest's external interface (from its default route): denied targets must leave through it.
+    GUEST_EXTIF=""
+    qry X sh -c 'ip -4 route show default'
+    if [ "$QRC" -eq 0 ]; then GUEST_EXTIF=$(printf '%s\n' "$QOUT" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'); fi
+    if [ -n "$GUEST_EXTIF" ]; then rec evidence INFO "    guest default route: $(printf '%s' "$QOUT" | sed -n 1p) (external interface $GUEST_EXTIF)"
+    else rec isolation INCONCLUSIVE "the guest's default route could not be read (exit $QRC); no denied target can be tied to the host boundary"; fi
     rec isolation "$(positive_status "$(tcp_outcome "$(guest_tcp 10.72.0.1 53)")")" "positive control: guest's own resolver 10.72.0.1:53 (TCP) must connect"
     out=$(X sh -c 'curl -sS -4 -m 20 -o /dev/null https://api.github.com/zen >/dev/null 2>&1; echo "RC=$?"' 2>/dev/null | rc_of)
     case "$out" in 0) st=PASS;; ''|126|127) st=INCONCLUSIVE;; *) st=FAIL;; esac
@@ -664,7 +759,7 @@ probe_body() {
     probe_target required        tcp  10.71.0.1  53   "Keel's bridge resolver"
     probe_target required        tcp  10.0.0.22  22   "administration plane dc1-arm-1, sshd"
     probe_target required        tcp  "$ts"      443  "host Tailscale address, Caddy"
-    probe_target required        tcp  172.17.0.1 443  "docker0 address, Caddy"
+    select_docker_bridge_target
     qry X sh -c 'ip -6 -o addr show scope global && ip -6 route show default && echo __OK__'
     if [ "$QRC" -ne 0 ] || [ -z "$(printf '%s\n' "$QOUT" | grep -x __OK__)" ]; then rec isolation INCONCLUSIVE "IPv6: could not read the guest's IPv6 addresses and routes (exit $QRC)"
     elif [ -n "$(printf '%s\n' "$QOUT" | grep -vx __OK__)" ]; then rec isolation FAIL "IPv6: guest has a global address or default route: $(printf '%s\n' "$QOUT" | grep -vx __OK__ | tr '\n' ';')"
@@ -685,12 +780,22 @@ probe_body() {
   summarize
 }
 
+# probe <deployment SHA> [checker commit]
+# The deployment SHA is the infrastructure revision that PROVISIONED the host (it goes to INFRA_SHA,
+# as before). The checker is recorded separately, in CHECKER: this script's own SHA-256 always, and
+# the commit it was staged from when given. A corrected checker can therefore probe an existing
+# deployment without pretending to be the revision that built it.
 probe() {
-  local SHA="${1:-}" D ps body teerc
-  sha_ok "$SHA" || die "argument must be the 40-character infrastructure SHA"
+  local SHA="${1:-}" CC="${2:-}" D ps body teerc self
+  sha_ok "$SHA" || die "argument must be the 40-character infrastructure SHA of the deployment"
+  [ -z "$CC" ] || sha_ok "$CC" || die "the optional checker commit must be a 40-character SHA"
   sudo -v || die "sudo refused"
+  self=$(sha256_of "$HOSTCHECK_SELF" 2>/dev/null | awk '{print $1}')
   D="$BASE/probe-$(date -u +%Y%m%dT%H%M%SZ)"
-  mkdir -p "$D" && chmod -R go-rwx "$BASE" && echo "$SHA" > "$D/INFRA_SHA" || die "cannot create $D"
+  mkdir -p "$D" && chmod -R go-rwx "$BASE" && echo "$SHA" > "$D/INFRA_SHA" \
+    && printf 'checker_sha256 %s\nchecker_commit %s\nchecker_path %s\n' "${self:-unreadable}" "${CC:-unrecorded}" "$HOSTCHECK_SELF" > "$D/CHECKER" \
+    || die "cannot create $D"
+  echo "== checker: $HOSTCHECK_SELF sha256 ${self:-unreadable}, commit ${CC:-unrecorded}; deployment (INFRA_SHA) $SHA"
   # The log is a pipeline, so the shell waits for tee and both statuses are checked.
   probe_body "$D" "$SHA" 2>&1 | tee "$D/probe.txt"
   ps=("${PIPESTATUS[@]}"); body=${ps[0]}; teerc=${ps[1]:-1}
@@ -711,7 +816,7 @@ hostcheck_main() {
     verify)   shift; verify_cmd "$@"; exit $? ;;
     compare)  shift; compare "$@"; exit $? ;;
     probe)    shift; probe "$@"; exit $? ;;
-    *) die "usage: hostcheck.sh snapshot <phase> <sha> | verify <phase> <sha> [max-min] | compare <sha> | probe <sha>" ;;
+    *) die "usage: hostcheck.sh snapshot <phase> <sha> | verify <phase> <sha> [max-min] | compare <sha> | probe <deployment-sha> [checker-commit]" ;;
   esac
 }
 if [ "${HOSTCHECK_LIB:-0}" != 1 ]; then hostcheck_main "$@"; fi
