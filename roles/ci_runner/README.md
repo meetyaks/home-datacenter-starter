@@ -466,15 +466,23 @@ reads the host, and writes nothing outside `~/ci-shared-check` (0700).
 
 - **`snapshot`** is fail-closed:
   - each required collector's own exit status and output structure are checked, and stderr is kept in `errors/`;
-  - it requires Keel's DOCKER-USER rules each exactly once, readable unit states with docker, LXD and Caddy active, every Keel container running and healthy, and Keel's five health endpoints (below) at 200;
-  - only then does it write `COMPLETE`, which binds the phase, `C`, the snapshot identity, the creation time and the SHA-256 of all 20 required evidence files, with an end count;
+  - it requires Keel's DOCKER-USER rules each exactly once, readable unit states with docker, LXD and Caddy active, every Keel container to satisfy the **container contract** (below), and Keel's five health endpoints (below) at 200;
+  - only then does it write `COMPLETE` (format `hostcheck-snapshot v2`), which binds the phase, `C`, the snapshot identity, the creation time and the SHA-256 of all 20 required evidence files, with an end count;
   - otherwise it prints `RESULT: INCOMPLETE`, exits 1 and writes no record.
-- **`verify`** checks the **newest** snapshot of a phase. An older valid snapshot is never used instead.
+- **`verify`** checks the **newest** snapshot of a phase, and re-applies the container contract to its bound evidence. An older valid snapshot is never used instead.
 - **`compare`** verifies both records, requires `stable/` to be byte-identical and each `citwbr0` and `lxdbr0` DOCKER-USER rule exactly once. It exits 1 on anything else.
 - **`probe`** judges three sections separately:
   - **infrastructure readiness:** the instance is a VM and answers; its expanded configuration has no host-path disk, passthrough device or raw override (configuration evidence only); the live `inet ci_egress_tw` equals the reviewed rendering; the DOCKER-USER rules, the units and `citwbr0`;
-  - **Keel preservation:** Keel's table, unit and DOCKER-USER rules, `dc1-ci-1`, the five health endpoints, and the containers;
+  - **Keel preservation:** Keel's table, unit and DOCKER-USER rules, `dc1-ci-1`, the five health endpoints, and the containers under the same container contract;
   - **TrueWealth isolation coverage:** positive controls, denied targets, IPv6 and guest contents.
+
+**Keel container contract** — the same in `snapshot`, `verify`, `compare` (both records) and `probe`:
+- **One-shot jobs** are exactly `bootstrap` and `minio-bucket`: the set `roles/keel/tasks/verify.yml` exempts from "running". In Keel's `infra/lab/compose.lab.yml` at the pinned `keel_commit`, both have `restart: 'no'`, run one command and exit, and gate the gateway through `service_completed_successfully`. Each must be present exactly once and have **completed successfully**: `status=exited`, `exit=0`, `oom=false`. A nonzero exit, an OOM kill, a `created` or `running` one-shot, a missing one-shot, or a duplicate blocks.
+- **Every other `keel-lab-*` container is long-running**: it must be `running`, and `healthy` where it has a health check. An exited long-running service blocks, even with exit 0, and so do `restarting` or a health state of `starting` or `unhealthy`.
+- **Also blocking:** a failed `docker inspect` (INCONCLUSIVE in the probe) and any unrecognised state line.
+- **Evidence:** each container's line is kept in the snapshot's `stable/keel-state.txt` as `/<name> restarts=N status=S exit=E oom=B health=H`, and in the probe directory's `keel-state.txt`. It is hash-bound by the record, and compared byte-for-byte before and after, so a one-shot rerun or a changed exit code shows as a regression.
+- HTTP health alone never satisfies the contract.
+- **Keeping the list honest:** `tests/ci-activation` checks that the one-shot list equals `verify.yml`'s. Changing it needs a matching change to Keel's Compose contract and `verify.yml`.
 
 **Probe verdicts.**
 - **PASS for a denied target** is an *observed* outcome: the guest got no connection, and the host reached the same address and port. Drop-counter changes are printed as supporting evidence only.
@@ -520,7 +528,7 @@ expected table equal to it.
 - the units `ci-egress`, `docker`, `snap.lxd.daemon` and `caddy`;
 - `dc1-ci-1`'s expanded configuration without `volatile.*`;
 - `lxdbr0`;
-- the Keel containers, with restart counts and health;
+- the Keel containers, with restart count, state, exit code, OOM flag and health (one-shots included);
 - Keel's health contract from `roles/keel/tasks/verify.yml`:
   - `http://127.0.0.1:3000/healthz`;
   - `http://127.0.0.1:3000/readyz`;

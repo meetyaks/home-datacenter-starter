@@ -29,7 +29,7 @@ sha_ok() { [ "${#1}" -eq 40 ] && case "$1" in *[!0-9a-f]*) false;; *) true;; esa
 sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 newest_dir() { ls -1d "$BASE/$1"-2* 2>/dev/null | sort | tail -n 1; }
 
-RECORD_FORMAT="hostcheck-snapshot v1"
+RECORD_FORMAT="hostcheck-snapshot v2"   # v2: Keel container state carries status, exit code, OOM and health
 # Every file a completion record must bind. A snapshot missing any of them is not a baseline.
 REQUIRED_EVIDENCE="INFRA_SHA raw/nft-keel.txt raw/nft-ruleset.txt raw/nft-lxd.txt raw/iptables.txt
 raw/iptables-nat.txt raw/dc1-ci-1.yaml raw/keel-ps.txt stable/keel-nft.txt stable/iptables.txt
@@ -40,6 +40,40 @@ KEEL_HEALTH_URLS="http://127.0.0.1:3000/healthz http://127.0.0.1:3000/readyz htt
 https://keel.dc1.lan/ https://keel.dc1.lan/__keel/healthz"
 KEEL_DU_RULES=('-A DOCKER-USER -i lxdbr0 -j ACCEPT' '-A DOCKER-USER -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT')
 TW_DU_RULES=('-A DOCKER-USER -i citwbr0 -j ACCEPT' '-A DOCKER-USER -o citwbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT')
+
+# ── Keel's container contract ────────────────────────────────────────────────
+# ONE-SHOT JOBS are exactly the services roles/keel/tasks/verify.yml exempts from "running"
+# (`^(bootstrap|minio-bucket) `). In Keel's infra/lab/compose.lab.yml at the pinned keel_commit
+# both have `restart: 'no'`, run one command and exit, and gate the gateway (and bootstrap the
+# runtime-worker) through `service_completed_successfully`. A one-shot must have COMPLETED
+# SUCCESSFULLY: present exactly once, exited, exit code 0, not OOM-killed. EVERY OTHER keel-lab
+# container is long-running: running, and healthy where it has a health check. Anything else —
+# a missing one-shot, a failed inspection, a nonzero exit, an unrecognised state — blocks.
+# tests/ci-activation keeps this list equal to verify.yml's.
+KEEL_ONESHOT_SERVICES="bootstrap minio-bucket"
+KEEL_CONTAINER_PREFIX="keel-lab-"
+# The evidence line for one container; explicit fields so a reader (and the classifier) never guesses.
+KEEL_STATE_FORMAT='{{.Name}} restarts={{.RestartCount}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
+# State lines on stdin -> one line per violation of the contract; no output means the contract holds.
+keel_state_problems() {
+  awk -v oneshots="$KEEL_ONESHOT_SERVICES" -v pfx="$KEEL_CONTAINER_PREFIX" '
+    BEGIN { n = split(oneshots, o, " "); for (i = 1; i <= n; i++) { one["/" pfx o[i]] = 1; seen["/" pfx o[i]] = 0 } }
+    NF == 0 { next }
+    $0 !~ /^\/[^ ]+ restarts=[0-9]+ status=[a-z]+ exit=-?[0-9]+ oom=(true|false) health=[a-z]+$/ { print "unrecognised state line: " $0; next }
+    {
+      name = $1; split($3, s, "="); split($4, x, "="); split($5, m, "="); split($6, h, "=")
+      if (name in one) {
+        seen[name]++
+        if (s[2] != "exited" || x[2] != "0" || m[2] != "false")
+          print "one-shot " name " did not complete successfully: status=" s[2] " exit=" x[2] " oom=" m[2]
+      } else if (s[2] != "running") {
+        print "long-running " name " is not running: status=" s[2] " exit=" x[2] " oom=" m[2]
+      } else if (h[2] != "none" && h[2] != "healthy") {
+        print "long-running " name " is not healthy: health=" h[2]
+      }
+    }
+    END { for (k in seen) { if (seen[k] == 0) print "one-shot " k " is missing"; else if (seen[k] > 1) print "one-shot " k " appears " seen[k] " times" } }'
+}
 
 # ═══ snapshot ═══════════════════════════════════════════════════════════════
 SNAP_BAD=0
@@ -116,19 +150,20 @@ snapshot() {
   collect stable/lxdbr0.txt sudo lxc network show lxdbr0 && has_line "$D/stable/lxdbr0.txt" '^name: lxdbr0$' \
     || bad_ev "lxc network show lxdbr0 (see errors/)"
 
-  # Keel's containers: every one inspected, running, and healthy where it has a health check
+  # Keel's containers: every one inspected and judged by the container contract above —
+  # long-running ones running (healthy where checked), one-shots completed with exit 0
   if collect raw/keel-ps.txt sudo docker ps -a --filter name=keel-lab --format '{{.Names}} {{.Image}} {{.Label "com.docker.compose.project"}}' \
      && [ -s "$D/raw/keel-ps.txt" ]; then
     sort "$D/raw/keel-ps.txt" > "$D/stable/keel-containers.txt" || bad_ev "derivation of keel-containers"
     : > "$D/stable/keel-state.txt"
     for c in $(awk '{print $1}' "$D/stable/keel-containers.txt"); do
-      sudo docker inspect --format '{{.Name}} restarts={{.RestartCount}} {{.State.Status}}{{if .State.Health}} {{.State.Health.Status}}{{end}}' "$c" \
+      sudo docker inspect --format "$KEEL_STATE_FORMAT" "$c" \
         >> "$D/stable/keel-state.txt" 2>>"$D/errors/keel-state.err" || bad_ev "docker inspect $c (see errors/)"
     done
     n=$(awk 'END {print NR}' "$D/stable/keel-state.txt"); m=$(awk 'END {print NR}' "$D/stable/keel-containers.txt")
     [ "$n" = "$m" ] || bad_ev "container state for $n of $m Keel containers"
-    bad=$(awk '!/^\/[^ ]+ restarts=[0-9]+ running( healthy)?$/' "$D/stable/keel-state.txt")
-    [ -z "$bad" ] || bad_ev "Keel container not running or not healthy: $(printf '%s' "$bad" | tr '\n' ';')"
+    bad=$(keel_state_problems < "$D/stable/keel-state.txt")
+    [ -z "$bad" ] || bad_ev "Keel container contract: $(printf '%s' "$bad" | tr '\n' ';')"
   else bad_ev "docker ps keel-lab: error or no containers (see errors/)"; fi
 
   # Keel's own health contract (roles/keel/tasks/verify.yml): all 200, certificates verified
@@ -201,6 +236,11 @@ verify_record() { # dir phase sha [max-age-minutes] -> 0 only if every check pas
   done
   n=$(awk '$2 == "200" {n++} END {print n + 0}' "$d/stable/keel-health.txt" 2>/dev/null)
   [ "$n" = 5 ] || vr_bad "Keel health is $n/5 at 200"
+  # The same container contract the snapshot applied, re-applied to the bound evidence.
+  if [ -f "$d/stable/keel-state.txt" ]; then
+    n=$(keel_state_problems < "$d/stable/keel-state.txt")
+    [ -z "$n" ] || vr_bad "Keel container contract: $(printf '%s' "$n" | tr '\n' ';')"
+  fi
   if [ -n "$max" ]; then
     ce=$(awk '$1 == "created_epoch" {print $2}' "$r"); now=$(date +%s)
     case "$ce" in ''|*[!0-9]*) vr_bad "no creation time";;
@@ -448,7 +488,7 @@ table_check() { # section table label
 }
 
 probe_body() {
-  local D=$1 SHA=$2 out missing live duok st u code rc notup unhealthy findings keelvm ts
+  local D=$1 SHA=$2 out missing live duok st u code rc iok problems findings keelvm ts
   echo "== live checks for $VM (infrastructure $SHA), $(date -u +%FT%TZ)"
 
   echo "── Infrastructure readiness"
@@ -520,15 +560,21 @@ probe_body() {
     elif [ "$rc" -eq 0 ] && [ "$code" = 200 ]; then rec keel PASS "health $u 200"
     else rec keel FAIL "health $u: HTTP ${code:-none}, curl exit $rc"; fi
   done
-  qry sudo docker ps -a --filter name=keel-lab --format '{{.Names}} {{.Status}}'
+  # The same container contract as the snapshot: one-shots completed (exit 0), the rest running/healthy.
+  qry sudo docker ps -a --filter name=keel-lab --format '{{.Names}}'
   if [ "$QRC" -ne 0 ]; then rec keel INCONCLUSIVE "docker ps keel-lab failed: $QOUT"
+  elif [ -z "$QOUT" ]; then rec keel FAIL "no keel-lab containers found"
   else
-    notup=$(printf '%s\n' "$QOUT" | awk 'NF && $0 !~ / Up /')
-    unhealthy=$(printf '%s\n' "$QOUT" | grep -E '\((unhealthy|health: starting)\)')
-    if [ -z "$QOUT" ]; then rec keel FAIL "no keel-lab containers found"
-    elif [ -n "$notup" ]; then rec keel FAIL "a keel-lab container is not up: $(printf '%s\n' "$notup" | tr '\n' ';')"
-    elif [ -n "$unhealthy" ]; then rec keel FAIL "a keel-lab container is not healthy: $(printf '%s\n' "$unhealthy" | tr '\n' ';')"
-    else rec keel PASS "all keel-lab containers up ($(printf '%s\n' "$QOUT" | awk 'NF' | wc -l | tr -d ' '))"; fi
+    iok=1; : > "$D/keel-state.txt"
+    for u in $(printf '%s\n' "$QOUT" | sort); do
+      sudo docker inspect --format "$KEEL_STATE_FORMAT" "$u" >> "$D/keel-state.txt" 2>>"$D/keel-state.err" || iok=0
+    done
+    if [ "$iok" != 1 ]; then rec keel INCONCLUSIVE "docker inspect failed for a keel-lab container (see $D/keel-state.err)"
+    else
+      problems=$(keel_state_problems < "$D/keel-state.txt")
+      if [ -n "$problems" ]; then rec keel FAIL "Keel container contract: $(printf '%s' "$problems" | tr '\n' ';')"
+      else rec keel PASS "Keel containers: one-shots ($KEEL_ONESHOT_SERVICES) completed with exit 0; the other $(awk 'END {print NR - 2}' "$D/keel-state.txt") running and healthy where checked"; fi
+    fi
   fi
 
   echo "── TrueWealth isolation coverage"

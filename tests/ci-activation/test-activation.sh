@@ -214,10 +214,23 @@ case "$name" in
     esac;;
   docker)
     case "$a" in
-      inspect*) c=${!#}; if [ "$c" = keel-lab-db ] && [ -n "${STUB_UNHEALTHY:-}" ]; then echo "/$c restarts=0 running unhealthy"; else echo "/$c restarts=0 running healthy"; fi;;
-      *Image*) printf 'keel-lab-api keel/api:1 keel\nkeel-lab-db postgres:16 keel\n';;
-      *Status*) echo "keel-lab-api Up 2 days (healthy)"
-                if [ -n "${STUB_UNHEALTHY:-}" ]; then echo "keel-lab-db Up 2 days (unhealthy)"; else echo "keel-lab-db Up 2 days (healthy)"; fi;;
+      # Containers: keel-lab-api / keel-lab-db (long-running, health-checked), keel-lab-worker
+      # (long-running, no health check), keel-lab-bootstrap / keel-lab-minio-bucket (one-shots).
+      # STUB_UNHEALTHY, STUB_LONGRUN_EXITED, STUB_BOOTSTRAP_EXIT, STUB_BOOTSTRAP_OOM,
+      # STUB_BOOTSTRAP_STATUS, STUB_NO_BOOTSTRAP and STUB_INSPECT_FAIL inject faults.
+      inspect*) c=${!#}
+        if [ -n "${STUB_INSPECT_FAIL:-}" ] && [ "$c" = keel-lab-minio-bucket ]; then echo "Error: No such object: $c" >&2; exit 1; fi
+        case "$c" in
+          keel-lab-bootstrap) echo "/$c restarts=0 status=${STUB_BOOTSTRAP_STATUS:-exited} exit=${STUB_BOOTSTRAP_EXIT:-0} oom=${STUB_BOOTSTRAP_OOM:-false} health=none";;
+          keel-lab-minio-bucket) echo "/$c restarts=0 status=exited exit=0 oom=false health=none";;
+          keel-lab-api) if [ -n "${STUB_LONGRUN_EXITED:-}" ]; then echo "/$c restarts=0 status=exited exit=0 oom=false health=none"
+                        else echo "/$c restarts=0 status=running exit=0 oom=false health=healthy"; fi;;
+          keel-lab-db) echo "/$c restarts=0 status=running exit=0 oom=false health=$([ -n "${STUB_UNHEALTHY:-}" ] && echo unhealthy || echo healthy)";;
+          *) echo "/$c restarts=0 status=running exit=0 oom=false health=none";;
+        esac;;
+      *Image*) printf 'keel-lab-api keel/api:1 keel\nkeel-lab-db postgres:16 keel\nkeel-lab-worker keel/api:1 keel\nkeel-lab-minio-bucket minio-mc:1 keel\n'
+               [ -n "${STUB_NO_BOOTSTRAP:-}" ] || printf 'keel-lab-bootstrap keel/api:1 keel\n';;
+      *Names*) printf 'keel-lab-api\nkeel-lab-db\nkeel-lab-worker\nkeel-lab-minio-bucket\n'; [ -n "${STUB_NO_BOOTSTRAP:-}" ] || echo keel-lab-bootstrap;;
       stats*) echo "keel-lab-api 1.00% 100MiB / 27GiB";;
       *) echo "stub docker: unhandled [$a]" >&2; exit 99;;
     esac;;
@@ -317,11 +330,11 @@ out=$(hc verify before "$SHA" 120); rc=$?; eq "newest snapshot incomplete, older
 echo "── E4 container health failure despite five HTTP 200s"
 newhome 5
 out=$(STUB_PHASE=before STUB_UNHEALTHY=1 hc snapshot before "$SHA"); rc=$?
-eq "snapshot exits nonzero" "$rc" 1; has "unhealthy container named" "$out" "not running or not healthy: /keel-lab-db restarts=0 running unhealthy"
+eq "snapshot exits nonzero" "$rc" 1; has "unhealthy container named" "$out" "long-running /keel-lab-db is not healthy: health=unhealthy"
 B=$(newest before); eq "all five endpoints were 200" "$(grep -c ' 200$' "$B/stable/keel-health.txt")" 5
 [ ! -e "$B/COMPLETE" ] && ok "no completion record" || bad "no completion record" "found"
 out=$(STUB_UNHEALTHY=1 probe_run); rc=$?; eq "probe with an unhealthy Keel container -> FAIL (1)" "$rc" 1
-has "probe names it in Keel preservation" "$out" "a keel-lab container is not healthy"
+has "probe names it in Keel preservation" "$out" "long-running /keel-lab-db is not healthy"
 
 echo "── E5 failed configuration queries never become PASS"
 newhome 6
@@ -338,6 +351,79 @@ echo "── E6 evidence log failure"
 newhome 7
 out=$(HOME="$H" PATH="$T/teefail:$T/bin:$PATH" STUB_DIR="$T" STUB_PHASE=after "$BASH" "$T/probe-run.sh" "$HC" "$SHA" 2>&1); rc=$?
 eq "tee failure -> exit 3" "$rc" 3; has "log failure named" "$out" "RESULT: LOG FAILURE"
+
+echo "── K1 Keel container contract: one-shot jobs vs long-running services (pure)"
+OK1='/keel-lab-api restarts=0 status=running exit=0 oom=false health=healthy
+/keel-lab-worker restarts=2 status=running exit=0 oom=false health=none
+/keel-lab-bootstrap restarts=0 status=exited exit=0 oom=false health=none
+/keel-lab-minio-bucket restarts=0 status=exited exit=0 oom=false health=none'
+kp() { printf '%s\n' "$1" | keel_state_problems; }
+eq "one-shots exited 0, long-running running/healthy -> no problems" "$(kp "$OK1")" ""
+has "one-shot nonzero exit -> blocked" "$(kp "${OK1/bootstrap restarts=0 status=exited exit=0/bootstrap restarts=0 status=exited exit=1}")" \
+    "one-shot /keel-lab-bootstrap did not complete successfully: status=exited exit=1 oom=false"
+has "one-shot OOM-killed -> blocked" "$(kp "${OK1/minio-bucket restarts=0 status=exited exit=0 oom=false/minio-bucket restarts=0 status=exited exit=137 oom=true}")" \
+    "one-shot /keel-lab-minio-bucket did not complete successfully: status=exited exit=137 oom=true"
+has "one-shot OOM-killed even with exit 0 -> blocked" "$(kp "${OK1/bootstrap restarts=0 status=exited exit=0 oom=false/bootstrap restarts=0 status=exited exit=0 oom=true}")" "oom=true"
+has "one-shot never ran (created) -> blocked" "$(kp "${OK1/bootstrap restarts=0 status=exited/bootstrap restarts=0 status=created}")" "status=created"
+has "one-shot still running -> blocked" "$(kp "${OK1/bootstrap restarts=0 status=exited/bootstrap restarts=0 status=running}")" "status=running"
+has "one-shot missing -> blocked" "$(kp "$(printf '%s\n' "$OK1" | grep -v bootstrap)")" "one-shot /keel-lab-bootstrap is missing"
+has "one-shot listed twice -> blocked" "$(kp "$OK1
+/keel-lab-bootstrap restarts=0 status=exited exit=0 oom=false health=none")" "appears 2 times"
+has "long-running exited (even exit 0) -> blocked" "$(kp "${OK1/api restarts=0 status=running/api restarts=0 status=exited}")" \
+    "long-running /keel-lab-api is not running: status=exited exit=0"
+has "long-running restarting -> blocked" "$(kp "${OK1/worker restarts=2 status=running/worker restarts=2 status=restarting}")" "status=restarting"
+has "long-running health starting -> blocked" "$(kp "${OK1/health=healthy/health=starting}")" "is not healthy: health=starting"
+has "long-running unhealthy -> blocked" "$(kp "${OK1/health=healthy/health=unhealthy}")" "is not healthy: health=unhealthy"
+has "unknown state line (old v1 format) -> blocked" "$(kp "$OK1
+/keel-lab-web restarts=0 running healthy")" "unrecognised state line"
+has "no containers at all -> both one-shots missing" "$(kp "")" "is missing"
+# The one-shot list is the one roles/keel/tasks/verify.yml exempts from "running".
+contract=$(sed -n "s/.*grep -vE '\^(\([a-z|-]*\)) '.*/\1/p" "$REPO/roles/keel/tasks/verify.yml" | tr '|' '\n' | sort | tr '\n' ' ')
+eq "one-shot set equals roles/keel/tasks/verify.yml's exemption" "$contract" "$(printf '%s\n' $KEEL_ONESHOT_SERVICES | sort | tr '\n' ' ')"
+case "$(cat "$REPO/roles/keel/tasks/deploy.yml")" in *"inspect --format"*"State.ExitCode"*"keel-lab-bootstrap"*) ok "deploy.yml also requires keel-lab-bootstrap's exit code";;
+  *) bad "deploy.yml bootstrap exit contract" "not found";; esac
+
+echo "── K2 one-shot handling end to end (snapshot, verify, compare, probe)"
+newhome 9
+out=$(STUB_PHASE=before hc snapshot before "$SHA"); rc=$?; eq "one-shots exited 0 -> snapshot OK" "$rc" 0
+B=$(newest before)
+has "one-shot exit evidence kept in the snapshot" "$(cat "$B/stable/keel-state.txt")" "/keel-lab-bootstrap restarts=0 status=exited exit=0 oom=false health=none"
+has "record binds the container evidence" "$(cat "$B/COMPLETE")" "stable/keel-state.txt"
+sleep 1; out=$(STUB_PHASE=after hc snapshot after-provision "$SHA"); A=$(newest after-provision)
+out=$(hc compare "$SHA"); rc=$?; eq "compare with one-shot evidence on both sides -> OK" "$rc" 0
+has "after snapshot keeps one-shot evidence too" "$(cat "$A/stable/keel-state.txt")" "/keel-lab-minio-bucket restarts=0 status=exited exit=0 oom=false"
+out=$(probe_run); rc=$?; eq "probe with completed one-shots -> OK" "$rc" 0
+has "probe states one-shots completed" "$out" "one-shots (bootstrap minio-bucket) completed with exit 0; the other 3 running"
+has "probe keeps container evidence" "$(cat "$(newest probe)/keel-state.txt")" "/keel-lab-bootstrap restarts=0 status=exited exit=0"
+newhome 10
+out=$(STUB_PHASE=before STUB_BOOTSTRAP_EXIT=1 hc snapshot before "$SHA"); rc=$?
+eq "failed one-shot (exit 1) -> snapshot INCOMPLETE" "$rc" 1; has "failed one-shot named" "$out" "one-shot /keel-lab-bootstrap did not complete successfully: status=exited exit=1"
+[ ! -e "$(newest before)/COMPLETE" ] && ok "failed one-shot -> no record" || bad "failed one-shot -> no record" "found"
+out=$(STUB_BOOTSTRAP_EXIT=1 probe_run); rc=$?; eq "failed one-shot -> probe FAIL (1)" "$rc" 1
+newhome 10b; out=$(STUB_PHASE=before STUB_BOOTSTRAP_EXIT=137 STUB_BOOTSTRAP_OOM=true hc snapshot before "$SHA"); rc=$?
+eq "OOM-killed one-shot -> snapshot INCOMPLETE" "$rc" 1; has "OOM named" "$out" "oom=true"
+newhome 10c; out=$(STUB_PHASE=before STUB_NO_BOOTSTRAP=1 hc snapshot before "$SHA"); rc=$?
+eq "missing one-shot -> snapshot INCOMPLETE" "$rc" 1; has "missing one-shot named" "$out" "one-shot /keel-lab-bootstrap is missing"
+out=$(STUB_NO_BOOTSTRAP=1 probe_run); rc=$?; eq "missing one-shot -> probe FAIL (1)" "$rc" 1
+newhome 10d; out=$(STUB_PHASE=before STUB_BOOTSTRAP_STATUS=created hc snapshot before "$SHA"); rc=$?
+eq "one-shot in unknown/unfinished state -> snapshot INCOMPLETE" "$rc" 1
+newhome 10e; out=$(STUB_PHASE=before STUB_INSPECT_FAIL=1 hc snapshot before "$SHA"); rc=$?
+eq "inspection fails -> snapshot INCOMPLETE" "$rc" 1; has "inspection failure named" "$out" "docker inspect keel-lab-minio-bucket"
+out=$(STUB_INSPECT_FAIL=1 probe_run); rc=$?; eq "inspection fails -> probe INCONCLUSIVE (2)" "$rc" 2
+newhome 10f; out=$(STUB_PHASE=before STUB_LONGRUN_EXITED=1 hc snapshot before "$SHA"); rc=$?
+eq "exited long-running service -> snapshot INCOMPLETE" "$rc" 1; has "exited long-running named" "$out" "long-running /keel-lab-api is not running: status=exited"
+out=$(STUB_LONGRUN_EXITED=1 probe_run); rc=$?; eq "exited long-running service -> probe FAIL (1)" "$rc" 1
+out=$(hc verify before "$SHA" 120); rc=$?; eq "only failed snapshots in this home -> verify refuses" "$rc" 1
+# verify re-applies the contract to bound evidence: a record written over a failed one-shot is refused
+newhome 11
+STUB_PHASE=before hc snapshot before "$SHA" >/dev/null; B=$(newest before)
+sed -i.bak 's#^/keel-lab-bootstrap .*#/keel-lab-bootstrap restarts=0 status=exited exit=2 oom=false health=none#' "$B/stable/keel-state.txt"
+# shellcheck disable=SC1090
+( HOSTCHECK_LIB=1 . "$HC"; write_record "$B" before "$SHA" ) || bad "re-record" "write_record failed"
+out=$(hc verify before "$SHA" 120); rc=$?
+eq "record over a failed one-shot -> verify refuses" "$rc" 1; has "verify names the contract" "$out" "Keel container contract: one-shot /keel-lab-bootstrap did not complete successfully"
+sed -i.v1 '1s/.*/hostcheck-snapshot v1/' "$B/COMPLETE"
+out=$(hc verify before "$SHA" 120); rc=$?; eq "v1 record (old state format) -> refused" "$rc" 1; has "format named" "$out" "unknown format"
 
 echo "── E7 the provision gate uses the checkout's own hostcheck.sh"
 newhome 8
