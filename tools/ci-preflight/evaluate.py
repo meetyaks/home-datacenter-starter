@@ -96,6 +96,19 @@ def evaluate(facts, plan):
     if facts.get("schema") != "ci-preflight-facts/1":
         return [("UNKNOWN", "facts", "not a ci-preflight-facts/1 document")]
 
+    # Older Ansible renders templated plan values as strings ("4"); accept
+    # exact numbers only, and refuse anything else rather than guess.
+    plan = dict(plan)
+    try:
+        for k in ("cpu", "memory_mib", "reserve_cpu", "reserve_memory_mib", "lv_size_bytes", "vg_reserve_bytes"):
+            v = str(plan[k]).strip()
+            if not re.fullmatch(r"\d+", v):
+                raise ValueError(f"{k}={plan[k]!r}")
+            plan[k] = int(v)
+        plan["production_headroom_factor"] = float(str(plan["production_headroom_factor"]))
+    except (KeyError, ValueError) as e:
+        return [("UNKNOWN", "plan", f"plan value missing or not a number: {e}")]
+
     # ── CPU and memory: every OTHER instance's EFFECTIVE limits ──────────────
     def others():
         insts = section(facts, "lxc_list", json.loads)

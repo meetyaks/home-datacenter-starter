@@ -189,6 +189,16 @@ class Preflight(unittest.TestCase):
             s["docker_forward"]["stdout"] = "-P FORWARD ACCEPT\n"
         self.assertEqual(verdicts(mutate(f))["forward policy"], "FAIL")
 
+    def test_plan_numbers_rendered_as_strings_are_accepted(self):
+        # ansible-core <= 2.18 renders templated plan values as strings.
+        as_strings = {k: (str(v) if isinstance(v, (int, float)) else v) for k, v in PLAN.items()}
+        self.assertEqual(verdicts(base_facts(), as_strings), verdicts(base_facts()))
+
+    def test_a_non_numeric_plan_value_is_unknown(self):
+        for bad in ("4 vCPU", "", "-1", "4.5"):
+            r = evaluate.evaluate(base_facts(), dict(PLAN, cpu=bad))
+            self.assertEqual((r[0][0], r[0][1]), ("UNKNOWN", "plan"), bad)
+
     def test_not_a_facts_document(self):
         self.assertEqual(evaluate.evaluate({"schema": "x"}, PLAN)[0][0], "UNKNOWN")
 

@@ -328,6 +328,44 @@ if ! HOME="$R/pfhome2" ansible-playbook playbooks/ci-runner-truewealth-preflight
 else
   bad "preflight playbook (overlap fixture)" "$(tail -5 "$R/pf-play2.log")"
 fi
+# Controller identity: the implicit localhost inherits `all`-group variables.
+# With the TARGET's identity set there (a Linux user that does not exist on
+# this controller, become, a remote temp under that user's home) and the play
+# running with become, the delegated report tasks must still run locally as
+# THIS controller user, without sudo, with a private temp dir under its HOME.
+ctl_user="$(id -un)"
+cat > "$R/pf-allvars.yml" <<'INV'
+all:
+  vars:
+    ansible_user: labadmin-synthetic
+    ansible_ssh_private_key_file: /nonexistent/home_datacenter_admin
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_remote_tmp: /home/labadmin-synthetic/.ansible/tmp
+    ansible_python_interpreter: /nonexistent/python3
+  hosts:
+    dc1-x86-synthetic:
+      ansible_host: 192.0.2.10
+INV
+mkdir -p "$R/pfhome3"
+if [ "$ctl_user" != labadmin-synthetic ] \
+   && HOME="$R/pfhome3" ansible-playbook -i "$R/pf-allvars.yml" playbooks/ci-runner-truewealth-preflight.yml --become \
+        -e preflight_host=dc1-x86-synthetic -e preflight_facts_file="$R/pf-ready.json" > "$R/pf-ctl.log" 2>&1 </dev/null \
+   && grep -q 'preflight: PASS' "$R/pf-ctl.log" \
+   && [ "$(stat -f '%Su %Lp' "$R/pfhome3/ci-preflight/dc1-ci-tw-1" 2>/dev/null || stat -c '%U %a' "$R/pfhome3/ci-preflight/dc1-ci-tw-1")" = "$ctl_user 700" ] \
+   && [ "$(stat -f '%Lp' "$R/pfhome3/ci-preflight/dc1-ci-tw-1/facts.json" 2>/dev/null || stat -c '%a' "$R/pfhome3/ci-preflight/dc1-ci-tw-1/facts.json")" = 600 ] \
+   && [ -d "$R/pfhome3/.ansible/tmp" ]; then
+  ok "controller tasks run as the controller user ($ctl_user), no sudo, temp under its HOME — even with the target's identity in all-group vars"
+else
+  bad "controller identity for delegated tasks" "$(grep -m2 -oE 'fatal: .{0,200}' "$R/pf-ctl.log")"
+fi
+n_deleg=$(grep -rhE '^\s*delegate_to: localhost' playbooks roles/ci_runner | wc -l | tr -d ' ')
+n_pinned=$(grep -rhE '^\s*vars: (&controller_connection|\*controller_connection)' playbooks roles/ci_runner | wc -l | tr -d ' ')
+n_role=$(grep -rhE '^\s*delegate_to: localhost' roles/ci_runner playbooks/ci-runner.yml playbooks/ci-runner-truewealth.yml | wc -l | tr -d ' ')
+[ "$n_deleg" -gt 0 ] && [ "$n_deleg" = "$n_pinned" ] && [ "$n_role" = 0 ] \
+  && ok "every localhost-delegated task pins the controller connection ($n_pinned); provisioning and the runner role delegate none" \
+  || bad "delegated tasks pinned" "delegated=$n_deleg pinned=$n_pinned in provisioning/role=$n_role"
+
 if [ -n "$TOOLS_IMAGE" ]; then
   # The REAL collector on a Linux box that has none of LXD, Docker or LVM:
   # it must still emit a complete document, and the evaluator must refuse.

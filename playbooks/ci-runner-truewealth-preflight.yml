@@ -38,6 +38,15 @@
     # does not use them.
     ci_tw_host_lan_ip: "not-used-by-the-preflight"
     preflight_out: "{{ lookup('env', 'HOME') }}/ci-preflight/{{ ci_vm_name }}"
+    # The CONTROLLER's own identity, for the tasks delegated to localhost. The
+    # implicit localhost inherits variables set for the `all` group; if the
+    # target's connection identity (ansible_user, become, remote temp, Python)
+    # is set there, a delegated task would otherwise run locally as the Linux
+    # account (e.g. labadmin), try to sudo, or use a temp directory under a
+    # home that does not exist on the controller. Only the delegated tasks use
+    # these; the collection on the target keeps the inventory's identity.
+    preflight_controller_user: "{{ lookup('ansible.builtin.pipe', 'id -un') }}"
+    preflight_controller_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
     preflight_production_headroom_factor: 1.5
     preflight_plan:
       vm_name: "{{ ci_vm_name }}"
@@ -81,6 +90,12 @@
         mode: "0700"
       delegate_to: localhost
       become: false
+      vars: &controller_connection
+        ansible_connection: local
+        ansible_user: "{{ preflight_controller_user }}"
+        ansible_become: false
+        ansible_remote_tmp: "{{ preflight_controller_home }}/.ansible/tmp"
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
 
     - name: Write the facts and the plan on the controller
       ansible.builtin.copy:
@@ -96,6 +111,7 @@
         label: "{{ item.name }}"
       delegate_to: localhost
       become: false
+      vars: *controller_connection
 
     - name: Evaluate (fails closed on anything unknown)
       ansible.builtin.command:
@@ -109,6 +125,7 @@
       check_mode: false
       delegate_to: localhost
       become: false
+      vars: *controller_connection
 
     - name: The report
       ansible.builtin.debug:
