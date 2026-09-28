@@ -4,5 +4,5 @@
 FROM ubuntu@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ansible-core procps jq nftables iproute2 python3 netcat-openbsd util-linux bsdutils ca-certificates \
+      ansible-core procps jq nftables iptables iproute2 python3 netcat-openbsd util-linux bsdutils ca-certificates \
  && rm -rf /var/lib/apt/lists/*

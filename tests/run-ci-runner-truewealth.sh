@@ -383,6 +383,19 @@ if [ -n "$TOOLS_IMAGE" ]; then
 else
   skip "real collector" "needs Docker"
 fi
+
+echo
+echo "── 12. Keel's and TrueWealth's policies loaded TOGETHER (real packets, both orders) ──"
+if [ -n "$TOOLS_IMAGE" ]; then
+  if docker run --rm --privileged --label twtask=hds-egress-test -v "$R/keel-now:/k:ro" -v "$R/tw:/t:ro" -v "$PWD/tests:/tests:ro" "$TOOLS_IMAGE" \
+       bash /tests/ci-egress-combined-netns.sh /k /t > "$R/netns-combined.log" 2>&1; then
+    ok "both rendered policies and appliers together: $(grep -o '[0-9]* passed' "$R/netns-combined.log" | tail -1) — both orders, re-application, controls; Keel's table and unrelated rules unchanged"
+  else
+    bad "combined policies" "$(grep -A1 FAIL "$R/netns-combined.log" | head -8)"
+  fi
+else
+  skip "combined policies" "needs Docker (privileged, network namespaces)"
+fi
 echo
 printf '── %d passed, %d failed ──\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

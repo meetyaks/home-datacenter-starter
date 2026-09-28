@@ -377,3 +377,87 @@ registrations to prove it.
 
 Removal: `--tags unregister` with `CI_RUNNER_REMOVAL_TOKEN` exported the same way (or the prompt); rebuild:
 `--tags rebuild -e ci_rebuild_confirm=dc1-ci-tw-1`.
+
+### Old checkouts and the second VM
+
+Merging this role into `main` does **not** update any existing checkout or
+worktree on the administration plane: a checkout at #2 (`934ca20`) or older
+stays at that code until it is deliberately moved. Once `dc1-ci-tw-1` exists,
+every **provisioning** run of Keel's runner (`playbooks/ci-runner.yml` without
+`--tags`) must use a revision that recognises the marked sibling — `455c088`
+or a later `main` — because the preflight of earlier revisions refuses any
+other LXD instance on the host. Keel's `--tags register|unregister|rebuild`
+do not run preflight and are unaffected. Record the SHA of every
+administration run (below).
+
+### Shared-host checks before and after provisioning (read-only)
+
+Record the infrastructure revision of every administration operation. On
+dc1-arm-1, in the worktree used:
+
+```bash
+INFRA_SHA=$(git rev-parse HEAD); [ -z "$(git status --porcelain)" ] && echo "infrastructure $INFRA_SHA (clean)"
+```
+
+Put `$INFRA_SHA` in each log's name and first line. Then take the same
+snapshot on dc1-x86 BEFORE provisioning and AFTER it (and after
+registration), with `PHASE=before|after-provision|after-register`:
+
+```bash
+PHASE=before; SHA=PASTE_THE_40_CHARACTER_INFRA_SHA
+if [ ${#SHA} -ne 40 ]; then echo "set SHA to the infrastructure commit first"; else
+D=~/ci-shared-check/$PHASE-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D/stable" "$D/volatile"; chmod -R go-rwx ~/ci-shared-check
+echo "$SHA" > "$D/INFRA_SHA"
+# STABLE — must be byte-identical before and after (no counters, no timings)
+sudo nft -s list table inet ci_egress                            > "$D/stable/keel-nft.txt"
+sudo iptables-save   | sed -E 's/\[[0-9]+:[0-9]+\]//' | grep -v '^#' | grep -v -- 'citwbr0' > "$D/stable/iptables.txt"
+sudo iptables-save -t nat | sed -E 's/\[[0-9]+:[0-9]+\]//' | grep -v '^#' | grep -v -- 'citwbr0' > "$D/stable/iptables-nat.txt"
+sudo nft -s list ruleset | grep -v '^# Warning' \
+  | awk '/^table (ip|ip6) (filter|nat|mangle|raw|security) \{|^table inet (ci_egress|ci_egress_tw|lxd) \{/{s=1} s&&/^\}/{s=0; next} !s' > "$D/stable/nft-other.txt"
+sudo nft -s list table inet lxd 2>/dev/null | grep -- 'lxdbr0'  > "$D/stable/lxd-lxdbr0.txt"
+for u in ci-egress docker snap.lxd.daemon caddy; do echo "$u $(systemctl is-enabled $u 2>&1) $(systemctl is-active $u 2>&1)"; done > "$D/stable/units.txt"
+sudo lxc config show dc1-ci-1 --expanded | grep -vE '^\s*volatile\.' > "$D/stable/dc1-ci-1.txt"
+sudo lxc network show lxdbr0                                     > "$D/stable/lxdbr0.txt"
+docker ps -a --filter name=keel-lab --format '{{.Names}} {{.Image}} {{.Label "com.docker.compose.project"}}' | sort > "$D/stable/keel-containers.txt"
+for c in $(docker ps -a --filter name=keel-lab --format '{{.Names}}' | sort); do
+  docker inspect --format '{{.Name}} restarts={{.RestartCount}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c"
+done > "$D/stable/keel-state.txt"
+# Keel's own health contract (roles/keel/tasks/verify.yml): all 200
+for u in http://127.0.0.1:3000/healthz http://127.0.0.1:3000/readyz http://127.0.0.1:8080/ \
+         https://keel.dc1.lan/ https://keel.dc1.lan/__keel/healthz; do
+  echo "$u $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u")"
+done > "$D/stable/keel-health.txt"
+# VOLATILE — recorded for context, expected to differ
+free -m > "$D/volatile/memory.txt"; sudo vgs ubuntu-vg > "$D/volatile/vgs.txt"; sudo lvs ubuntu-vg > "$D/volatile/lvs.txt"
+docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' > "$D/volatile/docker-stats.txt"
+sudo nft list table inet ci_egress > "$D/volatile/keel-nft-counters.txt"; sudo lxc list --format csv -c ns4 > "$D/volatile/lxc-list.txt"
+sudo iptables -S DOCKER-USER > "$D/volatile/docker-user.txt"; echo "snapshot: $D"
+fi
+```
+
+Compare: `diff -r ~/ci-shared-check/<before>/stable ~/ci-shared-check/<after>/stable`
+must print **nothing**. On dc1-arm-1, also compare
+`gh api repos/meetyaks/keel/actions/runners --jq '.runners[] | {name,status}'`
+(`dc1-ci-1` must stay `online`; `busy` may change with jobs).
+
+**Expected to change (not regressions):** nft and iptables counters (hence
+`-s` and the stripped `[n:m]`); `docker stats`, container uptime; free/available
+memory (lower by what dc1-ci-tw-1 uses); VG free −50 GiB and the new
+`ci-tw-lxd` LV; new objects: bridge `citwbr0`, table `inet ci_egress_tw`,
+`DOCKER-USER` rules `-i citwbr0`/`-o citwbr0` (exactly once each), units
+`ci-egress-tw` / `ci-egress-tw-early`, LXD's own `citwbr0` rules, pool
+`ci-tw-pool`, instance `dc1-ci-tw-1`; the Keel runner's `busy` flag.
+
+**Regressions (stop before registration):** any line of `stable/` differing —
+Keel's table, any non-`citwbr0` iptables rule (Docker's, Tailscale's, Keel's
+`lxdbr0` rules), any other nft table, LXD's `lxdbr0` rules, a unit's enabled
+or active state, `dc1-ci-1`'s configuration or limits, `lxdbr0`, the Keel
+container set, images, a **higher restart count** or non-running/unhealthy
+state, or any Keel health endpoint not `200`; `dc1-ci-1` offline; and in
+`volatile/docker-user.txt` a `citwbr0` rule present twice or a `lxdbr0` rule
+missing.
+
+`tests/run-ci-runner-truewealth.sh` §12 loads both rendered policies and both
+appliers together in network namespaces (both orders, re-application) and
+checks exactly these invariants with real packets; the snapshot above is
+how the same invariants are observed on the live host.
