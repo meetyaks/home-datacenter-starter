@@ -1,0 +1,102 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# The DEV delivery suites, run on every change to what they cover.
+#
+# ⚠️ WHY THIS EXISTS. Until now nothing in CI ran this repository's tests at all
+# — `tests/run-all.sh` is invoked by hand, and the only workflow here publishes
+# MinIO images. A guard that depends on somebody remembering to run it is a
+# convention, not an enforcement, and the DEV delivery path's whole value is in
+# its guards: digest-only images, provenance verification, the backwards
+# refusal, the retry bound, the deployment lock.
+#
+# ⚠️ WHY ONLY SIX SUITES AND NOT `run-all.sh`. The rest of that script needs
+# Docker containers with systemd, and one step reaches a real registry to ask
+# "can this be fetched anonymously right now". Both belong on a machine someone
+# owns, not on an ephemeral hosted runner — and a lane that is red for reasons
+# unrelated to the change stops being read. These six are controller-only: they
+# create nothing outside /tmp and contact nothing.
+#
+# ⚠️ NOT `self-hosted`. That label is dc1-ci-1, which is Keel's CI runner. A
+# deployment repository's tests running on a CI VM is the first step towards a
+# CI VM that deploys, which is the boundary this whole design keeps.
+# ─────────────────────────────────────────────────────────────────────────────
+name: DEV delivery tests
+
+on:
+  push:
+    branches: [main, 'deploy/**']
+    paths: &covered
+      - 'roles/keel/**'
+      - 'roles/keel_reconcile/**'
+      - 'playbooks/keel-reconcile.yml'
+      - 'inventory/**'
+      - 'tests/**'
+      - '.github/workflows/dev-delivery-tests.yml'
+  pull_request:
+    paths: *covered
+
+concurrency:
+  group: dev-delivery-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suites:
+    name: Controller-only suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet ansible-core
+          ansible --version
+
+      # ── Every play below runs the ROLE'S OWN tasks against fixtures. None of
+      #    them restates an assertion, so a guard that is deleted from a role
+      #    fails here rather than passing against a copy.
+
+      - name: DEV environment identity
+        run: ansible-playbook tests/dev-environment-identity.yml
+
+      - name: Release contract — the site's own reader
+        run: ansible-playbook tests/release-contract.yml
+
+      - name: Reconcile decisions
+        run: ansible-playbook tests/reconcile-decisions.yml
+
+      - name: Deployment lock
+        run: ansible-playbook tests/reconcile-lock.yml
+
+      - name: Reconcile boundaries
+        run: ansible-playbook tests/reconcile-boundaries.yml
+
+      - name: Reconcile check mode — a real --check run
+        run: tests/run-reconcile-check-mode.sh
+
+      # ── The static guard check from the existing preflight suite. Its runtime
+      #    half needs a source tree this runner does not have, so only the
+      #    static half runs here; the full script stays in run-all.sh.
+      - name: Every mutating phase is still guarded under --check
+        run: |
+          set -euo pipefail
+          missing=0
+          guards=$(awk -f tests/lib/guard-check.awk roles/keel/tasks/main.yml)
+          for phase in source build release-bundle deploy caddy verify; do
+            if echo "$guards" | grep -qx "$phase guarded"; then
+              echo "  ok         $phase.yml is guarded"
+            else
+              echo "  UNGUARDED  $phase.yml would run under --check"
+              missing=$((missing + 1))
+            fi
+          done
+          for phase in preflight secrets release; do
+            if echo "$guards" | grep -qx "$phase UNGUARDED"; then
+              echo "  ok         $phase.yml runs in both modes, as it must"
+            else
+              echo "  WRONG      $phase.yml is guarded; check mode would validate nothing"
+              missing=$((missing + 1))
+            fi
+          done
+          [ "$missing" -eq 0 ] || { echo "FAILED: ${missing} phase(s) wrong."; exit 1; }
