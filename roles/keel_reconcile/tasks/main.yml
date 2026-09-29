@@ -32,9 +32,15 @@
     file: "{{ role_path }}/../keel/defaults/main.yml"
     name: keel_layout
 
-- name: Anchor this role's state to it
+- name: Anchor this role's paths to it, without overriding an operator
+  # ⚠️ `default()` AND NOT A BARE ASSIGNMENT. Reading `keel_layout.keel_root`
+  # directly would make this role ignore an inventory or command-line override
+  # that roles/keel itself honours — so the two would disagree about where the
+  # source and the state live, which is worse than either answer. The layout
+  # file is the FALLBACK, which is exactly what a role default is.
   ansible.builtin.set_fact:
-    keel_root: "{{ keel_layout.keel_root }}"
+    keel_root: "{{ keel_root | default(keel_layout.keel_root, true) }}"
+    keel_source_repo: "{{ keel_source_repo | default(keel_layout.keel_source_repo, true) }}"
 
 # ── 1. THE CHANNEL ──────────────────────────────────────────────────────────
 
@@ -178,6 +184,57 @@
   # an identical release.
   ansible.builtin.meta: end_host
   when: keel_reconcile_decision == 'converged'
+
+- name: Make sure the controller's Keel checkout actually has this commit
+  # ⚠️ AN UNATTENDED TIMER WOULD OTHERWISE FAIL ON EVERY NEW RELEASE. Release
+  # mode still transfers the commit's tree, because the compose bundle and
+  # pg_hba.conf are part of the stack definition and are not inside the image —
+  # and roles/keel builds that tree with `git archive` from the CONTROLLER's
+  # checkout. A console whose checkout predates the release has no such object,
+  # so preflight would refuse, every fifteen minutes, until a human remembered
+  # to fetch. Automatic reconciliation that depends on a manual `git pull` is
+  # not automatic.
+  #
+  # `fetch` only, never `pull` or `checkout`: this writes to the object store
+  # and leaves the working tree, branch and any local edits exactly as they
+  # were. The console is somebody's working copy.
+  ansible.builtin.command:
+    argv: [git, -C, "{{ keel_source_repo }}", fetch, --quiet, origin]
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  check_mode: false
+
+- name: Confirm the release's commit is now present
+  ansible.builtin.command:
+    argv:
+      - git
+      - -C
+      - "{{ keel_source_repo }}"
+      - cat-file
+      - -e
+      - "{{ keel_reconcile_channel_doc.release.gitSha }}^{commit}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  failed_when: false
+  register: keel_reconcile_commit_present
+  check_mode: false
+
+- name: Stop if it is not, and say what to do
+  ansible.builtin.fail:
+    msg: >-
+      REFUSING: commit {{ keel_reconcile_channel_doc.release.gitSha }} (release
+      {{ keel_reconcile_channel_doc.release.releaseId }}) is not in
+      {{ keel_source_repo }} on this controller, even after
+      fetching origin. The release's compose bundle is read from that commit's
+      tree, so the deployment cannot proceed. Check that the checkout's origin
+      is the repository the release came from
+      ({{ keel_reconcile_channel_doc.release.provenance.repository
+          | default('the release repository') }}).
+  when: keel_reconcile_commit_present.rc | default(1) != 0
 
 - name: Report the drift and stop, because automatic deployment is off
   # Not a refusal — a site that has deliberately taken itself out of automatic
