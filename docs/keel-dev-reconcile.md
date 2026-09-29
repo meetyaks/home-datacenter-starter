@@ -102,9 +102,29 @@ ssh dc1-x86 'sudo rm /srv/data/services/keel/releases/attempts/<releaseId>.json'
 
 A **rollback** is published by CI, not decided here: re-run `dev-release.yml` with `rollback: true` against the older commit. The channel entry then records `advanced.rollback: true`, which is what makes the site accept a backwards move — and what distinguishes it from the straggler the guard exists to stop.
 
+## Delivery sequence
+
+Both halves must land, in order, and the order matters: a site that can consume releases before any release exists is harmless, but a channel that publishes into a site that cannot verify provenance is not.
+
+| # | where | step | stop if |
+|---|---|---|---|
+| 1 | keel | merge the DEV release channel PR to `main` | the eligibility gate is not green on the PR itself |
+| 2 | keel | let `dev-release.yml` run on `main` and publish the **first** release | the gate fails on `main` — that is the gate doing its job, not a reason to bypass it |
+| 3 | keel | read `channels/dev.json` on `release/dev` by hand and check it names two digest-pinned images, a bundle hash, and a `platformVersion` | anything is tagged rather than digested |
+| 4 | keel | `gh attestation verify oci://…@<digest> --repo meetyaks/keel` for both images, and for the manifest file | verification fails — the site would refuse anyway, and better to learn it here |
+| 5 | infra | merge `deploy/keel-lab` (PR #1), then this PR | — |
+| 6 | dns | create `keel-dev.dc1.lan` → dc1-x86 | — |
+| 7 | infra | apply the identity. **This invalidates live sessions** — the JWT issuer appears in already-issued tokens | outside an acceptable window |
+| 8 | infra | `ansible-playbook playbooks/keel-reconcile.yml --check --diff` and read the decision | it does not name the release you verified at step 3 |
+| 9 | infra | run it for real, watching, and confirm `/srv/data/services/keel/releases/current.json` names that release | health verification fails — evidence is kept, and recovery is manual |
+| 10 | console | provision `/etc/keel/vault-pass` (`0400`) and the scoped sudo rule | — |
+| 11 | console | install the units and `systemctl enable --now keel-reconcile-dev.timer` | steps 8 and 9 have not both been done by hand at least once |
+
+Steps 1–4 are the producing side and change nothing on any host. Steps 5–9 are one deliberate, watched deployment. Steps 10–11 are what makes it unattended, and are deliberately last: a mechanism nobody has watched work should not first run at 3am.
+
 ## Turning it on
 
-Not yet done. In order:
+Steps 6 onwards, in detail. Not yet done:
 
 1. **Create the DNS record** `keel-dev.dc1.lan` → `dc1-x86`. Nothing in this repository creates DNS.
 2. **Apply the identity.** `keel_hostname` changes the Caddy route, the CORS origin, and the JWT and OIDC issuers. **The issuer appears in already-issued tokens, so applying it invalidates live sessions** — do it when that is acceptable, and expect to sign in again.
