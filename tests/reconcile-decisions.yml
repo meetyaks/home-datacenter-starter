@@ -1,0 +1,152 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THE SITE CONTROLLER DECIDES, AND WHY.
+#
+#   ansible-playbook tests/reconcile-decisions.yml
+#
+# Drives roles/keel_reconcile/tasks/decide.yml — the role's OWN decision — over
+# every state a DEV site can be in. Nothing here restates the rules.
+#
+# ⚠️ WHY THE DECISION IS A FACT AND NOT AN ACTION. Precisely so this suite can
+# exist. Every branch below is reachable from a fixture: no host, no registry,
+# no deployment, no clock. A controller whose decisions could only be observed
+# by letting it deploy would be tested by deploying, which is not a test anyone
+# runs often enough to trust.
+#
+# Controller-only: nothing is read from or written to any host.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The DEV site controller's decision table
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    older: "2026-09-20T10:00:00Z"
+    newer: "2026-09-27T10:00:00Z"
+
+    # Two releases, one plainly newer than the other.
+    rel_old: &rel_old
+      releaseId: keel-20260920T100000Z-aaaaaaaaaaaa
+      gitSha: "aaaaaaaaaaaa00000000000000000000000000ff"
+      createdAt: "2026-09-20T10:00:00Z"
+      platformVersion: "0.1.2"
+      images: []
+      migrations: {requiresManualRecoveryOnFailure: true}
+
+    rel_new: &rel_new
+      releaseId: keel-20260927T100000Z-bbbbbbbbbbbb
+      gitSha: "bbbbbbbbbbbb00000000000000000000000000ff"
+      createdAt: "2026-09-27T10:00:00Z"
+      platformVersion: "0.1.2"
+      images: []
+      migrations: {requiresManualRecoveryOnFailure: true}
+
+  tasks:
+    - name: Load the role's real defaults, so the allowance is the shipped one
+      # `keel_reconcile_max_attempts` comes from here. A suite carrying its own
+      # copy would still pass if the shipped allowance were changed to 999.
+      ansible.builtin.include_vars:
+        file: ../roles/keel_reconcile/defaults/main.yml
+
+    - name: Automatic deployment is ON for DEV, as shipped
+      ansible.builtin.assert:
+        that:
+          - keel_reconcile_auto_deploy | bool
+        fail_msg: >-
+          The role ships with automatic deployment disabled, so DEV would never
+          reconcile and every case below would be vacuous.
+        success_msg: "Shipped default reconciles automatically."
+
+    - name: Automatic rollback is OFF, because migrations are forward-only
+      # ⚠️ NOT A PREFERENCE. Keel has no down-migration runner, so redeploying
+      # the previous image does not restore the previous schema. A site that
+      # rolled back here would report success while leaving the database ahead
+      # of the code.
+      ansible.builtin.assert:
+        that:
+          - not (keel_reconcile_auto_rollback | bool)
+        fail_msg: >-
+          keel_reconcile_auto_rollback is true. Keel's migrations are
+          forward-only; an automatic rollback would claim a recovery that did
+          not happen.
+        success_msg: "No automatic rollback."
+
+    - name: Retries are bounded, so a timer cannot become an infinite retry
+      ansible.builtin.assert:
+        that:
+          - keel_reconcile_max_attempts | int >= 1
+          - keel_reconcile_max_attempts | int <= 5
+        fail_msg: >-
+          keel_reconcile_max_attempts is
+          {{ keel_reconcile_max_attempts }}. A timer plus an unbounded retry is
+          an infinite retry: the site would restart the stack on every tick
+          forever and bury the one informative failure.
+        success_msg: "Retries bounded at {{ keel_reconcile_max_attempts }}."
+
+    - name: Run every decision case
+      ansible.builtin.include_tasks: reconcile-decision-case.yml
+      loop:
+        - name: a host that has never been reconciled deploys
+          current: {}
+          attempts: 0
+          channel: {schemaVersion: keel.channel/v1, channel: dev, release: *rel_new, advanced: {rollback: false}}
+          expect: deploy
+
+        - name: a host already running the release does nothing
+          current: {releaseId: keel-20260927T100000Z-bbbbbbbbbbbb, createdAt: "2026-09-27T10:00:00Z", outcome: deployed}
+          attempts: 0
+          channel: {schemaVersion: keel.channel/v1, channel: dev, release: *rel_new, advanced: {rollback: false}}
+          expect: converged
+
+        - name: a host behind the channel moves forward
+          current: {releaseId: keel-20260920T100000Z-aaaaaaaaaaaa, createdAt: "2026-09-20T10:00:00Z", outcome: deployed}
+          attempts: 0
+          channel: {schemaVersion: keel.channel/v1, channel: dev, release: *rel_new, advanced: {rollback: false}}
+          expect: deploy
+
+        - name: a channel that moved backwards without declaring a rollback is refused
+          # The straggler case. CI's ancestry guard should stop this upstream;
+          # if a document reaches the site anyway, the site is the last place
+          # it can be caught.
+          current: {releaseId: keel-20260927T100000Z-bbbbbbbbbbbb, createdAt: "2026-09-27T10:00:00Z", outcome: deployed}
+          attempts: 0
+          channel: {schemaVersion: keel.channel/v1, channel: dev, release: *rel_old, advanced: {rollback: false}}
+          expect: refuse-backwards
+
+        - name: an explicit rollback is allowed through
+          # Same two releases, same direction — the ONLY difference is that the
+          # channel declares it. That is what makes a rollback distinguishable
+          # from the straggler above.
+          current: {releaseId: keel-20260927T100000Z-bbbbbbbbbbbb, createdAt: "2026-09-27T10:00:00Z", outcome: deployed}
+          attempts: 0
+          channel: {schemaVersion: keel.channel/v1, channel: dev, release: *rel_old, advanced: {rollback: true}}
+          expect: deploy
+
+        - name: a release that used up its allowance is not retried
+          current: {releaseId: keel-20260920T100000Z-aaaaaaaaaaaa, createdAt: "2026-09-20T10:00:00Z", outcome: deployed}
+          attempts: 2
+          channel: {schemaVersion: keel.channel/v1, channel: dev, release: *rel_new, advanced: {rollback: false}}
+          expect: refuse-attempts
+
+        - name: one attempt still leaves one, for a transient failure
+          current: {releaseId: keel-20260920T100000Z-aaaaaaaaaaaa, createdAt: "2026-09-20T10:00:00Z", outcome: deployed}
+          attempts: 1
+          channel: {schemaVersion: keel.channel/v1, channel: dev, release: *rel_new, advanced: {rollback: false}}
+          expect: deploy
+
+        - name: a failed deployment of the current release is retried, not called converged
+          # ⚠️ `outcome` IS WHY THE RECORD HAS ONE. Matching on releaseId alone
+          # would read a FAILED attempt at the channel's release as "already
+          # running it", and the site would sit broken and report convergence.
+          current: {releaseId: keel-20260927T100000Z-bbbbbbbbbbbb, createdAt: "2026-09-27T10:00:00Z", outcome: failed}
+          attempts: 1
+          channel: {schemaVersion: keel.channel/v1, channel: dev, release: *rel_new, advanced: {rollback: false}}
+          expect: deploy
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: Every decision was the specified one
+      ansible.builtin.debug:
+        msg: "reconcile decisions: 8 cases, all as specified."

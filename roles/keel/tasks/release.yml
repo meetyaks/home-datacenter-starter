@@ -1,0 +1,257 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# RELEASE MODE — deploy an immutable, attested artifact instead of building one.
+#
+# ═══ WHAT THIS CHANGES, AND WHAT IT DELIBERATELY DOES NOT ════════════════════
+#
+# Ordinarily this role deploys `keel_commit` by transferring that commit's tree
+# and BUILDING the images on the host. That is right for a lab a person drives
+# by hand, and wrong for an environment that must be able to say exactly which
+# artifact it is running: a host build leaves no digest, no provenance and no
+# record of what was validated.
+#
+# In release mode a `keel.release/v1` manifest decides the commit and the image
+# digests, and `build.yml` is skipped. EVERYTHING ELSE IS UNCHANGED — the same
+# preflight, the same source transfer, the same deploy, the same verify. This
+# is the existing deployer accepting a prebuilt artifact, not a second deployer.
+#
+# ⚠️ THE SOURCE TRANSFER STILL HAPPENS, AND THAT IS NOT REDUNDANT. The compose
+# bundle and pg_hba.conf are part of the stack definition and are NOT inside the
+# image; the role reads them from the commit's tree. Release mode pins that tree
+# to the release's own `gitSha`, so the bundle and the images come from one
+# commit rather than from whatever the control node had checked out.
+#
+# ═══ THE SITE READS THE CONTRACT WITH ITS OWN READER ═════════════════════════
+#
+# These assertions restate `scripts/release/manifest.mjs` from the Keel
+# repository in Ansible. That duplication is deliberate and is the reason the
+# producing side keeps that module dependency-free: a contract only one side can
+# check is not a contract. If the two readers ever disagree the release is
+# refused here, which is the safe direction.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Read the release manifest from the controller
+  # ⚠️ ON THE CONTROLLER, NOT THE HOST. The manifest is the instruction; it is
+  # fetched, verified and decided on the administration side, and the managed
+  # host is never asked what it should be running. A host that could answer that
+  # question could also answer it wrongly.
+  ansible.builtin.slurp:
+    src: "{{ keel_release_manifest_file }}"
+  delegate_to: localhost
+  become: false
+  register: keel_release_raw
+
+- name: Parse it
+  ansible.builtin.set_fact:
+    keel_release: "{{ keel_release_raw.content | b64decode | from_json }}"
+
+# ── SCHEMA ──────────────────────────────────────────────────────────────────
+
+- name: The manifest declares a schema version this controller understands
+  ansible.builtin.assert:
+    that:
+      - keel_release.schemaVersion is defined
+      - keel_release.schemaVersion == keel_release_schema_version
+    fail_msg: >-
+      Release manifest declares schemaVersion
+      "{{ keel_release.schemaVersion | default('(absent)') }}", and this
+      controller implements {{ keel_release_schema_version }}. REFUSING rather
+      than best-effort parsing it: a field this reader does not know about is
+      exactly where a security-relevant instruction would be.
+    success_msg: "Release manifest schema {{ keel_release_schema_version }}."
+
+- name: Every field this deployment depends on is present and well formed
+  ansible.builtin.assert:
+    that:
+      - keel_release.releaseId is defined
+      - keel_release.releaseId | length > 0
+      - keel_release.gitSha is defined
+      - keel_release.gitSha is match('^[0-9a-f]{40}$')
+      - keel_release.createdAt is defined
+      - keel_release.images is defined
+      - keel_release.images | length > 0
+      - keel_release.bundle is defined
+      - keel_release.bundle.composePath is defined
+      - keel_release.bundle.sha256 is match('^[0-9a-f]{64}$')
+      - keel_release.migrations is defined
+      - keel_release.migrations.headId is defined
+      - keel_release.migrations.requiresManualRecoveryOnFailure is defined
+      - keel_release.minimumControllerVersion is defined
+      - keel_release.platformVersion is match('^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$')
+      - keel_release.provenance is defined
+      - keel_release.provenance.repository is defined
+    fail_msg: >-
+      Release {{ keel_release.releaseId | default('(unnamed)') }} is missing or
+      malforming a required field. This reader implements the same shape as
+      scripts/release/manifest.mjs in the Keel repository.
+    success_msg: "Release {{ keel_release.releaseId }} is well formed."
+
+- name: The release id names its own commit
+  # The id is what appears in logs, records and operator conversation. If it
+  # could name a different commit than `gitSha`, every one of those would be
+  # quietly wrong — and the id is the part a human reads.
+  ansible.builtin.assert:
+    that:
+      - keel_release.gitSha.startswith(keel_release.releaseId[-12:])
+    fail_msg: >-
+      Release id {{ keel_release.releaseId }} ends in
+      "{{ keel_release.releaseId[-12:] }}" but the commit is
+      {{ keel_release.gitSha }}. The id must embed the commit it deploys.
+    success_msg: "{{ keel_release.releaseId }} names commit {{ keel_release.gitSha }}."
+
+- name: This controller is new enough for the release
+  # A site older than the release must REFUSE, not guess. A field added by a
+  # newer producer is one this reader would silently ignore.
+  ansible.builtin.assert:
+    that:
+      - keel_controller_version is version(keel_release.minimumControllerVersion, '>=')
+    fail_msg: >-
+      Release {{ keel_release.releaseId }} requires controller
+      >= {{ keel_release.minimumControllerVersion }} and this one is
+      {{ keel_controller_version }}. Upgrade the deployment repository on the
+      administration console before deploying this release.
+    success_msg: >-
+      Controller {{ keel_controller_version }} satisfies
+      >= {{ keel_release.minimumControllerVersion }}.
+
+# ── DIGEST-ONLY IMAGES ──────────────────────────────────────────────────────
+
+- name: Every image is identified by an immutable digest and nothing else
+  # ⚠️ THE WHOLE POINT OF THE MECHANISM. A tag is a mutable pointer: the same
+  # `:sha-abc123` can be repushed to mean a different image, and a site that
+  # deployed the tag would never know. A digest cannot be repointed.
+  #
+  # A registry PORT is not a tag — `registry.dc1.lan:5000/keel` is a bare
+  # repository — so the check is "a colon after the last slash, whose suffix is
+  # not all digits", exactly as the producing reader has it.
+  ansible.builtin.assert:
+    that:
+      - item.role is defined
+      - item.repository is defined
+      - '"@" not in item.repository'
+      - (item.repository | regex_search(':[^/]*$')) == None
+        or (item.repository | regex_search(':[0-9]+$')) != None
+      - item.digest is match('^sha256:[0-9a-f]{64}$')
+    fail_msg: >-
+      Image "{{ item.role | default('(no role)') }}" is not digest-pinned:
+      repository={{ item.repository | default('(absent)') }}
+      digest={{ item.digest | default('(absent)') }}. Images are identified by
+      digest only — a tag, or a digest smuggled into the repository field, is
+      refused.
+    success_msg: "{{ item.role }} → {{ item.repository }}@{{ item.digest }}"
+  loop: "{{ keel_release.images }}"
+  loop_control:
+    label: "{{ item.role | default('(no role)') }}"
+
+- name: No two images claim the same role
+  ansible.builtin.assert:
+    that:
+      - (keel_release.images | map(attribute='role') | list | unique | length)
+        == (keel_release.images | length)
+    fail_msg: >-
+      The release names the same role twice:
+      {{ keel_release.images | map(attribute='role') | list }}. Which digest
+      wins would then depend on iteration order.
+    success_msg: "Each image role appears once."
+
+- name: The release names every image this deployment's bundle resolves
+  # ⚠️ THE SITE KNOWS ITS OWN BUNDLE, SO THE SITE IS WHERE THIS IS CHECKED.
+  # compose.lab.yml resolves exactly `${KEEL_IMAGE}` and `${KEEL_WEB_IMAGE}`. A
+  # release naming only one of them would leave the other to be built here —
+  # the unrecorded host artifact release mode exists to remove — and compose
+  # would fail late, after the stack had already been stopped.
+  ansible.builtin.assert:
+    that:
+      - keel_release_required_roles | difference(keel_release.images | map(attribute='role') | list) | length == 0
+    fail_msg: >-
+      Release {{ keel_release.releaseId }} names
+      {{ keel_release.images | map(attribute='role') | list }}, but this
+      deployment's compose bundle resolves {{ keel_release_required_roles }}.
+      Missing:
+      {{ keel_release_required_roles | difference(keel_release.images | map(attribute='role') | list) }}.
+    success_msg: "The release covers every image the bundle resolves."
+
+# ── PROVENANCE ──────────────────────────────────────────────────────────────
+
+- name: Verify each image was built by the expected workflow
+  # ⚠️ SHAPE CANNOT DETECT SUBSTITUTION. Every assertion above passes just as
+  # happily on a manifest someone edited to point at their own image: it is
+  # still schema-valid, still digest-pinned, still internally consistent. Only
+  # an attestation ties these bytes to a build that actually happened in the
+  # expected repository and workflow.
+  ansible.builtin.command:
+    argv:
+      - gh
+      - attestation
+      - verify
+      - "oci://{{ item.repository }}@{{ item.digest }}"
+      - --repo
+      - "{{ keel_release.provenance.repository }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  loop: "{{ keel_release.images }}"
+  loop_control:
+    label: "{{ item.role }}"
+  when: keel_release_require_provenance | bool
+
+- name: Verify the manifest bytes themselves
+  # The manifest is a signed subject in its own right. Verifying only the images
+  # would leave the document that CHOOSES them unverified — and that document
+  # also carries the bundle hash and the migration recovery flag.
+  ansible.builtin.command:
+    argv:
+      - gh
+      - attestation
+      - verify
+      - "{{ keel_release_manifest_file }}"
+      - --repo
+      - "{{ keel_release.provenance.repository }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  when: keel_release_require_provenance | bool
+
+- name: Record that provenance was deliberately not verified
+  # ⚠️ LOUD, BECAUSE SILENCE HERE WOULD BE THE WHOLE VULNERABILITY. The only
+  # supported reason to disable this is a test fixture that has no attestation
+  # because it was never published. If this appears in an operational run, the
+  # deployment is unverified whatever else it reports.
+  ansible.builtin.debug:
+    msg: >-
+      ⚠️ PROVENANCE VERIFICATION DISABLED (keel_release_require_provenance is
+      false). {{ keel_release.releaseId }} is being deployed WITHOUT checking
+      that its images and manifest came from
+      {{ keel_release.provenance.repository }}. This is supported only for
+      offline fixtures.
+  when: not (keel_release_require_provenance | bool)
+
+# ── ADOPT THE RELEASE'S IDENTITY ────────────────────────────────────────────
+
+- name: Deploy the release's commit and its exact images
+  # `keel_commit_short`, `keel_image_tag` and `keel_build_dir` are Jinja
+  # expressions over `keel_commit` in defaults, so they re-derive from this.
+  # `keel_gateway_image`/`keel_web_image` are overridden outright: in release
+  # mode they are digest references, not locally built tags.
+  ansible.builtin.set_fact:
+    keel_commit: "{{ keel_release.gitSha }}"
+    keel_gateway_image: >-
+      {{ (keel_release.images | selectattr('role', 'eq', 'gateway') | first).repository }}@{{
+         (keel_release.images | selectattr('role', 'eq', 'gateway') | first).digest }}
+    keel_web_image: >-
+      {{ (keel_release.images | selectattr('role', 'eq', 'web') | first).repository }}@{{
+         (keel_release.images | selectattr('role', 'eq', 'web') | first).digest }}
+
+- name: Say what is being deployed, and from where
+  ansible.builtin.debug:
+    msg:
+      - "release       {{ keel_release.releaseId }}"
+      - "commit        {{ keel_commit }}"
+      - "platform      {{ keel_release.platformVersion }}"
+      - "gateway       {{ keel_gateway_image }}"
+      - "web           {{ keel_web_image }}"
+      - "bundle        {{ keel_release.bundle.composePath }} sha256:{{ keel_release.bundle.sha256 }}"
+      - "migrations    head {{ keel_release.migrations.headId }}, manual recovery on failure:
+         {{ keel_release.migrations.requiresManualRecoveryOnFailure }}"
+      - "provenance    {{ 'verified against ' ~ keel_release.provenance.repository
+                          if keel_release_require_provenance | bool else '⚠️ NOT VERIFIED' }}"

@@ -1,0 +1,303 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Reconcile this site towards the release its channel names.
+#
+#   1. read the channel, and check it says what it claims to say
+#   2. decide — converged? moving backwards? already failed?
+#   3. take the lock
+#   4. deploy, through roles/keel in release mode
+#   5. record what happened, keep the evidence, release the lock
+#
+# Every refusal below is a deliberate stop with a reason, not an error. A site
+# controller that cannot say WHY it did nothing is indistinguishable from one
+# that is broken.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── 0. WHERE THE DEPLOYER KEEPS THINGS ──────────────────────────────────────
+#
+# ⚠️ READ FROM ITS ONE AUTHORITY, NOT COPIED. This role's state lives beside
+# roles/keel's own builds/, data/, secrets/ and env/ directories, so it needs
+# `keel_root` — which is a roles/keel default and is therefore UNDEFINED until
+# that role is included, several tasks after the state is first read. (This
+# failed exactly that way: "'keel_root' is undefined".)
+#
+# Loaded into a NAMESPACE and then set explicitly, rather than splatted. An
+# un-namespaced `include_vars` of another role's defaults outranks inventory
+# and would silently overwrite this environment's own `keel_hostname` with the
+# role default — turning keel-dev.dc1.lan back into keel.dc1.lan, changing the
+# Caddy route and the JWT issuer, and passing every test that did not look.
+
+- name: Read the deployer's filesystem layout
+  ansible.builtin.include_vars:
+    file: "{{ role_path }}/../keel/defaults/main.yml"
+    name: keel_layout
+
+- name: Anchor this role's state to it
+  ansible.builtin.set_fact:
+    keel_root: "{{ keel_layout.keel_root }}"
+
+# ── 1. THE CHANNEL ──────────────────────────────────────────────────────────
+
+- name: Fetch the channel branch on the controller
+  # ⚠️ ON THE CONTROLLER, AND READ-ONLY. The managed host is never given
+  # credentials to a source repository, and never decides for itself what it
+  # should be running. `depth: 1` because only the tip of a pointer matters.
+  ansible.builtin.git:
+    repo: "{{ keel_reconcile_channel_repo }}"
+    dest: "{{ keel_reconcile_workdir }}"
+    version: "{{ keel_reconcile_channel_branch }}"
+    depth: 1
+    force: true
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  # ⚠️ RUNS UNDER --check TOO, AND MUST. The git module in check mode reports
+  # what it WOULD clone and clones nothing, so every task after this one had
+  # nothing to read and a dry run died on a missing channels/dev.json — making
+  # `--check` useless for the one playbook an operator most wants to dry-run.
+  #
+  # It is safe because it is a READ: a shallow fetch of a published pointer
+  # into a controller temp directory. Nothing on the managed host is touched,
+  # and the dry run is worth far more with the real document in hand than with
+  # a prediction that one exists.
+  check_mode: false
+
+- name: Read the channel document
+  ansible.builtin.slurp:
+    src: "{{ keel_reconcile_workdir }}/{{ keel_reconcile_channel_path }}"
+  delegate_to: localhost
+  become: false
+  register: keel_reconcile_channel_raw
+
+- name: Parse it
+  ansible.builtin.set_fact:
+    keel_reconcile_channel_doc: "{{ keel_reconcile_channel_raw.content | b64decode | from_json }}"
+
+- name: The channel document is the shape this controller understands
+  ansible.builtin.assert:
+    that:
+      - keel_reconcile_channel_doc.schemaVersion is defined
+      - keel_reconcile_channel_doc.schemaVersion == keel_reconcile_channel_schema_version
+      - keel_reconcile_channel_doc.channel == keel_reconcile_channel
+      - keel_reconcile_channel_doc.release is defined
+      - keel_reconcile_channel_doc.advanced is defined
+    fail_msg: >-
+      {{ keel_reconcile_channel_path }} on
+      {{ keel_reconcile_channel_branch }} is not a
+      {{ keel_reconcile_channel_schema_version }} document for channel
+      "{{ keel_reconcile_channel }}". Refusing to interpret it.
+    success_msg: >-
+      Channel "{{ keel_reconcile_channel }}" names
+      {{ keel_reconcile_channel_doc.release.releaseId }}.
+
+- name: Write the release manifest out for the deployer to verify
+  # The deployer re-validates and verifies these bytes itself (roles/keel
+  # tasks/release.yml). Nothing here is trusted on this role's say-so — which
+  # is why the manifest is handed over as a FILE rather than as a variable:
+  # `gh attestation verify` needs the exact bytes that were signed.
+  ansible.builtin.copy:
+    content: "{{ keel_reconcile_channel_doc.release | to_nice_json(indent=2) }}\n"
+    dest: "{{ keel_reconcile_workdir }}/release.json"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+# ── 2. WHAT THIS HOST IS RUNNING NOW ────────────────────────────────────────
+
+- name: Look for a deployment record on the host
+  ansible.builtin.slurp:
+    src: "{{ keel_reconcile_current_file }}"
+  register: keel_reconcile_current_raw
+  failed_when: false
+
+- name: Read it, or note that this host has never been reconciled
+  ansible.builtin.set_fact:
+    keel_reconcile_current: >-
+      {{ (keel_reconcile_current_raw.content | b64decode | from_json)
+         if (keel_reconcile_current_raw.content is defined) else {} }}
+
+- name: Look for previous attempts at this exact release
+  ansible.builtin.slurp:
+    src: "{{ keel_reconcile_attempts_dir }}/{{ keel_reconcile_channel_doc.release.releaseId }}.json"
+  register: keel_reconcile_attempt_raw
+  failed_when: false
+
+- name: Count them
+  ansible.builtin.set_fact:
+    keel_reconcile_attempts: >-
+      {{ ((keel_reconcile_attempt_raw.content | b64decode | from_json).attempts
+          if (keel_reconcile_attempt_raw.content is defined) else 0) | int }}
+
+- name: Say where this host stands
+  ansible.builtin.debug:
+    msg:
+      - "channel wants  {{ keel_reconcile_channel_doc.release.releaseId }}
+         ({{ keel_reconcile_channel_doc.release.gitSha[:12] }})"
+      - "host has       {{ keel_reconcile_current.releaseId | default('(no record — never reconciled)') }}"
+      - "attempts       {{ keel_reconcile_attempts }} of {{ keel_reconcile_max_attempts }}"
+      - "auto-deploy    {{ keel_reconcile_auto_deploy | bool }}"
+
+# ── 3. THE DECISION ─────────────────────────────────────────────────────────
+
+- name: Decide
+  ansible.builtin.include_tasks: decide.yml
+
+- name: Refuse to move this site backwards
+  # ⚠️ THE SITE'S OWN GUARD, NOT A RESTATEMENT OF CI'S. CI refuses to advance
+  # the channel to a commit that is not a descendant of the current one, using
+  # git ancestry it can see. A site has no repository and cannot ask that
+  # question — but it does know what it deployed and when that release was
+  # built. A channel that now names an OLDER release without declaring a
+  # rollback means something went wrong upstream, or the document is not the
+  # one CI wrote. Either way this host should stop, not deploy it.
+  #
+  # An explicit rollback (`advanced.rollback`) is allowed through: it is an
+  # operator act, and the channel says so in the artifact rather than leaving
+  # it to be inferred.
+  ansible.builtin.fail:
+    msg: "REFUSING TO MOVE BACKWARDS: {{ keel_reconcile_reason }}. Investigate before deploying."
+  when: keel_reconcile_decision == 'refuse-backwards'
+
+- name: Stop retrying a release that has already failed its allowance
+  # ⚠️ A TIMER PLUS AN UNCONDITIONAL RETRY IS AN INFINITE RETRY. Without this
+  # the site would restart the stack on every tick, forever, and bury the one
+  # informative failure under a thousand identical ones.
+  ansible.builtin.fail:
+    msg: >-
+      REFUSING: {{ keel_reconcile_reason }}. Not retrying automatically. The
+      evidence is under {{ keel_reconcile_evidence_dir }}. When the cause is
+      understood, clear the attempt record to allow another try:
+        rm {{ keel_reconcile_attempts_dir }}/{{ keel_reconcile_channel_doc.release.releaseId }}.json
+  when: keel_reconcile_decision == 'refuse-attempts'
+
+- name: Already converged — nothing to do
+  # The ordinary outcome. A timer that fires every few minutes finds this
+  # almost every time, and it must be cheap about it rather than redeploying
+  # an identical release.
+  ansible.builtin.meta: end_host
+  when: keel_reconcile_decision == 'converged'
+
+- name: Report the drift and stop, because automatic deployment is off
+  # Not a refusal — a site that has deliberately taken itself out of automatic
+  # reconciliation, saying exactly what it would otherwise have done.
+  ansible.builtin.meta: end_host
+  when: not (keel_reconcile_auto_deploy | bool)
+
+- name: Report the drift and stop, because this is a dry run
+  # ⚠️ `--check` MUST NOT DEPLOY. roles/keel guards each mutating phase, but
+  # this role takes a lock and writes an attempt record before it ever gets
+  # there, and neither of those is a dry run of anything.
+  ansible.builtin.meta: end_host
+  when: ansible_check_mode
+
+# ── 4. DEPLOY, UNDER A LOCK ─────────────────────────────────────────────────
+
+- name: Make sure the state directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0750"
+  loop:
+    - "{{ keel_reconcile_state_dir }}"
+    - "{{ keel_reconcile_attempts_dir }}"
+    - "{{ keel_reconcile_evidence_dir }}"
+
+- name: Take the deployment lock
+  ansible.builtin.include_tasks: lock.yml
+
+- name: Deploy the release, and always give the lock back
+  block:
+    - name: Note the attempt before making it
+      # ⚠️ WRITTEN FIRST, ON PURPOSE. A deployment that hangs or takes the host
+      # down would otherwise leave no record that it was ever tried, and the
+      # next timer tick would try it again — and again. The count increments
+      # before the risk is taken, not after it is survived.
+      ansible.builtin.copy:
+        content: |
+          {{ {
+               'releaseId': keel_reconcile_channel_doc.release.releaseId,
+               'gitSha': keel_reconcile_channel_doc.release.gitSha,
+               'attempts': (keel_reconcile_attempts | int) + 1,
+               'lastAttemptAt': ansible_date_time.iso8601,
+               'lastAttemptBy': lookup('env', 'USER') ~ '@' ~ lookup('env', 'HOSTNAME')
+             } | to_nice_json(indent=2) }}
+        dest: "{{ keel_reconcile_attempts_dir }}/{{ keel_reconcile_channel_doc.release.releaseId }}.json"
+        owner: "{{ keel_owner }}"
+        group: "{{ keel_group }}"
+        mode: "0640"
+
+    - name: Deploy through the canonical deployer, in release mode
+      # ⚠️ ONE DEPLOYER. This role decides; roles/keel deploys. It verifies the
+      # manifest's provenance, pins the commit and the digests, proves the
+      # bundle matches what was gated, runs migrations through the compose
+      # `migrate` service — the canonical migration owner, unchanged — and
+      # gates on health. None of that is reimplemented here.
+      ansible.builtin.include_role:
+        name: keel
+      vars:
+        keel_release_manifest_file: "{{ keel_reconcile_workdir }}/release.json"
+
+    - name: Record the release this host is now running
+      ansible.builtin.copy:
+        content: |
+          {{ {
+               'releaseId': keel_reconcile_channel_doc.release.releaseId,
+               'gitSha': keel_reconcile_channel_doc.release.gitSha,
+               'createdAt': keel_reconcile_channel_doc.release.createdAt,
+               'platformVersion': keel_reconcile_channel_doc.release.platformVersion,
+               'images': keel_reconcile_channel_doc.release.images,
+               'outcome': 'deployed',
+               'deployedAt': ansible_date_time.iso8601,
+               'deployedBy': lookup('env', 'USER') ~ '@' ~ lookup('env', 'HOSTNAME'),
+               'channel': keel_reconcile_channel,
+               'channelAdvanced': keel_reconcile_channel_doc.advanced
+             } | to_nice_json(indent=2) }}
+        dest: "{{ keel_reconcile_current_file }}"
+        owner: "{{ keel_owner }}"
+        group: "{{ keel_group }}"
+        mode: "0640"
+
+    - name: Clear the attempt record now that it succeeded
+      ansible.builtin.file:
+        path: "{{ keel_reconcile_attempts_dir }}/{{ keel_reconcile_channel_doc.release.releaseId }}.json"
+        state: absent
+
+  rescue:
+    - name: Keep the evidence
+      ansible.builtin.include_tasks: evidence.yml
+
+    - name: Say what must happen next, precisely
+      # ⚠️ NO AUTOMATIC ROLLBACK, AND THE RELEASE ITSELF SAYS WHY. Keel's
+      # migrations are forward-only and there is no down-migration runner, so
+      # redeploying the previous image does NOT restore the previous schema. A
+      # site that rolled back here would report success while leaving the
+      # database ahead of the code — the one failure mode nobody checks for.
+      ansible.builtin.fail:
+        msg: >-
+          DEPLOYMENT FAILED: {{ keel_reconcile_channel_doc.release.releaseId }}
+          on {{ inventory_hostname }}, attempt
+          {{ (keel_reconcile_attempts | int) + 1 }} of
+          {{ keel_reconcile_max_attempts }}.
+          {{ 'This release declares requiresManualRecoveryOnFailure — migrations
+             are forward-only and there is no down-migration runner, so
+             redeploying the previous image would NOT restore the previous
+             schema. MANUAL RECOVERY IS REQUIRED; this controller will not roll
+             back.'
+             if keel_reconcile_channel_doc.release.migrations.requiresManualRecoveryOnFailure | bool
+             else 'Automatic rollback is disabled by policy
+             (keel_reconcile_auto_rollback).' }}
+          Evidence: {{ keel_reconcile_evidence_run_dir | default(keel_reconcile_evidence_dir) }}.
+          {{ 'No further automatic attempts will be made.'
+             if ((keel_reconcile_attempts | int) + 1) >= (keel_reconcile_max_attempts | int)
+             else 'One further automatic attempt remains.' }}
+
+  always:
+    - name: Give the lock back
+      # In `always`, so a failed deployment does not wedge every future run.
+      ansible.builtin.file:
+        path: "{{ keel_reconcile_lock_dir }}"
+        state: absent

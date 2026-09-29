@@ -1,0 +1,16 @@
+---
+# Fixture inventory for tests/run-reconcile-check-mode.sh.
+#
+# ⚠️ THE "HOST" IS THIS MACHINE, AND THAT IS THE POINT. The check-mode run must
+# prove it changes nothing — so pointing it at the controller itself makes any
+# write it does perform land somewhere this suite can look. A run that took the
+# lock, wrote an attempt record or started a container would be visible here
+# immediately, and dc1-x86 is never contacted.
+all:
+  children:
+    keel_reconcile_fixture:
+      hosts:
+        reconcile-fixture-host:
+          ansible_host: 127.0.0.1
+          ansible_connection: local
+          ansible_become: false

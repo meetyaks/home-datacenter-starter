@@ -1,0 +1,83 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# RELEASE MODE — the bundle on the host is the bundle the release was gated on,
+# and the images are the exact digests the release names.
+#
+# Runs after source.yml (which put the commit's tree on the host) and instead of
+# build.yml (which would build images here).
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Hash the compose bundle that was transferred
+  ansible.builtin.stat:
+    path: "{{ keel_build_dir }}/{{ keel_release.bundle.composePath }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: keel_release_bundle_stat
+
+- name: The transferred bundle is byte-identical to the one the release names
+  # ⚠️ NOT A REDUNDANT CHECK. source.yml proves the tree came from `keel_commit`
+  # via its DEPLOYMENT_MANIFEST; this proves the bundle inside that tree is the
+  # one CI hashed when it declared the release eligible. They can differ: the
+  # controller's checkout of that commit could be corrupt, the archive could
+  # have been altered in transit, or `bundle.composePath` could point somewhere
+  # the manifest's author did not intend. A compose file is executable
+  # instruction — it names images, mounts host paths and sets capabilities — so
+  # "close enough" is not a state worth deploying.
+  ansible.builtin.assert:
+    that:
+      - keel_release_bundle_stat.stat.exists
+      - keel_release_bundle_stat.stat.checksum == keel_release.bundle.sha256
+    fail_msg: >-
+      {{ keel_release.bundle.composePath }} on the host hashes to
+      {{ keel_release_bundle_stat.stat.checksum | default('(absent)') }} but
+      release {{ keel_release.releaseId }} declares
+      {{ keel_release.bundle.sha256 }}. REFUSING to deploy: the bundle that
+      would run is not the bundle that was gated.
+    success_msg: >-
+      Bundle matches the release: sha256:{{ keel_release.bundle.sha256 }}.
+
+- name: Pull the exact image digests the release names
+  # ⚠️ PULL BY DIGEST, AND LET IT FAIL HERE. Compose would pull these anyway
+  # when the stack starts — but that happens after `docker compose up` has
+  # already stopped the running containers, so an unreachable registry or a
+  # withdrawn image would take the site DOWN and then fail. Pulling first means
+  # an unavailable artifact costs nothing.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - pull
+      - "{{ item.repository }}@{{ item.digest }}"
+  register: keel_release_pull
+  changed_when: "'Downloaded newer image' in keel_release_pull.stdout"
+  loop: "{{ keel_release.images }}"
+  loop_control:
+    label: "{{ item.role }} {{ item.digest[:19] }}…"
+
+- name: Confirm each digest resolved locally to the image it claims
+  # `docker pull` succeeding is not quite the same statement: this asks the
+  # local daemon what it now holds under that digest.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - image
+      - inspect
+      - --format
+      - '{{ "{{index .RepoDigests 0}}" }}'
+      - "{{ item.repository }}@{{ item.digest }}"
+  register: keel_release_resolved
+  changed_when: false
+  loop: "{{ keel_release.images }}"
+  loop_control:
+    label: "{{ item.role }}"
+
+- name: Every pulled image carries the digest the release named
+  ansible.builtin.assert:
+    that:
+      - item.item.digest in item.stdout
+    fail_msg: >-
+      {{ item.item.role }} resolved to "{{ item.stdout }}", which does not carry
+      {{ item.item.digest }}.
+    success_msg: "{{ item.item.role }} is {{ item.item.digest }}."
+  loop: "{{ keel_release_resolved.results }}"
+  loop_control:
+    label: "{{ item.item.role }}"

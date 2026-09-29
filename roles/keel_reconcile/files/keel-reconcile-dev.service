@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Unattended DEV reconciliation, on the ADMINISTRATION CONSOLE.
+#
+# ⚠️ NOT INSTALLED BY THIS REPOSITORY. Shipped as a reviewed file and installed
+# by an administrator, because it needs two things that must never be committed:
+# a vault password file and a become rule. See docs/keel-dev-reconcile.md.
+#
+# ⚠️ NOT ON A CI RUNNER. CI decides eligibility; a site decides when to deploy.
+# A runner holding this unit would hold the vault passphrase, the SSH key and a
+# route to DEV's database — which is exactly the boundary this design keeps.
+# ─────────────────────────────────────────────────────────────────────────────
+[Unit]
+Description=Reconcile the Keel DEV site to its release channel
+Documentation=https://github.com/meetyaks/home-datacenter-starter/blob/main/docs/keel-dev-reconcile.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# The operator account that owns the deployment checkout, the SSH key and the
+# vault password file. Not root: nothing here needs root ON THE CONSOLE, and
+# privilege on the managed host comes from the scoped become rule instead.
+User=%i
+WorkingDirectory=/opt/home-datacenter-starter
+
+# Both files are mode 0400, owned by the operator account, and provisioned by
+# the administrator. Neither is in git.
+Environment=ANSIBLE_VAULT_PASSWORD_FILE=/etc/keel/vault-pass
+Environment=ANSIBLE_CONFIG=/opt/home-datacenter-starter/ansible.cfg
+
+# ⚠️ `--become` WITHOUT `--ask-become-pass` REQUIRES THE SCOPED SUDO RULE. An
+# unattended run cannot answer a prompt; the rule is limited to this playbook's
+# own needs on the DEV host rather than being blanket NOPASSWD.
+ExecStart=/usr/bin/ansible-playbook playbooks/keel-reconcile.yml --become
+
+# ⚠️ NO Restart=. The role's own attempt ledger bounds retries; a systemd
+# restart loop on top of it would defeat that and hammer the site.
+Restart=no
+TimeoutStartSec=3600
+
+# The unit needs to read its checkout and write nothing outside /tmp on the
+# console — everything it changes is on the remote host, over SSH.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+NoNewPrivileges=false

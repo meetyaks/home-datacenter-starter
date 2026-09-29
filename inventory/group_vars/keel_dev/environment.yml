@@ -1,0 +1,48 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE DEV ENVIRONMENT, NAMED.
+#
+# ═══ WHAT THIS FILE CHANGES ══════════════════════════════════════════════════
+#
+# Nothing about how the host runs. The Keel runtime on dc1-x86 has been the only
+# one there is; it was never called anything, and "the lab" was doing the work
+# of an environment name. That is fine until there is a second environment, at
+# which point every sentence about "the Keel host" becomes ambiguous — including
+# the ones in runbooks, alerts and incident notes written before the ambiguity
+# existed.
+#
+# So this classifies the EXISTING runtime as DEV. It is a naming and an
+# identity, not a migration: no data moves, no volume is recreated, and the
+# stack is not rebuilt because of anything here.
+#
+# ⚠️ THE ONE OPERATIONAL CHANGE IS THE HOSTNAME, AND IT IS NOT AUTOMATIC.
+# `keel_hostname` moves from `keel.dc1.lan` to `keel-dev.dc1.lan`, which changes
+# the Caddy route, the JWT issuer, the OIDC issuer and the CORS origin — the
+# issuer in particular appears in already-issued tokens, so applying it
+# invalidates live sessions. It takes a DNS record that does not exist yet.
+# Nothing here creates DNS; see docs/keel-dev-reconcile.md for the sequence.
+#
+# ⚠️ `keel.dc1.lan` IS RESERVED, NOT RECYCLED. It is the future PROD name, on
+# separate hardware. Leaving DEV on it would mean the eventual PROD cutover has
+# to take a name away from a running environment — the kind of change that gets
+# done at 2am under pressure. Reserving it now costs one DNS record.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── IDENTITY ────────────────────────────────────────────────────────────────
+keel_environment: dev
+keel_site: dc1
+keel_hostname: keel-dev.dc1.lan
+
+# ── RELEASE CONSUMPTION ─────────────────────────────────────────────────────
+#
+# DEV follows the `dev` channel and deploys eligible releases without a human in
+# the loop. That is the point of this environment: main lands, CI proves the
+# commit is safe to stand up, DEV runs it. A person who wants to stop that sets
+# `keel_reconcile_auto_deploy: false` here.
+keel_reconcile_channel: dev
+keel_reconcile_auto_deploy: true
+
+# ⚠️ PROVENANCE IS VERIFIED HERE. Stated explicitly rather than inherited: this
+# is the file an operator reads to answer "is DEV checking where its images came
+# from", and the answer should not require knowing a role default.
+keel_release_require_provenance: true

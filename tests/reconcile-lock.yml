@@ -1,0 +1,178 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE DEPLOYMENT LOCK, EXERCISED FOR REAL.
+#
+#   ansible-playbook tests/reconcile-lock.yml
+#
+# Runs roles/keel_reconcile/tasks/lock.yml against a real directory in /tmp.
+#
+# ⚠️ WHY NOT A STRUCTURAL CHECK. Grepping the role for `mkdir` would prove the
+# word is present. It would NOT prove that a second acquisition fails, which is
+# the only property that matters — and it is exactly the property
+# `file: state=directory` would silently lose, because that module succeeds
+# when the directory already exists. This suite fails against that mistake.
+#
+# Controller-only: one directory under /tmp, removed at the end.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The deployment lock
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    keel_reconcile_channel_doc:
+      release:
+        releaseId: keel-20260929T000000Z-cccccccccccc
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/keel_reconcile/defaults/main.yml
+
+    - name: Move ONLY the location into /tmp
+      # ⚠️ `set_fact`, NOT PLAY VARS. `include_vars` outranks play vars, so a
+      # `vars:` override up top is silently clobbered by the file just loaded —
+      # and the first version of this suite was, failing on `keel_root is
+      # undefined` because the shipped default still applied.
+      #
+      # Everything else stays SHIPPED: the staleness threshold, the retry
+      # allowance, the lock's name. `keel_reconcile_lock_dir` is a Jinja
+      # expression over the state dir in defaults, so it follows this by
+      # itself rather than being restated here.
+      ansible.builtin.set_fact:
+        keel_reconcile_state_dir: /tmp/keel-reconcile-lock-test
+
+    - name: Start from no lock at all
+      ansible.builtin.file:
+        path: "{{ keel_reconcile_state_dir }}"
+        state: absent
+
+    - name: Create the state directory the lock lives in
+      ansible.builtin.file:
+        path: "{{ keel_reconcile_state_dir }}"
+        state: directory
+        mode: "0750"
+
+    # ── 1. AN UNCONTESTED ACQUISITION SUCCEEDS ──────────────────────────────
+
+    - name: Take the lock on a free site
+      ansible.builtin.include_tasks: ../roles/keel_reconcile/tasks/lock.yml
+
+    - name: It exists, and it records who holds it
+      ansible.builtin.stat:
+        path: "{{ keel_reconcile_lock_dir }}/holder.json"
+      register: holder
+
+    - name: The holder record is real
+      ansible.builtin.assert:
+        that:
+          - holder.stat.exists
+        fail_msg: >-
+          The lock was taken but no holder.json was written, so whoever finds
+          this lock at 3am has no way to know whose run left it.
+        success_msg: "Lock taken, holder recorded."
+
+    # ── 2. A SECOND ACQUISITION IS REFUSED ──────────────────────────────────
+    #
+    # ⚠️ THE WHOLE POINT. Two reconciliations deploying at once interleave
+    # `docker compose up` with a migration, which is how a schema ends up
+    # half-applied.
+
+    - name: Try to take a lock that is already held
+      block:
+        - name: Second acquisition
+          ansible.builtin.include_tasks: ../roles/keel_reconcile/tasks/lock.yml
+
+        - name: It succeeded, which it must not have
+          ansible.builtin.set_fact:
+            second_result: acquired
+
+      rescue:
+        - name: It was refused, as it must be
+          ansible.builtin.set_fact:
+            second_result: refused
+            second_error: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: A held lock cannot be taken twice
+      ansible.builtin.assert:
+        that:
+          - second_result == 'refused'
+        fail_msg: >-
+          A SECOND RECONCILIATION TOOK A LOCK THAT WAS ALREADY HELD. This is
+          the failure `file: state=directory` produces — that module is
+          idempotent and succeeds on an existing directory, so the lock stops
+          being a lock. Acquisition must be an atomic `mkdir`.
+        success_msg: "A held lock is refused."
+
+    - name: The refusal explains itself and says how to clear it
+      ansible.builtin.assert:
+        that:
+          - second_error is search('REFUSING')
+          - second_error is search('rmdir')
+          - second_error is search(keel_reconcile_lock_dir)
+        fail_msg: >-
+          The refusal did not name the lock or say how to clear it, leaving an
+          operator stuck. It said: {{ second_error }}
+        success_msg: "The refusal names the lock and the command to clear it."
+
+    - name: The reported age is a real age, not a negative number
+      # ⚠️ THIS CAUGHT A REAL DEFECT. The first version computed the age from
+      # `ansible_date_time.epoch`, which is captured when facts are gathered at
+      # the START of the play — so it understated the age by the play's whole
+      # duration and, for a lock created mid-play, printed "-3s ago". An
+      # operator reading a negative age learns nothing, and a threshold
+      # compared against an understated age reads an old lock as fresh.
+      ansible.builtin.assert:
+        that:
+          - second_error is not search('\(-[0-9]')
+        fail_msg: >-
+          The lock age is negative, so it is being computed against a clock
+          reading from before the lock existed: {{ second_error }}
+        success_msg: "The reported lock age is non-negative."
+
+    - name: A fresh lock is NOT auto-broken, however the message reads
+      # ⚠️ THE ROLE MUST NEVER BREAK A LOCK ITSELF, and the staleness threshold
+      # must change only the wording. If a future edit makes "old enough" mean
+      # "take it anyway", this assertion is what notices: the lock here is
+      # seconds old, so it is nowhere near the threshold, and it still must not
+      # have been taken.
+      ansible.builtin.assert:
+        that:
+          - second_error is not search('breaking')
+          - second_error is not search('taking it anyway')
+        fail_msg: "The role appears to break locks automatically: {{ second_error }}"
+        success_msg: "Locks are reported, never broken automatically."
+
+    # ── 3. RELEASING IT MAKES THE SITE AVAILABLE AGAIN ──────────────────────
+
+    - name: Release the lock, as the role's `always` block does
+      ansible.builtin.file:
+        path: "{{ keel_reconcile_lock_dir }}"
+        state: absent
+
+    - name: Take it again
+      ansible.builtin.include_tasks: ../roles/keel_reconcile/tasks/lock.yml
+
+    - name: A released lock can be retaken, so a failed run does not wedge the site
+      ansible.builtin.stat:
+        path: "{{ keel_reconcile_lock_dir }}"
+      register: retaken
+
+    - name: It was retaken
+      ansible.builtin.assert:
+        that:
+          - retaken.stat.exists
+        fail_msg: >-
+          The lock could not be retaken after release, so one failed
+          deployment would wedge every future reconciliation.
+        success_msg: "A released lock can be retaken."
+
+    - name: Clean up
+      ansible.builtin.file:
+        path: "{{ keel_reconcile_state_dir }}"
+        state: absent
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "deployment lock: 3 scenarios (acquire, contend, release-and-retake)."

@@ -1,0 +1,91 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Keep enough to diagnose a failed reconciliation AFTER the fact.
+#
+# ⚠️ WHY ON THE HOST AND NOT IN THE PLAYBOOK OUTPUT. The run that failed was
+# started by a timer at 03:00 with nobody watching; its stdout went to the
+# journal of whichever machine happened to be the control node, and by the time
+# somebody asks, the terminal is gone. The evidence has to outlive the run that
+# produced it, and it has to be where the thing it describes is.
+#
+# ⚠️ AND WHY NOT SECRETS. `docker compose config` would resolve the environment
+# file into the output — every vault value in plain text, written to disk
+# outside the secrets directory and kept for twenty releases. `compose ps` and
+# per-service logs are what a diagnosis actually needs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Name this evidence run
+  ansible.builtin.set_fact:
+    keel_reconcile_evidence_run_dir: >-
+      {{ keel_reconcile_evidence_dir }}/{{ ansible_date_time.iso8601_basic_short }}-{{
+         keel_reconcile_channel_doc.release.releaseId }}
+
+- name: Create it
+  ansible.builtin.file:
+    path: "{{ keel_reconcile_evidence_run_dir }}"
+    state: directory
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0750"
+
+- name: Record what was being attempted and what this host held before it
+  ansible.builtin.copy:
+    content: |
+      {{ {
+           'attemptedRelease': keel_reconcile_channel_doc.release,
+           'channelAdvanced': keel_reconcile_channel_doc.advanced,
+           'previousRelease': keel_reconcile_current | default({}, true),
+           'attemptNumber': (keel_reconcile_attempts | int) + 1,
+           'maxAttempts': keel_reconcile_max_attempts,
+           'failedAt': ansible_date_time.iso8601,
+           'host': inventory_hostname
+         } | to_nice_json(indent=2) }}
+    dest: "{{ keel_reconcile_evidence_run_dir }}/attempt.json"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0640"
+
+- name: Capture container state
+  ansible.builtin.shell:
+    cmd: >-
+      {{ keel_compose_cmd }} ps --all
+      > {{ keel_reconcile_evidence_run_dir }}/compose-ps.txt 2>&1
+  changed_when: true
+  failed_when: false
+
+- name: Capture recent logs per service
+  # `failed_when: false` throughout — this runs in a rescue, and evidence
+  # collection that can itself fail would replace the real error with its own.
+  ansible.builtin.shell:
+    cmd: >-
+      {{ keel_compose_cmd }} logs --no-color --tail {{ keel_diagnostic_log_lines }}
+      > {{ keel_reconcile_evidence_run_dir }}/compose-logs.txt 2>&1
+  changed_when: true
+  failed_when: false
+
+- name: Record the images the host actually holds for this release
+  ansible.builtin.shell:
+    cmd: >-
+      docker image inspect
+      {% for i in keel_reconcile_channel_doc.release.images %}
+      {{ i.repository }}@{{ i.digest }}
+      {% endfor %}
+      --format '{{ "{{.ID}} {{index .RepoDigests 0}} {{index .Config.Labels \"org.opencontainers.image.version\"}}" }}'
+      > {{ keel_reconcile_evidence_run_dir }}/images.txt 2>&1
+  changed_when: true
+  failed_when: false
+
+- name: Prune the oldest evidence, keeping the most recent runs
+  # Bounded, because this lives on the data volume. Sorted by name, which sorts
+  # by time because the directory name starts with a compact UTC timestamp.
+  ansible.builtin.shell:
+    cmd: >-
+      ls -1d {{ keel_reconcile_evidence_dir }}/*/ 2>/dev/null | sort
+      | head -n -{{ keel_reconcile_evidence_keep }}
+      | xargs -r rm -rf
+  changed_when: true
+  failed_when: false
+
+- name: Say where it went
+  ansible.builtin.debug:
+    msg: "Evidence retained at {{ keel_reconcile_evidence_run_dir }}"

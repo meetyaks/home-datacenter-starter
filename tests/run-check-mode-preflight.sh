@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 echo "── static: every mutating phase is guarded ─────────────────────────"
 missing=0
 guards=$(awk -f tests/lib/guard-check.awk roles/keel/tasks/main.yml)
-for phase in source build deploy caddy verify; do
+for phase in source build release-bundle deploy caddy verify; do
   if echo "$guards" | grep -qx "$phase guarded"; then
     echo "  ok         $phase.yml is guarded"
   else
@@ -20,8 +20,16 @@ for phase in source build deploy caddy verify; do
     missing=$((missing + 1))
   fi
 done
-# preflight and secrets MUST NOT be guarded: they are the preflight.
-for phase in preflight secrets; do
+# preflight, secrets and release MUST NOT be guarded: they ARE the preflight.
+#
+# `release` resolves which commit and which image digests a release names, and
+# a --check run that skipped it would print a plan for the DEFAULT pinned
+# commit while a real run deployed something else — a dry run describing the
+# wrong deployment is worse than no dry run. It changes nothing: it reads a
+# manifest and sets facts. (Its `gh attestation verify` steps are `command`
+# tasks, which Ansible skips under --check, so a dry run resolves identity but
+# does not prove provenance. The real run does.)
+for phase in preflight secrets release; do
   if echo "$guards" | grep -qx "$phase UNGUARDED"; then
     echo "  ok         $phase.yml runs in both modes, as it must"
   else

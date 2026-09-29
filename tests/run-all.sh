@@ -118,5 +118,52 @@ echo
 echo "══ installation identity (7 cases + no committed value) ════════════"
 ansible-playbook tests/installation-identity.yml
 
+# ═══ DEV RELEASE DELIVERY ═══════════════════════════════════════════════════
+#
+# The site half of the DEV channel: read a published release, verify it, and
+# deploy it through roles/keel rather than building on the host.
+
+echo
+echo "══ DEV environment identity (12 checks, read from inventory) ══════"
+# The names are read out of inventory/hosts.yml and
+# inventory/group_vars/keel_dev/ — never restated here. Also asserts that
+# neither CI VM is a deployment target, which is the boundary the whole
+# delivery design rests on.
+ansible-playbook tests/dev-environment-identity.yml
+
+echo
+echo "══ release contract (14 cases, the site's own reader) ═════════════"
+# roles/keel/tasks/release.yml is this repository's reader for
+# keel.release/v1; the producing side has its own. A contract only one side
+# can check is not a contract, and this is what makes the second reader real.
+# Runs the ROLE'S tasks against fixtures — it restates no assertion.
+ansible-playbook tests/release-contract.yml
+
+echo
+echo "══ reconcile decisions (8 cases + 3 shipped-posture checks) ═══════"
+# Every state a DEV site can be in: converged, behind, moved backwards,
+# rolled back explicitly, out of retries, previously failed.
+ansible-playbook tests/reconcile-decisions.yml
+
+echo
+echo "══ deployment lock (3 scenarios, real directory) ══════════════════"
+# ⚠️ EXERCISED, NOT GREPPED. That a second acquisition FAILS is the only
+# property that matters, and it is exactly the one `file: state=directory`
+# would silently lose.
+ansible-playbook tests/reconcile-lock.yml
+
+echo
+echo "══ reconcile boundaries (8 structural checks) ═════════════════════"
+# One deployer, one migration owner, no path that weakens provenance
+# verification, no systemd restart loop.
+ansible-playbook tests/reconcile-boundaries.yml
+
+echo
+echo "══ reconcile check mode (13 checks, real channel repository) ══════"
+# ⚠️ A REAL --check RUN. The role takes a lock and writes an attempt record
+# BEFORE it reaches roles/keel, and neither is a dry run of anything. Builds a
+# local git repository so the real `git` task is exercised without a network.
+tests/run-reconcile-check-mode.sh
+
 echo
 echo "All regression suites passed."

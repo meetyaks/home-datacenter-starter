@@ -1,0 +1,77 @@
+---
+# One case for tests/release-contract.yml. Writes the fixture, runs the ROLE'S
+# OWN tasks/release.yml against it, and records whether it was accepted.
+#
+# ⚠️ IT RUNS THE ROLE'S TASKS. Nothing here re-implements a single assertion —
+# a harness carrying its own copy of the contract would pass against a contract
+# the role does not have, which is the failure mode this repository has already
+# had once.
+
+- name: "{{ case.name }} — write the fixture"
+  ansible.builtin.copy:
+    content: "{{ case.manifest | to_nice_json(indent=2) }}\n"
+    dest: "{{ case_file }}"
+    mode: "0644"
+
+- name: "{{ case.name }} — run the role's own release resolution"
+  block:
+    - name: "{{ case.name }} — include tasks/release.yml"
+      ansible.builtin.include_tasks: ../roles/keel/tasks/release.yml
+      vars:
+        keel_release_manifest_file: "{{ case_file }}"
+        # ⚠️ THE ONE SUPPORTED REASON TO DISABLE THIS. These fixtures were never
+        # published, so there is nothing to verify them against. That the
+        # SHIPPED DEFAULT is `true` is asserted separately and statically in
+        # tests/release-contract.yml — a test that turned verification off and
+        # then said nothing about the default would be hiding the important bit.
+        keel_release_require_provenance: false
+
+    - name: "{{ case.name }} — it was accepted"
+      ansible.builtin.set_fact:
+        case_result: accepted
+        case_error: ""
+
+  rescue:
+    - name: "{{ case.name }} — it was refused"
+      # ⚠️ A LOOPED TASK'S OWN `msg` IS "One or more items failed", NOT the
+      # reason. The per-item messages are in `.results`, and they are the whole
+      # point of checking WHY a fixture was refused — without them this suite
+      # would accept any refusal at all as a pass.
+      ansible.builtin.set_fact:
+        case_result: refused
+        case_error: >-
+          {{ (ansible_failed_result.msg | default('')) ~ ' | ' ~
+             (ansible_failed_result.results | default([])
+              | selectattr('failed', 'defined') | selectattr('failed')
+              | map(attribute='msg') | join(' | ')) }}
+
+- name: "{{ case.name }} — the outcome is the expected one"
+  ansible.builtin.assert:
+    that:
+      - case_result == case.expect
+    fail_msg: >-
+      {{ case.name }}: expected the contract to {{ case.expect[:-1] }} this
+      manifest, but it was {{ case_result }}.
+      {{ ('The refusal said: ' ~ case_error) if case_result == 'refused'
+         else 'It was accepted, so a malformed release would have been deployed.' }}
+    success_msg: "{{ case.name }} → {{ case_result }}"
+
+- name: "{{ case.name }} — the refusal names the field at fault"
+  # ⚠️ A REFUSAL FOR THE WRONG REASON IS NOT A PASS. Every one of these fixtures
+  # is invalid in exactly one way; if the message does not mention that way, the
+  # contract rejected it by accident and the intended check is untested.
+  ansible.builtin.assert:
+    that:
+      - case_error is search(case.because)
+    fail_msg: >-
+      {{ case.name }}: refused, but for the wrong reason. Expected a message
+      matching /{{ case.because }}/ and got: {{ case_error }}
+    success_msg: "{{ case.name }} → refused because {{ case.because }}"
+  when:
+    - case.expect == 'refused'
+    - case.because is defined
+
+- name: "{{ case.name }} — clean up the fixture"
+  ansible.builtin.file:
+    path: "{{ case_file }}"
+    state: absent

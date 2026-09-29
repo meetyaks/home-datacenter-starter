@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# When DEV checks its channel. Installed by an administrator alongside the
+# service unit — see docs/keel-dev-reconcile.md.
+# ─────────────────────────────────────────────────────────────────────────────
+[Unit]
+Description=Check the Keel DEV release channel periodically
+Documentation=https://github.com/meetyaks/home-datacenter-starter/blob/main/docs/keel-dev-reconcile.md
+
+[Timer]
+# Every fifteen minutes. A converged site ends the run in seconds — it reads one
+# small JSON document and stops — so the cost of checking often is close to
+# nothing, and the reward is that DEV is never far behind an eligible main.
+OnBootSec=10min
+OnUnitActiveSec=15min
+
+# ⚠️ SPREAD THE HITS. Without this, every site on a fifteen-minute boundary
+# fetches the channel at exactly :00, :15, :30 and :45.
+RandomizedDelaySec=120
+
+# ⚠️ DO NOT CATCH UP. If the console was asleep over a weekend, a burst of
+# missed runs on wake would be several deployments queued back to back. The
+# next scheduled tick reconciles to whatever the channel says by then, which
+# is the only state that matters.
+Persistent=false
+
+# ⚠️ NEVER TWO AT ONCE. systemd will not start the unit while the previous
+# activation is still running; the role's lock covers the other case, an
+# operator running the playbook by hand at the same time.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

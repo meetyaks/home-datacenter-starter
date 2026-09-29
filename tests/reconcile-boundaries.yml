@@ -1,0 +1,174 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE BOUNDARIES THE DEV DELIVERY DESIGN DEPENDS ON.
+#
+#   ansible-playbook tests/reconcile-boundaries.yml
+#
+# These are STRUCTURAL checks, and that is a deliberate and limited claim. They
+# prove that the code has no path which bypasses a guarantee — they do not
+# prove the guarantee holds at runtime. Where a property can be exercised it is
+# exercised instead, in tests/release-contract.yml, tests/reconcile-lock.yml
+# and tests/reconcile-decisions.yml. What is left here is the class of property
+# whose failure mode is "somebody added a second way to do it", and for that a
+# structural check is the right instrument.
+#
+# Controller-only: reads files.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Structural boundaries of the DEV delivery path
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    reconcile_tasks:
+      - ../roles/keel_reconcile/tasks/main.yml
+      - ../roles/keel_reconcile/tasks/decide.yml
+      - ../roles/keel_reconcile/tasks/lock.yml
+      - ../roles/keel_reconcile/tasks/evidence.yml
+
+  tasks:
+    - name: Read every task file of the reconcile role
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      register: reconcile_raw
+      loop: "{{ reconcile_tasks }}"
+
+    - name: As one body of text
+      ansible.builtin.set_fact:
+        reconcile_text: >-
+          {{ reconcile_raw.results | map(attribute='content') | map('b64decode') | join('\n') }}
+
+    # ── ONE DEPLOYER ────────────────────────────────────────────────────────
+
+    - name: The reconciler deploys through roles/keel and not by itself
+      # ⚠️ IMPROVE THE CANONICAL OWNER, DO NOT STAND UP A SECOND ONE. roles/keel
+      # is this repository's deployer. A reconciler that grew its own
+      # `docker compose up` would be a second deployer, and the two would drift
+      # — the first divergence being the one nobody notices.
+      ansible.builtin.assert:
+        that:
+          # ⚠️ QUOTED. An unquoted `- x is search('name: keel')` contains ": "
+          # and YAML reads the whole item as a MAPPING, which Ansible then
+          # rejects with "Conditional expressions must be strings".
+          - reconcile_text is search('include_role')
+          - "reconcile_text is search('name: keel')"
+        fail_msg: >-
+          roles/keel_reconcile does not include roles/keel, so it is deploying
+          by some other means. There must be exactly one thing that knows how
+          to put Keel on a host.
+        success_msg: "The reconciler delegates to roles/keel."
+
+    - name: It never runs migrations itself
+      # ⚠️ THE CANONICAL MIGRATION OWNER IS THE COMPOSE `migrate` SERVICE,
+      # driven by roles/keel deploy.yml. A second migration path would run
+      # against the same database with different ordering guarantees, and
+      # Keel's migrations are forward-only — a wrong one is not undoable.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is not search('migrate-cli')
+          - reconcile_text is not search('run migrate')
+          - reconcile_text is not search('psql')
+        fail_msg: >-
+          roles/keel_reconcile appears to run migrations directly. Migrations
+          belong to the compose `migrate` service that roles/keel drives; a
+          second runner against the same forward-only schema is unrecoverable
+          when it is wrong.
+        success_msg: "Migrations stay with their canonical owner."
+
+    - name: It never builds an image
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is not search('docker build')
+        fail_msg: >-
+          roles/keel_reconcile builds an image. A site never builds — that is
+          the entire point of deploying an attested artifact by digest.
+        success_msg: "The site does not build."
+
+    # ── NO PATH THAT SKIPS VERIFICATION ─────────────────────────────────────
+
+    - name: The reconciler cannot turn provenance verification off
+      # ⚠️ IT HANDS OVER A FILE AND LETS THE DEPLOYER DECIDE. If this role
+      # passed `keel_release_require_provenance: false` — even "temporarily" —
+      # every DEV deployment would silently stop being verified, and every
+      # other test in this repository would still pass.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is not search('keel_release_require_provenance')
+        fail_msg: >-
+          roles/keel_reconcile mentions keel_release_require_provenance. The
+          reconciler must not be able to weaken the deployer's verification;
+          the site's posture belongs in inventory, where an operator reads it.
+        success_msg: "The reconciler cannot weaken verification."
+
+    - name: The manifest is handed over as a file, not as a variable
+      # `gh attestation verify` checks BYTES. A manifest passed as a dict and
+      # re-serialised somewhere else is a different sequence of bytes, and
+      # would verify against nothing.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is search('keel_release_manifest_file')
+        fail_msg: >-
+          The release is not handed to the deployer as a file path, so the
+          exact signed bytes are not what gets verified.
+        success_msg: "The signed bytes are what gets verified."
+
+    # ── THE DEPLOYER'S OWN GUARANTEE ────────────────────────────────────────
+
+    - name: Read the deployer's entry point
+      ansible.builtin.slurp:
+        src: ../roles/keel/tasks/main.yml
+      register: keel_main_raw
+
+    - name: Release mode skips the host build, and ordinary mode still builds
+      # Both directions matter. A release-mode run that also built would
+      # publish-then-overwrite with an unattested local image; an ordinary run
+      # that stopped building would break every existing deployment.
+      ansible.builtin.assert:
+        that:
+          - (keel_main_raw.content | b64decode) is search('keel_release_manifest_file \| length == 0')
+          - (keel_main_raw.content | b64decode) is search('build.yml')
+        fail_msg: >-
+          roles/keel/tasks/main.yml does not gate build.yml on release mode. In
+          release mode the host would build an image with a different digest
+          than the one that was gated and attested.
+        success_msg: "Release mode pulls; ordinary mode still builds."
+
+    # ── THE SCHEDULING UNITS ────────────────────────────────────────────────
+
+    - name: Read the timer and service units
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      register: units_raw
+      loop:
+        - ../roles/keel_reconcile/files/keel-reconcile-dev.service
+        - ../roles/keel_reconcile/files/keel-reconcile-dev.timer
+
+    - name: The service does not restart itself into a deployment loop
+      # ⚠️ THE ROLE'S ATTEMPT LEDGER BOUNDS RETRIES. A systemd `Restart=` on top
+      # of it would defeat that bound and hammer the site — the role would
+      # refuse after its allowance, systemd would restart it, and the refusal
+      # itself would become the loop.
+      ansible.builtin.assert:
+        that:
+          - (units_raw.results[0].content | b64decode) is not search('(?m)^Restart=(always|on-failure)')
+        fail_msg: >-
+          The service unit restarts on failure, which defeats the role's
+          bounded retry allowance.
+        success_msg: "No systemd restart loop."
+
+    - name: The timer does not catch up on missed runs
+      # A console asleep over a weekend would otherwise wake to a burst of
+      # queued activations — several deployments back to back. Only the
+      # channel's current state matters.
+      ansible.builtin.assert:
+        that:
+          - (units_raw.results[1].content | b64decode) is search('(?m)^Persistent=false')
+        fail_msg: >-
+          The timer is Persistent, so missed runs queue up and fire as a burst
+          of consecutive deployments.
+        success_msg: "Missed ticks are dropped, not queued."
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "boundaries: one deployer, one migration owner, no verification bypass, no retry loop."

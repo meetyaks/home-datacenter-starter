@@ -1,0 +1,259 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE RELEASE CONTRACT, AS THIS SITE READS IT.
+#
+#   ansible-playbook tests/release-contract.yml
+#
+# roles/keel/tasks/release.yml is this repository's reader for
+# `keel.release/v1`. The producing side has its own
+# (scripts/release/manifest.mjs in the Keel repository, 24 cases under
+# `node --test`), and the duplication is deliberate: a contract only one side
+# can check is not a contract. This suite is what makes the SECOND reader real
+# rather than aspirational.
+#
+# ⚠️ IT RUNS THE ROLE'S OWN TASKS AGAINST FIXTURES. It does not restate a single
+# assertion. A harness carrying its own copy of the rules would pass against
+# rules the role does not have.
+#
+# Controller-only: no host, no registry, no secrets, nothing written outside
+# /tmp.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The site's reader of keel.release/v1
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    case_file: /tmp/keel-release-contract-fixture.json
+    d64: "1111111111111111111111111111111111111111111111111111111111111111"
+    e64: "2222222222222222222222222222222222222222222222222222222222222222"
+    sha40: "938f25ac6474b7408d425be600220ce9c52de87e"
+
+  tasks:
+    # The role's real defaults, at play scope, exactly as they land when the
+    # role runs. `keel_controller_version`, `keel_release_schema_version` and
+    # `keel_release_required_roles` all come from here — this suite must not
+    # carry its own copy of any of them.
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/keel/defaults/main.yml
+
+    # ── THE SHIPPED POSTURE ─────────────────────────────────────────────────
+    #
+    # ⚠️ ASSERTED BEFORE ANY CASE RUNS, because every case below turns
+    # provenance verification OFF to work offline. Without this, the suite
+    # would be compatible with a role that never verifies provenance at all —
+    # which is the single most important thing the role does.
+    - name: Provenance verification is ON by default, as shipped
+      ansible.builtin.assert:
+        that:
+          - keel_release_require_provenance | bool
+        fail_msg: >-
+          roles/keel/defaults/main.yml ships
+          keel_release_require_provenance=false. Every release would then be
+          deployed without checking that its images and manifest came from the
+          expected repository — and every case in this suite would still pass.
+        success_msg: "Shipped default verifies provenance."
+
+    - name: Release mode is OFF by default, so an ordinary deploy is unchanged
+      ansible.builtin.assert:
+        that:
+          - keel_release_manifest_file == ""
+        fail_msg: >-
+          keel_release_manifest_file has a default value, so every existing
+          deployment would silently switch to release mode.
+        success_msg: "Release mode is opt-in."
+
+    - name: A valid manifest, as the producing side emits it
+      ansible.builtin.set_fact:
+        base: &base
+          schemaVersion: keel.release/v1
+          releaseId: "keel-20260929T000823Z-{{ sha40[:12] }}"
+          gitSha: "{{ sha40 }}"
+          createdAt: "2026-09-29T00:08:23Z"
+          images:
+            - role: gateway
+              repository: ghcr.io/meetyaks/keel
+              digest: "sha256:{{ d64 }}"
+            - role: web
+              repository: ghcr.io/meetyaks/keel-web
+              digest: "sha256:{{ e64 }}"
+          bundle:
+            composePath: infra/lab/compose.lab.yml
+            sha256: "74033b96ae9b37a83e4bd3aab9ee91a13afef6f425041316a062d77c63be9aad"
+          migrations:
+            headId: 304_skills.sql
+            count: 296
+            requiresManualRecoveryOnFailure: true
+          minimumControllerVersion: "1.0.0"
+          platformVersion: "0.1.2"
+          health:
+            version: 1
+            endpoints:
+              - path: /healthz
+                expectStatus: 200
+              - path: /readyz
+                expectStatus: 200
+          provenance:
+            mechanism: github-artifact-attestation
+            repository: meetyaks/keel
+            workflowRef: meetyaks/keel/.github/workflows/dev-release.yml@refs/heads/main
+            runId: "999"
+
+    - name: Run every case
+      ansible.builtin.include_tasks: release-contract-case.yml
+      loop:
+        # ── ACCEPTED ────────────────────────────────────────────────────────
+        - name: a well-formed release
+          expect: accepted
+          manifest: *base
+
+        - name: a registry port is not a tag
+          # `registry.dc1.lan:5000/keel` is a bare repository. A naive "contains
+          # a colon" check would refuse every private registry.
+          expect: accepted
+          manifest:
+            <<: *base
+            images:
+              - role: gateway
+                repository: registry.dc1.lan:5000/keel
+                digest: "sha256:{{ d64 }}"
+              - role: web
+                repository: registry.dc1.lan:5000/keel-web
+                digest: "sha256:{{ e64 }}"
+
+        # ── SCHEMA ──────────────────────────────────────────────────────────
+        - name: an unknown schema version
+          expect: refused
+          because: schemaVersion
+          manifest:
+            <<: *base
+            schemaVersion: keel.release/v2
+
+        - name: a short git sha
+          expect: refused
+          because: malforming a required field
+          manifest:
+            <<: *base
+            gitSha: abc1234
+
+        - name: a non-semver platform version
+          expect: refused
+          because: malforming a required field
+          manifest:
+            <<: *base
+            platformVersion: v0.1.2
+
+        - name: a bundle hash that is not 64 hex
+          expect: refused
+          because: malforming a required field
+          manifest:
+            <<: *base
+            bundle:
+              composePath: infra/lab/compose.lab.yml
+              sha256: deadbeef
+
+        # ── SHA IDENTITY ────────────────────────────────────────────────────
+        - name: a release id that names a different commit
+          expect: refused
+          because: must embed the commit
+          manifest:
+            <<: *base
+            releaseId: keel-20260929T000823Z-aaaaaaaaaaaa
+
+        # ── DIGEST-ONLY ─────────────────────────────────────────────────────
+        - name: an image identified by tag
+          expect: refused
+          because: not digest-pinned
+          manifest:
+            <<: *base
+            images:
+              - role: gateway
+                repository: ghcr.io/meetyaks/keel:latest
+                digest: "sha256:{{ d64 }}"
+              - role: web
+                repository: ghcr.io/meetyaks/keel-web
+                digest: "sha256:{{ e64 }}"
+
+        - name: a digest smuggled into the repository field
+          expect: refused
+          because: not digest-pinned
+          manifest:
+            <<: *base
+            images:
+              - role: gateway
+                repository: "ghcr.io/meetyaks/keel@sha256:{{ d64 }}"
+                digest: "sha256:{{ d64 }}"
+              - role: web
+                repository: ghcr.io/meetyaks/keel-web
+                digest: "sha256:{{ e64 }}"
+
+        - name: a truncated digest
+          expect: refused
+          because: not digest-pinned
+          manifest:
+            <<: *base
+            images:
+              - role: gateway
+                repository: ghcr.io/meetyaks/keel
+                digest: sha256:abc
+              - role: web
+                repository: ghcr.io/meetyaks/keel-web
+                digest: "sha256:{{ e64 }}"
+
+        - name: a non-sha256 digest algorithm
+          expect: refused
+          because: not digest-pinned
+          manifest:
+            <<: *base
+            images:
+              - role: gateway
+                repository: ghcr.io/meetyaks/keel
+                digest: "sha512:{{ d64 }}"
+              - role: web
+                repository: ghcr.io/meetyaks/keel-web
+                digest: "sha256:{{ e64 }}"
+
+        # ── ROLE COVERAGE ───────────────────────────────────────────────────
+        - name: two images claiming the same role
+          expect: refused
+          because: same role twice
+          manifest:
+            <<: *base
+            images:
+              - role: gateway
+                repository: ghcr.io/meetyaks/keel
+                digest: "sha256:{{ d64 }}"
+              - role: gateway
+                repository: ghcr.io/meetyaks/keel
+                digest: "sha256:{{ e64 }}"
+
+        - name: a release missing an image the bundle resolves
+          # The defect this catches is real: the first version of the producing
+          # workflow published only the gateway, and compose.lab.yml resolves
+          # ${KEEL_WEB_IMAGE} too. Compose would have failed AFTER stopping the
+          # running stack.
+          expect: refused
+          because: compose bundle resolves
+          manifest:
+            <<: *base
+            images:
+              - role: gateway
+                repository: ghcr.io/meetyaks/keel
+                digest: "sha256:{{ d64 }}"
+
+        # ── CONTROLLER VERSION ──────────────────────────────────────────────
+        - name: a release requiring a newer controller
+          expect: refused
+          because: requires controller
+          manifest:
+            <<: *base
+            minimumControllerVersion: "99.0.0"
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: All cases behaved as specified
+      ansible.builtin.debug:
+        msg: "release contract: 14 cases (2 accepted, 12 refused for the stated reason)."
