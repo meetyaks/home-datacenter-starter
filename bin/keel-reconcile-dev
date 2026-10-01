@@ -44,11 +44,39 @@ fi
 
 # Absolute, every one of them: launchd gives this process a minimal PATH and
 # no working directory worth having.
-KEEL_CHECKOUT="${KEEL_CHECKOUT:-/opt/home-datacenter-starter}"
+# ⚠️ DERIVED FROM THIS SCRIPT'S OWN LOCATION, NOT A CONSTANT. This file lives
+# at <checkout>/bin/keel-reconcile-dev, so the checkout is the parent of the
+# directory holding it — which is true on every console, whatever the layout.
+#
+# An earlier version defaulted to `/opt/home-datacenter-starter`, a path that
+# was invented rather than observed and does not exist on the real console
+# (whose checkout is in an operator's home). The wrapper then refused to start
+# with "no deployment checkout", on a machine where the checkout was plainly
+# there — the failure naming the one thing that was not wrong. A path a script
+# can work out for itself should never be a constant somebody has to keep in
+# step.
+KEEL_SELF_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+KEEL_CHECKOUT="${KEEL_CHECKOUT:-$(dirname -- "$KEEL_SELF_DIR")}"
 KEEL_INVENTORY="${KEEL_INVENTORY:-$KEEL_CHECKOUT/inventory/hosts.yml}"
 KEEL_PLAYBOOK="${KEEL_PLAYBOOK:-$KEEL_CHECKOUT/playbooks/keel-reconcile.yml}"
 KEEL_VAULT_PASSWORD_FILE="${KEEL_VAULT_PASSWORD_FILE:-/etc/keel/vault-pass}"
-KEEL_ANSIBLE_PLAYBOOK="${KEEL_ANSIBLE_PLAYBOOK:-/usr/local/bin/ansible-playbook}"
+# ⚠️ RESOLVED, NOT GUESSED — AND STILL ABSOLUTE. launchd hands a daemon a
+# minimal PATH, so this has to end up as a full path; but which full path
+# differs by machine (/opt/homebrew/bin on Apple Silicon, /usr/local/bin on
+# Intel, /usr/bin on a Linux console). `command -v` against the PATH the
+# scheduler set is the answer, with the known locations as a fallback for a
+# PATH that was not set at all.
+if [ -z "${KEEL_ANSIBLE_PLAYBOOK:-}" ]; then
+  KEEL_ANSIBLE_PLAYBOOK=$(command -v ansible-playbook 2>/dev/null || true)
+  if [ -z "$KEEL_ANSIBLE_PLAYBOOK" ]; then
+    for candidate in /opt/homebrew/bin/ansible-playbook \
+                     /usr/local/bin/ansible-playbook \
+                     /usr/bin/ansible-playbook; do
+      [ -x "$candidate" ] && KEEL_ANSIBLE_PLAYBOOK="$candidate" && break
+    done
+  fi
+  KEEL_ANSIBLE_PLAYBOOK="${KEEL_ANSIBLE_PLAYBOOK:-ansible-playbook}"
+fi
 KEEL_RECONCILE_LOG="${KEEL_RECONCILE_LOG:-/var/log/keel/reconcile-dev.log}"
 KEEL_RECONCILE_RUNLOCK="${KEEL_RECONCILE_RUNLOCK:-/var/run/keel-reconcile-dev.lock}"
 

@@ -34,7 +34,7 @@
 
   vars:
     wrapper: ../bin/keel-reconcile-dev
-    plist: ../roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist
+    plist: ../roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist.template
     systemd_dir: ../roles/keel_reconcile/files/systemd
 
     # ⚠️ TOKEN-SHAPED, DELIBERATELY BROAD. Catching a real GitHub token is the

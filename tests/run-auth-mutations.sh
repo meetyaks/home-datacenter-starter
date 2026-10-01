@@ -26,7 +26,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 TMP="$(mktemp -d)"
 
-PLIST=roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist
+PLIST=roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist.template
 SERVICE=roles/keel_reconcile/files/systemd/keel-reconcile-dev.service
 WRAPPER=bin/keel-reconcile-dev
 DEFAULTS=roles/keel_reconcile/defaults/main.yml

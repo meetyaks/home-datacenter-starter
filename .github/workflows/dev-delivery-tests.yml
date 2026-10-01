@@ -30,6 +30,8 @@ on:
       - 'playbooks/keel-reconcile.yml'
       - 'inventory/**'
       - 'tests/**'
+      - 'scripts/**'
+      - 'bin/**'
       - '.github/workflows/dev-delivery-tests.yml'
   pull_request:
     paths: *covered
@@ -96,6 +98,12 @@ jobs:
       #    created — afterwards a mistake is a disclosed secret, not a red test.
       - name: Credential contract — deploy key and registry token
         run: ansible-playbook tests/credential-contract.yml
+
+      # ⚠️ OFFLINE AND PORTABLE. Every case is a locally generated fixture, so
+      #    this proves the host-key verifier rejects a tampered document
+      #    without needing GitHub to be reachable or a particular OS.
+      - name: GitHub host-key pin — verified, not merely fetched
+        run: tests/run-known-hosts-pin.sh
 
       - name: Reconcile check mode — a real --check run
         run: tests/run-reconcile-check-mode.sh

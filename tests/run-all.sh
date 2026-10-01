@@ -184,6 +184,15 @@ echo "══ the wrapper, executed (20 checks) ═══════════
 tests/run-wrapper-behaviour.sh
 
 echo
+echo "══ the github host-key pin (9 checks) ════════════════════════════"
+# ⚠️ THE GUARD THAT MATTERS MOST ON THIS PATH. The controller decides what DEV
+# runs, from a document it fetches over SSH. `ssh-keyscan` — the usual way to
+# fill known_hosts — pins whatever answers on port 22 and authenticates
+# nothing. This proves the replacement actually REJECTS a tampered document
+# rather than merely fetching a good one.
+tests/run-known-hosts-pin.sh
+
+echo
 echo "══ the credential contract (99 checks) ═══════════════════════════"
 # ⚠️ NEITHER CREDENTIAL EXISTS YET. Nothing here proves authentication works
 # — only that the code refuses without it, cannot leak it, and gives it back.

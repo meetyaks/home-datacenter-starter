@@ -31,10 +31,11 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 
-# The dedicated service account that owns the deployment checkout, the SSH
-# keys and the vault password file. Not root: nothing here needs root ON THE
-# CONSOLE, and privilege on the managed host comes from the scoped sudo rule
-# there instead.
+# ⚠️ THESE TWO ARE PLACEHOLDERS, NOT OBSERVED VALUES. No Linux console
+# exists, so there is no real account and no real checkout path to put here.
+# The launchd variant solved this by becoming a template the bootstrap
+# renders; if this file ever goes live it must do the same, because a plausible
+# constant is how the macOS plist came to name a directory that was not there.
 User=keeladmin
 WorkingDirectory=/opt/home-datacenter-starter
 

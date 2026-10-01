@@ -13,8 +13,23 @@
   and are NOT part of the DEV path. A unit that cannot start is not a
   fallback; it is a thing somebody will one day believe is running.
 
-  ⚠️ NOT INSTALLED BY THIS REPOSITORY. Shipped as a reviewed file and placed
-  by an administrator, because it depends on three things that must never be
+  ⚠️ A TEMPLATE, BECAUSE launchd HAS NO VARIABLES. Every path in a plist is
+  absolute, and the console's checkout path is a fact about the machine — so
+  the choice is between a constant somebody has to keep in step and a
+  placeholder something renders. An earlier version was the former, naming
+  `/opt/home-datacenter-starter`, which was invented rather than observed and
+  does not exist on the real console. The daemon would have failed at load
+  with status 127 and nothing would have explained why.
+
+  scripts/bootstrap-dev-controller.sh renders it:
+
+      @@CHECKOUT@@      the deployment checkout, derived from where the
+                        bootstrap script itself lives
+      @@SERVICE_USER@@  the account the daemon runs as
+      @@LOG_DIR@@       where stdout and stderr go
+
+  ⚠️ NOT INSTALLED BY THIS REPOSITORY. Rendered and placed by an
+  administrator, because it depends on three things that must never be
   committed: the vault password file, the SSH deploy key, and the scoped sudo
   rule on the DEV host. See docs/keel-dev-reconcile.md.
 
@@ -47,7 +62,7 @@
   -->
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/home-datacenter-starter/bin/keel-reconcile-dev</string>
+    <string>@@CHECKOUT@@/bin/keel-reconcile-dev</string>
   </array>
 
   <!--
@@ -60,12 +75,12 @@
     The account must exist before bootstrap. See docs/keel-dev-reconcile.md.
   -->
   <key>UserName</key>
-  <string>keeladmin</string>
+  <string>@@SERVICE_USER@@</string>
   <key>GroupName</key>
   <string>staff</string>
 
   <key>WorkingDirectory</key>
-  <string>/opt/home-datacenter-starter</string>
+  <string>@@CHECKOUT@@</string>
 
   <!--
     ⚠️ PATHS ONLY. NO TOKEN, NO PASSPHRASE, NO KEY MATERIAL. A plist in
@@ -78,7 +93,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>KEEL_CHECKOUT</key>
-    <string>/opt/home-datacenter-starter</string>
+    <string>@@CHECKOUT@@</string>
     <key>KEEL_RECONCILE_CONF</key>
     <string>/etc/keel/reconcile.conf</string>
     <!-- launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin. Ansible,
@@ -134,9 +149,9 @@
     secret and every task handling one is `no_log: true`.
   -->
   <key>StandardOutPath</key>
-  <string>/var/log/keel/reconcile-dev.log</string>
+  <string>@@LOG_DIR@@/reconcile-dev.log</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/keel/reconcile-dev.err</string>
+  <string>@@LOG_DIR@@/reconcile-dev.err</string>
 
   <!-- Deployment is not interactive work and must not compete with it. -->
   <key>ProcessType</key>
