@@ -38,9 +38,25 @@
   # that roles/keel itself honours — so the two would disagree about where the
   # source and the state live, which is worse than either answer. The layout
   # file is the FALLBACK, which is exactly what a role default is.
+  #
+  # ⚠️ OWNERSHIP BELONGS HERE TOO, AND LEAVING IT OUT COST A DEPLOYMENT. This
+  # role creates its own state directories under `keel_root` BEFORE it
+  # includes roles/keel — so `keel_owner` and `keel_group` have to be anchored
+  # with everything else. They were not, and the first real run failed at
+  # "Make sure the state directories exist" with `'keel_group' is undefined`.
+  #
+  # ⚠️ AND --check COULD NOT HAVE CAUGHT IT. The dry run ends at
+  # `when: ansible_check_mode` a few tasks earlier, by design — it must not
+  # take the lock. Everything from the lock onwards is therefore invisible to
+  # --check, which is worth remembering before trusting a green dry run as
+  # evidence that a real run will work. tests/reconcile-boundaries.yml now
+  # asserts that every deployer variable this role uses is anchored, which is
+  # a check that does not need a host.
   ansible.builtin.set_fact:
     keel_root: "{{ keel_root | default(keel_layout.keel_root, true) }}"
     keel_source_repo: "{{ keel_source_repo | default(keel_layout.keel_source_repo, true) }}"
+    keel_owner: "{{ keel_owner | default(keel_layout.keel_owner, true) }}"
+    keel_group: "{{ keel_group | default(keel_layout.keel_group, true) }}"
 
 # ── 1. CAN THIS CONTROLLER READ THE CHANNEL AT ALL? ─────────────────────────
 #
