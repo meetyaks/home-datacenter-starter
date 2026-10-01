@@ -83,6 +83,11 @@ SERVICE_REALNAME="Keel DEV reconciler"
 CREATE_SERVICE_USER=${KEEL_CREATE_SERVICE_USER:-0}
 SERVICE_HOME=${KEEL_SERVICE_HOME:-/var/keel}
 
+# Set when an existing vault means the password file must be written by a
+# person rather than generated. Reported again at the end, because a step
+# left undone halfway up a long output is a step nobody notices.
+VAULT_PASS_DEFERRED=0
+
 # A name that says which machine and which job, so a deploy key list stays
 # readable and a compromised host is revocable by name.
 KEY_COMMENT="keel-dev-release-reader-$(hostname -s)"
@@ -241,9 +246,33 @@ fi
 # Generated here rather than chosen by a person: it is never typed, so it may
 # as well be long and random. It is written straight to its final path at 0400
 # and is not printed, logged, or passed as an argument.
+#
+# ⚠️ BUT ONLY FOR A VAULT THAT DOES NOT EXIST YET. This console has been an
+# Ansible control node for a while and its vault is decrypted with a
+# passphrase a person types (`--ask-vault-pass`). Generating a fresh random
+# password here would produce a file that does not open that vault — and the
+# failure arrives later, as "Decryption failed", pointing at the vault rather
+# than at the password file that was quietly wrong. So: if a vault is already
+# there, this refuses and asks for the existing passphrase instead.
 head2 "vault password"
 if [ -f "$VAULT_PASS" ]; then
   say "already present — NOT regenerated (it would orphan the encrypted vault)"
+elif [ -f "$CHECKOUT/inventory/group_vars/linux_servers/vault.yml" ]; then
+  say "an encrypted vault ALREADY EXISTS at"
+  say "  $CHECKOUT/inventory/group_vars/linux_servers/vault.yml"
+  say ""
+  say "Not generating a password: a new random one would not open it, and the"
+  say "failure would surface later as \"Decryption failed\". Write the EXISTING"
+  say "passphrase into the file yourself — typed, never echoed, never in"
+  say "shell history:"
+  say ""
+  say "  sudo install -o $SERVICE_USER -m 0400 /dev/null $VAULT_PASS"
+  say "  sudo sh -c 'stty -echo; printf \"vault passphrase: \"; head -1 > $VAULT_PASS; stty echo; echo'"
+  say ""
+  say "Then check it opens the vault, which prints nothing on success:"
+  say "  ansible-vault view --vault-password-file $VAULT_PASS \\"
+  say "    $CHECKOUT/inventory/group_vars/linux_servers/vault.yml > /dev/null && echo OK"
+  VAULT_PASS_DEFERRED=1
 elif act; then
   umask 077
   LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64 > "$VAULT_PASS"
@@ -318,6 +347,12 @@ fi
 
 # ── WHAT A PERSON STILL HAS TO DO ───────────────────────────────────────────
 head2 "what this script cannot do"
+if [ "$VAULT_PASS_DEFERRED" = "1" ]; then
+  printf '\n0. ⚠️ THE VAULT PASSWORD FILE IS STILL MISSING. See the vault-password\n'
+  printf '   section above — this console already has an encrypted vault, so the\n'
+  printf '   passphrase has to be the existing one, not a generated one. Nothing\n'
+  printf '   below will work until %s exists.\n' "$VAULT_PASS"
+fi
 if [ -f "$DEPLOY_KEY.pub" ]; then
   printf '\n1. Add this as a READ-ONLY deploy key on meetyaks/keel\n'
   printf '   https://github.com/meetyaks/keel/settings/keys/new  — leave "Allow write access" UNCHECKED\n\n'

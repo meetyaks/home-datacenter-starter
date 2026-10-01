@@ -8,6 +8,20 @@ Everything the unattended reconciler needs, in order, on the administration cons
 
 **Time:** about 15 minutes, most of it waiting for you to click through GitHub.
 
+> ### `dc1-arm-1` is not a new machine
+>
+> It has been the Ansible control node for a while: it has the checkout, the SSH key to `dc1-x86`, and **an encrypted vault** — deployments have been run from it with `--ask-vault-pass`. Nothing below replaces any of that.
+>
+> What is genuinely new is **release mode**, and the two credentials it needs, which could not have been set up before because the thing they read did not exist until the `release/dev` channel was first published:
+>
+> | already there | new |
+> |---|---|
+> | the checkout, Ansible, the vault | the **deploy key** for the private release channel |
+> | `~/.ssh/home_datacenter_admin` → `dc1-x86` | the **GHCR token** for the private image digests |
+> | `--ask-vault-pass`, typed by a person | `/etc/keel/vault-pass`, so an unattended run needs no person |
+>
+> **The vault password file is the one to be careful about.** The bootstrap generates a random one — but *only if no vault exists*. On this console a vault does exist, so it will refuse and ask you to write your **existing** passphrase into the file instead. A generated password would not open your vault, and the failure would surface much later as `Decryption failed`, pointing at the vault rather than at the password file that was quietly wrong.
+
 ---
 
 ## 0. Before you start
@@ -108,13 +122,23 @@ Or in the UI: **https://github.com/meetyaks/keel/settings/keys/new** — paste t
 
 > It must be a **classic** PAT. [GitHub's own documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry) says *"GitHub Packages only supports authentication using a personal access token (classic)"* — a fine-grained token authenticates against the API and is then rejected by `ghcr.io`, with an error that sends you looking in the wrong place. The vault script refuses a `github_pat_…` for exactly that reason.
 
-Then store it:
+Then store it. **On `dc1-arm-1` the vault already exists**, so this is an edit, not a create — the script will say so and refuse rather than clobber a file that may hold the only copy of your master key:
 
 ```bash
-sudo scripts/bootstrap-dev-vault.sh
+sudo ansible-vault edit --vault-password-file /etc/keel/vault-pass \
+  inventory/group_vars/linux_servers/vault.yml
 ```
 
-It asks for the username, then the token **hidden** (`read -s`). The token never reaches your shell history, never becomes a command argument, and is never written unencrypted. The script also refuses to overwrite an existing vault, and checks the file is gitignored *before* creating it.
+Add exactly these two lines, with the values:
+
+```yaml
+keel_vault_registry_username: "<the github account>"
+keel_vault_registry_token:    "<the classic PAT>"
+```
+
+The token is typed into your editor and never leaves it — not into shell history, not into a command argument, not onto disk unencrypted.
+
+> On a **fresh** console with no vault, `sudo scripts/bootstrap-dev-vault.sh` creates one instead: username, then the token read **hidden** (`read -s`). It checks the file is gitignored *before* creating it, and refuses a fine-grained or `gho_` token outright.
 
 ---
 
