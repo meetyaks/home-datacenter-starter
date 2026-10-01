@@ -1,0 +1,60 @@
+---
+# One case for tests/anon-pull-classify.yml. Feeds a synthetic
+# `keel_cached_check` to the ROLE'S OWN classification tasks and checks both
+# halves of the partition.
+
+- name: "{{ case.name }} — stand in for the docker inspect results"
+  ansible.builtin.set_fact:
+    keel_cached_check: "{{ {'results': case.results} }}"
+    keel_anon_unobtainable: []
+    keel_anon_cached_only: []
+
+- name: "{{ case.name }} — run the role's own classification"
+  ansible.builtin.include_tasks: ../roles/keel/tasks/anon-pull-classify.yml
+
+- name: "{{ case.name }} — the blocking set is exactly right"
+  # ⚠️ EXACTLY, IN BOTH DIRECTIONS. Checking only that the expected entries
+  # are present would pass a partition that blocked on everything; checking
+  # only the count would pass one that blocked on the wrong things.
+  ansible.builtin.assert:
+    that:
+      - (keel_anon_unobtainable | map(attribute='image') | sort)
+        == (case.expect_blocking | sort)
+    fail_msg: >-
+      {{ case.name }}: expected these to block the deployment —
+      {{ case.expect_blocking | sort }} — but got
+      {{ keel_anon_unobtainable | map(attribute='image') | sort }}.
+      {{ 'An image that should have blocked did not, which is the gate
+          failing open.'
+         if (case.expect_blocking | length) > (keel_anon_unobtainable | length)
+         else 'An image blocked that should not have, which is the refusal
+               that stopped a working deployment.' }}
+    success_msg: >-
+      {{ case.name }} → blocking {{ keel_anon_unobtainable | map(attribute='image') | list }}
+
+- name: "{{ case.name }} — and so is the cached-only set"
+  ansible.builtin.assert:
+    that:
+      - (keel_anon_cached_only | map(attribute='image') | sort)
+        == (case.expect_cached | sort)
+    fail_msg: >-
+      {{ case.name }}: expected {{ case.expect_cached | sort }} to be
+      reported as deployable-from-cache, but got
+      {{ keel_anon_cached_only | map(attribute='image') | sort }}. This set
+      drives the warning an operator gets, so a wrong one either cries wolf
+      or stays quiet about a host that cannot be rebuilt.
+    success_msg: >-
+      {{ case.name }} → cached-only {{ keel_anon_cached_only | map(attribute='image') | list }}
+
+- name: "{{ case.name }} — every refused image landed in exactly one set"
+  # Neither lost nor double-counted: the two halves must partition the input.
+  ansible.builtin.assert:
+    that:
+      - ((keel_anon_unobtainable | length) + (keel_anon_cached_only | length))
+        == (case.results | length)
+    fail_msg: >-
+      {{ case.name }}: {{ case.results | length }} image(s) went in but
+      {{ (keel_anon_unobtainable | length) + (keel_anon_cached_only | length) }}
+      came out. An image that falls through both filters is one nobody
+      decided about, and it would be deployed on silently.
+    success_msg: "{{ case.name }} → all {{ case.results | length }} accounted for"
