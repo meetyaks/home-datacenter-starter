@@ -71,6 +71,12 @@ release/dev : channels/dev.json
 | a release that already used its retry allowance | a timer plus an unconditional retry is an infinite retry |
 | a held deployment lock | two deployers interleaving `compose up` with a migration is how a schema ends up half-applied |
 
+### Failure is not rolled back automatically
+
+Keel's migrations are **forward-only**; there is no down-migration runner. Redeploying the previous image does **not** restore the previous schema, so a site that rolled back would report a recovery that did not happen. Each release states this itself, in `migrations.requiresManualRecoveryOnFailure`.
+
+On failure the controller keeps evidence under `/srv/data/services/keel/releases/evidence/<timestamp>-<releaseId>/` — the attempt, container state, recent logs per service, and which images the host actually holds — and escalates. It retries once more (`keel_reconcile_max_attempts: 2`) for a genuinely transient failure, then stops and waits for a person.
+
 ## Provenance, and what DEV actually gets
 
 A `keel.release/v1` release makes a provenance **statement**, and the site asks two separate questions about it. Conflating them is how *"we could not attest it"* quietly becomes *"we did not check"*.
@@ -127,12 +133,6 @@ The published release declares `minimumControllerVersion: 1.0.0`, and this contr
 - **`1.0.0` has never shipped.** `roles/keel/tasks/release.yml` and `keel_controller_version` do not exist on `main`; the whole reader arrives with this PR. There is no deployed `1.0.0` for a floor to protect, and bumping to `1.1.0` would assert a predecessor that never existed — leaving the first producer floor naming a reader nobody ever ran.
 
 Raise it when the role gains the ability to honour a **new required field** that an older reader would silently ignore. That is the only case where a producer needs to be able to say "older sites must refuse me" and be believed.
-
-### Failure is not rolled back automatically
-
-Keel's migrations are **forward-only**; there is no down-migration runner. Redeploying the previous image does **not** restore the previous schema, so a site that rolled back would report a recovery that did not happen. Each release states this itself, in `migrations.requiresManualRecoveryOnFailure`.
-
-On failure the controller keeps evidence under `/srv/data/services/keel/releases/evidence/<timestamp>-<releaseId>/` — the attempt, container state, recent logs per service, and which images the host actually holds — and escalates. It retries once more (`keel_reconcile_max_attempts: 2`) for a genuinely transient failure, then stops and waits for a person.
 
 ## Where the state is
 
