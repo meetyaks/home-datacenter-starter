@@ -1,0 +1,502 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# PREFLIGHT — everything that can be checked WITHOUT changing anything.
+#
+# This file runs identically in both modes, and in check mode it is very nearly
+# the whole run. That is the design: `--check` here is a PREFLIGHT, not a
+# simulated deployment. It answers "would this deploy be able to start, and is
+# the commit it names actually deployable" — and it answers that from the
+# controller's git objects and the target's real state, not from predictions.
+#
+# ⚠️ WHAT IT DELIBERATELY DOES NOT DO: create an archive, transfer anything,
+# build an image, start a container, or touch Caddy. Nor does it require any of
+# those to already exist. A previous version let the archive task report
+# `changed` in check mode without executing, and the unpack that followed failed
+# on a file that was never created — a dry run inventing work it had not done.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── The target ──────────────────────────────────────────────────────────────
+
+# ── Ingress ownership, asserted BEFORE anything is spent ────────────────────
+#
+# ⚠️ THE FAILURE THIS PREVENTS. A deployment transferred the source, built two
+# images, started the whole stack, brought every service to healthy — and only
+# then discovered there was no Caddy on the host at all. The application was
+# fine and unreachable, and the run had spent everything before finding out.
+#
+# `caddy_role_applied` is set by roles/caddy at the END of its own run, so it
+# means "ingress was provisioned successfully in this play" rather than "someone
+# intended it". A standalone invocation of this role against a host nobody
+# manages ingress for stops here, in seconds, naming the fix.
+- name: Require ingress to be provisioned in this play
+  ansible.builtin.assert:
+    that:
+      - caddy_role_applied | default(false) | bool
+    fail_msg: >-
+      keel_caddy_enabled is true, but the caddy role has not run in this play.
+      Keel publishes nothing to the LAN — gateway and web bind to 127.0.0.1 and
+      every dependency binds to nothing — so without Caddy this deployment ends
+      healthy and unreachable.
+      Run playbooks/keel.yml, which provisions Caddy first. If you are invoking
+      this role directly, include the `caddy` role before it. To deploy with no
+      ingress on purpose, set keel_caddy_enabled=false and wire the route
+      yourself afterwards.
+    success_msg: Ingress is owned by the caddy role and was provisioned in this play.
+    quiet: true
+  when: keel_caddy_enabled | bool
+
+- name: Note that ingress is deliberately not managed
+  ansible.builtin.debug:
+    msg: >-
+      keel_caddy_enabled is false. Nothing will be published to the LAN: the
+      gateway and console stay on 127.0.0.1 and no route is written. This is a
+      deliberate choice, not a default — reaching Keel afterwards needs a
+      reverse proxy configured by hand.
+  when: not (keel_caddy_enabled | bool)
+
+- name: Validate the declared auth profile
+  # Before the architecture check and everything after it: an incomplete auth
+  # profile is a configuration fault that no amount of host inspection fixes, and
+  # discovering it after a build means discovering it as a crash-looping gateway.
+  ansible.builtin.include_tasks: assert-auth-profile.yml
+
+- name: Confirm the target is the expected architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_architecture == 'x86_64'
+    fail_msg: >-
+      Keel images for this lab are built natively as linux/amd64 on the target.
+      This host reports {{ ansible_architecture }}.
+    success_msg: "Target architecture is {{ ansible_architecture }}."
+
+- name: Require the dedicated data filesystem
+  ansible.builtin.assert:
+    that:
+      - ansible_mounts | selectattr('mount', 'equalto', '/srv/data') | list | length == 1
+    fail_msg: >-
+      /srv/data is not a separate mounted filesystem. Persistent state must not
+      land on the root volume. Run the `storage` role first.
+    success_msg: /srv/data is a dedicated filesystem.
+
+- name: Confirm Docker is usable by this connection
+  # Read-only and runs in every mode. A deploy that discovers at BUILD time that
+  # it cannot talk to the daemon has already spent the archive and the transfer;
+  # asking here costs nothing and is exactly what a preflight is for.
+  ansible.builtin.command:
+    cmd: docker version --format '{{ '{{' }}.Server.Version{{ '}}' }}'
+  register: keel_docker_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require Docker access
+  ansible.builtin.assert:
+    that:
+      - (keel_docker_version.rc | default(1)) == 0
+      - (keel_docker_version.stdout | default('')) | length > 0
+    fail_msg: >-
+      Cannot reach the Docker daemon on {{ inventory_hostname }}:
+      {{ keel_docker_version.stderr | default('no output') }}. The account this
+      play connects as must be able to run `docker` — check group membership and
+      that the service is running.
+    success_msg: "Docker server {{ keel_docker_version.stdout | default('?') | trim }} is reachable."
+
+- name: Confirm Compose v2 is available
+  ansible.builtin.command:
+    cmd: docker compose version --short
+  register: keel_compose_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require Compose v2
+  ansible.builtin.assert:
+    that:
+      - (keel_compose_version.rc | default(1)) == 0
+    fail_msg: >-
+      `docker compose` is not available on {{ inventory_hostname }}. This stack
+      uses Compose v2 syntax; the standalone `docker-compose` v1 binary is not a
+      substitute.
+    success_msg: "Compose {{ keel_compose_version.stdout | default('?') | trim }} is available."
+
+# ── The intended paths ──────────────────────────────────────────────────────
+
+# ── Installation identity ───────────────────────────────────────────────────
+#
+# Validated in PREFLIGHT, so `--check` proves it before a real run spends
+# anything, and so a malformed value stops the play before the environment file
+# is rendered or a container starts.
+#
+# ⚠️ THIS VALUE IS PERMANENT. `bootstrap.js` seeds the initial tenant at it and
+# every row that tenant owns is keyed to it. Get it wrong once and the fix is not
+# a redeploy: the data is still in the database but is no longer reachable as
+# that tenant, and a dump taken under one value restores as an empty tenant under
+# another. So the shape is checked here rather than discovered later.
+#
+# `no_log` on the whole task: the value is not secret, but printing an
+# installation's permanent identity into a deployment log is gratuitous, and the
+# failure messages below say what is wrong without quoting it.
+- name: Validate the installation's permanent tenant identity
+  ansible.builtin.assert:
+    that:
+      - keel_vault_default_tenant_id is defined
+      - (keel_vault_default_tenant_id | default('') | trim) | length > 0
+      # Canonical lowercase UUID. Uppercase is a different string to Postgres
+      # comparisons made on the rendered text, and a value that round-trips
+      # differently is a value that will eventually not match.
+      - (keel_vault_default_tenant_id | default('') | trim) is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+      # Sentinels. Any of these means the value was never actually chosen, and
+      # every installation that copied it would share one tenant identity.
+      - (keel_vault_default_tenant_id | default('') | trim) != '00000000-0000-0000-0000-000000000000'
+      # EIGHT CONSECUTIVE ZEROS, anywhere. A randomly generated UUID essentially
+      # never has a run that long; every sentinel and rendering dummy in these
+      # two repositories does. An earlier version of this rule enumerated an
+      # exact all-zero SHAPE and missed `00000000-0000-4000-8000-000000000001`
+      # — the very dummy the compose-check scripts export — because the last
+      # group ends in a 1. Matching the run rather than the shape is what makes
+      # this catch values nobody has thought of yet.
+      # (enforced: tests/installation-identity.yml "zero-run sentinel")
+      - not ((keel_vault_default_tenant_id | default('') | trim) is search('0{8}'))
+      - not ((keel_vault_default_tenant_id | default('') | trim) is search('^(11111111|12345678|deadbeef|abcdefab)-'))
+    fail_msg: >-
+      keel_vault_default_tenant_id is missing, malformed, or a placeholder. It
+      must be a canonical lowercase UUID, generated once per installation on the
+      OPERATOR'S machine (`uuidgen | tr 'A-Z' 'a-z'`) and stored in
+      inventory/group_vars/linux_servers/vault.yml. It is never generated here,
+      never defaulted, and never regenerated on a rerun: it is the permanent id
+      of this installation's initial tenant, and changing it orphans that
+      tenant's data. The value is not shown; check the vault entry.
+    success_msg: >-
+      Installation tenant identity is present and well-formed (value not shown).
+    quiet: true
+  no_log: true
+
+- name: Validate the paths this deployment will use
+  # Cheap, and it catches the class of error that is most annoying to debug
+  # later: a variable that renders empty and turns a path into "/" or "//data".
+  ansible.builtin.assert:
+    that:
+      - keel_root is defined and keel_root.startswith('/srv/data/')
+      - keel_data_root.startswith(keel_root)
+      - keel_build_dir.startswith(keel_build_root)
+      - keel_secrets_dir.startswith(keel_root)
+      - keel_env_file.startswith(keel_env_dir)
+      - keel_compose_file.startswith(keel_root)
+      - keel_controller_tmp_archive.startswith('/tmp/')
+      - keel_image_tag == 'sha-' ~ keel_commit_short
+    fail_msg: >-
+      One or more paths are not where they must be. Persistent state lives under
+      /srv/data/services/keel, the staging archive under /tmp on the controller,
+      and the image tag is derived from the commit. Check keel_root and the
+      values derived from it.
+    success_msg: Paths and image tag are well-formed.
+    quiet: true
+
+# ── The commit, read from the controller's git objects ──────────────────────
+#
+# These read OBJECTS, not a working tree, so they are true of the commit itself
+# regardless of what is checked out or dirty on the control node. Nothing is
+# written and nothing is transferred: this is the check that makes `--check`
+# meaningful, because it proves the named commit is actually deployable before a
+# real run spends a build on finding out.
+
+- name: Confirm the control node has the source repository
+  ansible.builtin.stat:
+    path: "{{ keel_source_repo }}/.git"
+  register: keel_repo_stat
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  check_mode: false
+
+- name: Fail when the source repository is absent
+  ansible.builtin.assert:
+    that:
+      - keel_repo_stat.stat.exists | default(false)
+    fail_msg: >-
+      No git repository at {{ keel_source_repo }} on the control node. Set
+      keel_source_repo to the Keel checkout, or clone it there first.
+
+- name: Confirm the commit exists and is a commit
+  ansible.builtin.command:
+    cmd: git cat-file -t {{ keel_commit }}
+    chdir: "{{ keel_source_repo }}"
+  register: keel_commit_type
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require the object to be a commit
+  ansible.builtin.assert:
+    that:
+      - (keel_commit_type.rc | default(1)) == 0
+      - (keel_commit_type.stdout | default('') | trim) == 'commit'
+    fail_msg: >-
+      {{ keel_commit }} is not a commit in {{ keel_source_repo }}
+      (git says "{{ keel_commit_type.stdout | default(keel_commit_type.stderr | default('nothing')) | trim }}").
+      Fetch it, or correct keel_commit.
+    success_msg: "{{ keel_commit }} is a commit."
+
+- name: Confirm the commit contains everything this deployment needs
+  # `git cat-file -e <sha>:<path>` exits non-zero when the path is absent from
+  # THAT COMMIT'S TREE. Directories work too — a tree is an object like any
+  # other — which is how packs/ and profiles/ are checked without listing them.
+  ansible.builtin.command:
+    cmd: git cat-file -e {{ keel_commit }}:{{ item }}
+    chdir: "{{ keel_source_repo }}"
+  register: keel_tree_paths
+  loop: "{{ keel_required_commit_paths }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require every path to be present in the commit
+  ansible.builtin.assert:
+    that:
+      - (item.rc | default(1)) == 0
+    fail_msg: >-
+      Commit {{ keel_commit }} does not contain {{ item.item }}. This deployment
+      builds from that commit alone, so a missing path here would only surface
+      as a build or boot failure later. Deploy a commit that carries it — for
+      packs/ and profiles/ that means one including the image-baking change.
+    quiet: true
+  loop: "{{ keel_tree_paths.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Report the verified commit contents
+  ansible.builtin.debug:
+    msg: >-
+      Commit {{ keel_commit_short }} carries all
+      {{ keel_required_commit_paths | length }} required paths:
+      {{ keel_required_commit_paths | join(', ') }}
+
+# ── The platform version, read from the commit being deployed ───────────────
+#
+# ⚠️ FROM THE COMMIT'S OWN BLOB, NOT THE CONTROLLER'S WORKING TREE. `git show
+# <sha>:<path>` reads the object, so the version is the one THAT COMMIT declares
+# — regardless of which branch is checked out on the control node, or whether it
+# is dirty. Deriving it from the worktree would let a deployment stamp an image
+# with a version from a different commit entirely, and the stamp is the
+# instance's release identity: every compatibility decision it makes depends on
+# it being right.
+
+# ── Every external image must be anonymously pullable, right now ────────────
+#
+# ⚠️ THIS IS THE CHECK THAT WAS MISSING, AND IT COST A DEPLOYMENT.
+#
+# A run stopped mid-deploy on `HEAD …/minio/minio/manifests/sha256:7d80… → 401`.
+# The digest had been verified a short time earlier — resolved, pulled, and the
+# container actually run. Nothing local changed. MinIO withdrew the repository
+# from public registries, and every existing check stayed green while it
+# happened: they asked whether a digest is pinned, whether a tag resolves to it,
+# and whether the image runs, and all three are answerable from a local cache.
+#
+# The only question a deploy depends on is whether a machine with no credentials
+# and no cached copy can fetch the image NOW. It is asked here, in preflight, so
+# `--check` answers it before a real run spends a source transfer and a build
+# finding out.
+#
+# Refs come from the COMMIT'S OWN compose file, so this validates what will
+# actually be deployed rather than a list maintained beside it.
+- name: Read the external image references from the commit's compose file
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      git show {{ keel_commit }}:infra/lab/compose.lab.yml
+      | grep -E '^[[:space:]]*image:'
+      | sed -E 's/^[[:space:]]*image:[[:space:]]*//'
+      | grep '@sha256:'
+      | sort -u
+    executable: /bin/bash
+    chdir: "{{ keel_source_repo }}"
+  register: keel_external_images
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require the commit to pin at least one external image
+  # `stdout_lines`, not `stdout.split('\n')` — the same mistake as below, and it
+  # reported "1 external image(s) to verify" for a five-image list while looking
+  # entirely correct.
+  ansible.builtin.assert:
+    that:
+      - (keel_external_images.stdout_lines | default([])) | length > 0
+    fail_msg: >-
+      No digest-pinned image was found in commit {{ keel_commit_short }}'s
+      compose file. Either the pins were removed or this extraction is broken;
+      both mean the anonymous-pullability check below would silently verify
+      nothing.
+    success_msg: >-
+      {{ (keel_external_images.stdout_lines | default([])) | length }}
+      external image(s) to verify:
+      {{ (keel_external_images.stdout_lines | default([])) | join(', ') }}
+    quiet: true
+
+- name: Confirm every external image is anonymously pullable
+  # Runs ON THE TARGET, because that is the machine that will pull, and its
+  # network path and any registry blocking are what matter. Read-only: it issues
+  # registry HEAD/GET requests and changes nothing, so it runs in both modes.
+  # ⚠️ ARGV, NOT A COMMAND STRING. This previously used `ansible.builtin.script`
+  # with the image list interpolated into the command text. Two things made that
+  # fail on a real run:
+  #
+  #   `.split('\n')` inside a YAML folded scalar splits on a LITERAL backslash-n,
+  #   not a newline, so it returned ONE element rather than five;
+  #
+  #   `script` hands its `cmd` to a shell, so the five-line string arrived as a
+  #   PROGRAM — line 1 ran the checker with one reference and lines 2..5 were
+  #   executed as commands:
+  #
+  #       /bin/sh: 2: ghcr.io/meetyaks/minio...: not found
+  #       /bin/sh: 3: nats...: not found
+  #
+  # The checker then verified its single argument and printed PASS. A green
+  # check that had examined a fifth of its input.
+  #
+  # ⚠️ RUNS ON THE MANAGED HOST. NOT DELEGATED. That is the whole point.
+  #
+  # The incident this exists for was HOST-PATH-SPECIFIC: one machine could
+  # resolve an image while dc1-x86 got 401. Checking from anywhere else tests
+  # the wrong DNS, the wrong routes, the wrong proxy, the wrong TLS trust store
+  # and the wrong source address for whatever the registry decides about — and
+  # would have reported everything fine while the deploy was about to fail.
+  #
+  # A CUSTOM MODULE rather than a script, because a module's arguments arrive as
+  # JSON. `images` is a LIST — five discrete values — and no shell exists
+  # anywhere between this task and the HTTP requests. An earlier version built a
+  # command string from the same list; it was newline-separated, so the shell
+  # received it as a PROGRAM, checked one reference and executed the other four.
+  # There is no command string here to get wrong.
+  #
+  # `stdout_lines` is already a list. No `split('\n')`, which in a folded scalar
+  # splits on a literal backslash-n and silently returns one element.
+  #
+  # Read-only: the module opens sockets and returns facts, writing nothing at
+  # all, so check mode gets the same answer a real run would.
+  anonymous_image_check:
+    images: "{{ keel_external_images.stdout_lines }}"
+    expected_host: "{{ inventory_hostname }}"
+    # `lookup` ALWAYS evaluates on the controller, so this is the controller's
+    # own hostname. The module refuses to report anything if it finds itself
+    # running there — which catches delegation even when the inventory name and
+    # the target's real hostname happen to differ, a case `expected_host` alone
+    # would report as an ordinary mismatch rather than as running in the wrong
+    # place.
+    forbidden_host: "{{ lookup('pipe', 'hostname') }}"
+  register: keel_anon_pull
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Show the anonymous-pullability result
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['verified ' ~ (keel_anon_pull.verified_count | default(0)) ~ ' of '
+          ~ (keel_anon_pull.input_count | default(0)) ~ ' from '
+          ~ (keel_anon_pull.execution_host | default('(unknown host)'))] +
+         (keel_anon_pull.results | default([]) | map(attribute='image') | list) }}
+
+- name: Fail when an external image cannot be pulled without credentials
+  # THREE conditions, and all three are load-bearing:
+  #
+  #   host_matches    the requests came from the deployment host, not from the
+  #                   controller. A green result from the wrong machine is the
+  #                   regression this assertion exists to make impossible.
+  #   counts equal    every image supplied was verified. "No failures recorded"
+  #                   is not the same claim — a checker that examined a prefix
+  #                   would satisfy it.
+  #   per-image ok    stated explicitly so a future change to the counters
+  #                   cannot quietly widen what PASS means.
+  ansible.builtin.assert:
+    that:
+      - keel_anon_pull.host_matches | default(false)
+      - (keel_anon_pull.input_count | default(0)) > 0
+      - (keel_anon_pull.verified_count | default(-1)) == (keel_anon_pull.input_count | default(0))
+      - (keel_anon_pull.results | default([]) | rejectattr('ok') | list | length) == 0
+    fail_msg: >-
+      Anonymous image verification failed. Ran on
+      {{ keel_anon_pull.execution_host | default('(unknown)') }}, expected
+      {{ inventory_hostname }} (host_matches={{ keel_anon_pull.host_matches | default(false) }});
+      verified {{ keel_anon_pull.verified_count | default(0) }} of
+      {{ keel_anon_pull.input_count | default(0) }}.
+      {% for r in (keel_anon_pull.results | default([]) | rejectattr('ok') | list) %}
+      FAILED {{ r.image }} — {{ r.reason }}
+      {% endfor %}
+      This is a property of the REGISTRY AND THIS HOST'S PATH TO IT, not of any
+      local image cache: the module speaks HTTP directly and sends no
+      credentials. Do not add registry credentials to this host; find a source
+      that serves the image anonymously, or mirror it somewhere that does. A
+      deploy started now would stop at `docker compose pull`.
+    success_msg: >-
+      verified {{ keel_anon_pull.verified_count | default(0) }} of
+      {{ keel_anon_pull.input_count | default(0) }} from
+      {{ keel_anon_pull.execution_host | default('?') }} —
+      {{ keel_anon_pull.results | default([]) | map(attribute='image') | join(', ') }}
+    quiet: true
+
+- name: Read the platform version declared by this commit
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      git show {{ keel_commit }}:{{ keel_platform_version_file }}
+      | grep -E "^export const COMPILED_PLATFORM_VERSION"
+      | sed -E "s/.*'([^']+)'.*/\1/"
+    executable: /bin/bash
+    chdir: "{{ keel_source_repo }}"
+  register: keel_version_probe
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ keel_controller_python }}"
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Record the platform version for this deployment
+  ansible.builtin.set_fact:
+    keel_platform_version: "{{ keel_version_probe.stdout | default('') | trim }}"
+
+- name: Require a well-formed platform version before anything is built
+  # ⚠️ FAIL FAST, AND IN BOTH MODES. This is the one value that cannot be
+  # corrected after the fact: it is baked into the image at build time, and
+  # `resolvePlatformVersion` is fail-closed — a stamped-but-unparseable value
+  # makes the gateway REFUSE TO BOOT rather than answer compat questions wrongly.
+  # Catching it here costs nothing; catching it after a build costs the build.
+  #
+  # The pattern is the repository's own SEMVER_RE from
+  # packages/core/src/platform-version/version.ts, not a looser one invented
+  # here — a version this role accepted and the platform then rejected would be
+  # the worst of both.
+  ansible.builtin.assert:
+    that:
+      - keel_platform_version is defined
+      - keel_platform_version | length > 0
+      - keel_platform_version is match('^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$')
+    fail_msg: >-
+      Could not derive a valid platform version from commit {{ keel_commit_short }}.
+      Read "{{ keel_platform_version | default('(nothing)') }}" from
+      {{ keel_platform_version_file }}. Expected a semver such as 0.1.2. The
+      image stamps this at build time and the gateway refuses to boot on an
+      unparseable value, so the build is not attempted.
+    success_msg: >-
+      Platform version {{ keel_platform_version }} derived from commit
+      {{ keel_commit_short }}.

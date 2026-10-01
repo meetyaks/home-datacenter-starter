@@ -1,0 +1,48 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ VALIDATE, THEN RELOAD — AND NEVER RESTART.
+#
+# `systemctl reload caddy` swaps configuration in a running process. A restart
+# drops every in-flight connection for every site on the host, which is not an
+# acceptable cost for adding one route.
+#
+# Validation runs FIRST and separately, against the WHOLE config — main file
+# plus every drop-in — because the per-file `validate:` on a template task only
+# ever sees one file. A drop-in can be valid alone and still break the composed
+# configuration, and the composed configuration is what Caddy will load.
+#
+# If validation fails the reload never runs, so the process keeps serving the
+# configuration it already has. That is the behaviour that matters: a bad edit
+# costs a failed play, not an outage.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Validate the whole Caddy configuration
+  # Absolute path, like every other invocation in this role: `caddy` on PATH is
+  # not guaranteed to be the binary apt installed. The check-mode guard below
+  # also keeps this off a host where the binary was only ever predicted.
+  ansible.builtin.command:
+    argv: "{{ caddy_validate_argv }}"
+  changed_when: false
+  when: not ansible_check_mode
+  listen: Reload Caddy
+
+- name: Reload Caddy
+  ansible.builtin.systemd_service:
+    name: caddy
+    state: reloaded
+  # Guarded like every other mutating handler in this repository: in check mode
+  # a task notifies on a PREDICTED change it did not make, and reloading a
+  # service to apply configuration that was never written is not a dry run of
+  # anything. (enforced: tests/check-mode-handlers.yml)
+  when: not ansible_check_mode
+  listen: Reload Caddy
+
+- name: Restart Caddy
+  # Only for changes a reload cannot pick up — a unit file or package change.
+  # Never notified by a configuration edit, because a restart drops every
+  # in-flight connection for every site on this host.
+  ansible.builtin.systemd_service:
+    name: caddy
+    state: restarted
+    daemon_reload: true
+  when: not ansible_check_mode

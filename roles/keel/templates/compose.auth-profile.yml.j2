@@ -1,0 +1,51 @@
+# {{ ansible_managed }}
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THE OIDC OVERLAY — rendered and applied ONLY when keel_auth_methods selects
+# `oidc`.
+#
+#   docker compose -f compose.lab.yml -f compose.auth-profile.yml …
+#
+# ═══ WHY THE BASE STACK DECLARES NONE OF THESE ═══════════════════════════════
+#
+# An acceptance deployment failed with everything healthy except a CRASH-LOOPING
+# GATEWAY — bootstrap exit 0, seal rotated, 296 migrations skipped, Postgres,
+# NATS, Temporal and MinIO healthy, runtime-worker running — and the web container
+# stuck at Created behind the gateway's health gate. The gateway's config schema
+# rejected:
+#
+#     oidcIssuer = invalid URL,  oidcClientId = empty,  oidcClientSecret = empty
+#
+# compose.lab.yml had declared `KEEL_OIDC_ISSUER: ${KEEL_OIDC_ISSUER:-}`, and
+# `${VAR:-}` in a mapping ALWAYS EMITS THE KEY: an unset variable arrives as
+# `KEEL_OIDC_ISSUER=`. Present and empty. The env file correctly omitted all three;
+# Compose put them back as empty strings.
+#
+# ⚠️ ABSENT AND EMPTY ARE DIFFERENT STATES. The production-boot check that passed
+# review built its environment by hand and `unset` them — a state the real
+# deployment never reaches. That is the lesson, more than the one-line cause.
+#
+# So the base declares NONE of them, and password-only mode renders no overlay at
+# all. The keys are then absent from `docker compose config` and from the
+# container.
+#
+# ═══ AND WHY THIS OVERLAY USES `:?` ══════════════════════════════════════════
+#
+# `:?` makes Compose itself refuse to render when a value is missing. Selecting
+# `oidc` is a promise that a provider is configured; an incomplete profile stops
+# the stack at `docker compose config` with the variable named, rather than at a
+# gateway crash-loop three layers from the cause. `${VAR:-}` here would recreate
+# the exact defect this file exists because of.
+#
+# roles/keel/tasks/assert-auth-profile.yml checks the same completeness earlier,
+# in preflight, so the refusal usually arrives before any build. This is the
+# backstop at the point of use.
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+{% for svc in keel_compose_auth_services %}
+  {{ svc }}:
+    environment:
+      KEEL_OIDC_ISSUER: ${KEEL_OIDC_ISSUER:?keel_auth_methods selects oidc but KEEL_OIDC_ISSUER is not set}
+      KEEL_OIDC_CLIENT_ID: ${KEEL_OIDC_CLIENT_ID:?keel_auth_methods selects oidc but KEEL_OIDC_CLIENT_ID is not set}
+      KEEL_OIDC_CLIENT_SECRET: ${KEEL_OIDC_CLIENT_SECRET:?keel_auth_methods selects oidc but KEEL_OIDC_CLIENT_SECRET is not set}
+{% endfor %}

@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MinIO client (mc), built from upstream source — first-party, not a copy.
+#
+# Used by the lab stack's one-shot bucket initialiser. Same construction as
+# Dockerfile.server: both base images pinned by digest, source supplied through
+# the build context at an exact commit, and a final stage that downloads
+# nothing — every file in it is COPY --from an earlier stage.
+#
+# LICENSING. Upstream is AGPL-3.0-or-later. The licence travels with the image
+# under /licenses, and CORRESPONDING_SOURCE records where the source and the
+# recipe that built it can be obtained. See images/minio/README.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARG BUILDER=golang:1.22-bookworm@sha256:3d699e4d15d0f8f13c9195c0632a16702b8cbdece2955af1c23b37ae5d55a253
+ARG RUNTIME=alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+
+# ⚠️ `--platform=$BUILDPLATFORM` — the builder runs on the MACHINE'S OWN
+# architecture and cross-compiles to the target. Go does this natively and it is
+# the difference between a build that works anywhere and one that needs
+# emulation: pinning the builder to the target platform makes the Go COMPILER
+# itself run under QEMU, where it crashes outright (a register dump, not a
+# compile error). That cost a local validation run before it was understood.
+FROM --platform=$BUILDPLATFORM ${BUILDER} AS build-mc
+
+ARG MC_RELEASE
+ARG MC_COMMIT
+# Supplied by BuildKit from the requested --platform.
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY src/mc/ /src/
+
+# CGO off so the result is static and runs on a musl base unchanged.
+ENV CGO_ENABLED=0 GOFLAGS=-mod=mod
+RUN set -eux; \
+    export GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}"; \
+    LDF="-s -w"; \
+    LDF="$LDF -X github.com/minio/mc/cmd.Version=${MC_RELEASE}"; \
+    LDF="$LDF -X github.com/minio/mc/cmd.ReleaseTag=${MC_RELEASE}"; \
+    LDF="$LDF -X github.com/minio/mc/cmd.CommitID=${MC_COMMIT}"; \
+    go build -trimpath -ldflags "$LDF" -o /out/mc .
+
+FROM ${RUNTIME}
+
+ARG MC_RELEASE
+ARG MC_COMMIT
+ARG SOURCE_REPO_URL
+ARG BUILD_REPO_URL
+ARG BUILD_RUN_URL
+
+COPY --from=build-mc /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build-mc /out/mc /usr/bin/mc
+COPY --from=build-mc /src/LICENSE /licenses/mc/LICENSE
+
+RUN printf '%s\n' \
+  "This image is built from unmodified upstream source." \
+  "" \
+  "mc       ${MC_RELEASE}  commit ${MC_COMMIT}" \
+  "" \
+  "Upstream source: ${SOURCE_REPO_URL}" \
+  "Build recipe:    ${BUILD_REPO_URL}" \
+  "Build run:       ${BUILD_RUN_URL}" \
+  "" \
+  "mc is licensed AGPL-3.0-or-later; its licence is under /licenses. The" \
+  "corresponding source is the upstream repository at the commit above, and" \
+  "the complete scripts controlling this build are in the build recipe" \
+  "repository above, which is public." \
+  > /licenses/CORRESPONDING_SOURCE.txt
+
+# The stack overrides both, but a bare `docker run` should still do something
+# sensible rather than exit immediately.
+ENTRYPOINT ["/usr/bin/mc"]
+CMD ["--help"]
+
+LABEL org.opencontainers.image.title="minio-mc" \
+      org.opencontainers.image.description="MinIO client (mc), built from upstream source at a pinned commit" \
+      org.opencontainers.image.version="${MC_RELEASE}" \
+      org.opencontainers.image.revision="${MC_COMMIT}" \
+      org.opencontainers.image.source="${BUILD_REPO_URL}" \
+      org.opencontainers.image.url="${SOURCE_REPO_URL}" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"

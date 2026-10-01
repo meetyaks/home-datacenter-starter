@@ -1,0 +1,78 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Restore. Run explicitly, and only with the archive named:
+#   ansible-playbook playbooks/keel.yml --tags restore -e keel_restore_archive=/path/keel-data-YYYY-MM-DD.tgz
+#
+# ⚠️ THIS REPLACES LIVE DATA. There is no default archive and no wildcard: a
+# restore that picks its own input is a restore that can silently choose the
+# wrong day. The current data is moved aside, not deleted, so a mistaken restore
+# is recoverable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Require the archive to be named explicitly
+  ansible.builtin.assert:
+    that:
+      - keel_restore_archive is defined
+      - keel_restore_archive | length > 0
+    fail_msg: >-
+      Pass -e keel_restore_archive=/path/to/keel-data-YYYY-MM-DD.tgz. This task
+      overwrites live data and will not guess which archive you meant.
+
+- name: Confirm the archive exists
+  ansible.builtin.stat:
+    path: "{{ keel_restore_archive }}"
+  register: keel_restore_stat
+
+- name: Fail when the archive is missing
+  ansible.builtin.assert:
+    that:
+      - keel_restore_stat.stat.exists
+    fail_msg: "{{ keel_restore_archive }} does not exist on the target."
+
+- name: Show the archive's provenance if recorded
+  ansible.builtin.command:
+    cmd: cat {{ keel_restore_archive | regex_replace('\.tgz$', '.manifest') }}
+  register: keel_restore_manifest
+  changed_when: false
+  failed_when: false
+
+- name: Report which commit produced this data
+  ansible.builtin.debug:
+    msg: >-
+      {{ keel_restore_manifest.stdout if keel_restore_manifest.rc == 0
+         else 'NO MANIFEST beside this archive — the commit that produced it is unknown. Restoring under a newer image will run migrations this dump has never seen.' }}
+
+- name: Stop the stack
+  ansible.builtin.command:
+    cmd: {{ keel_compose_cmd }} down
+    chdir: "{{ keel_root }}"
+  changed_when: true
+
+- name: Move the current data aside rather than deleting it
+  ansible.builtin.command:
+    cmd: mv {{ keel_data_root }} {{ keel_data_root }}.replaced-{{ ansible_date_time.epoch }}
+  register: keel_data_moved
+  changed_when: keel_data_moved.rc == 0
+
+- name: Unpack the archive
+  ansible.builtin.unarchive:
+    src: "{{ keel_restore_archive }}"
+    dest: "{{ keel_root }}"
+    remote_src: true
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+
+- name: Start the stack again
+  ansible.builtin.command:
+    cmd: >-
+      {{ keel_compose_cmd }}
+      up -d --wait --wait-timeout {{ keel_health_retries * keel_health_delay_seconds }}
+    chdir: "{{ keel_root }}"
+  changed_when: true
+
+- name: Report what was displaced
+  ansible.builtin.debug:
+    msg: >-
+      Restored {{ keel_restore_archive }}. The previous data is at
+      {{ keel_data_root }}.replaced-{{ ansible_date_time.epoch }} and is NOT
+      removed automatically — delete it yourself once the restore is verified.

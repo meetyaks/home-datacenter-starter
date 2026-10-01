@@ -1,0 +1,360 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Publish first-party MinIO images to ghcr.io/meetyaks.
+#
+# Upstream withdrew minio/minio and minio/mc from every public registry and
+# withdrew the binaries too (dl.min.io answers HTTP 410 GONE). The SOURCE is
+# still public, so this builds the exact releases from their exact commits.
+# Nothing here mirrors or re-uploads a withdrawn artifact.
+#
+# ⚠️ SCOPE. It builds two images from a committed allowlist and nothing else.
+# It does not touch the deployment, and it cannot: the only credential it holds
+# is the job's own GITHUB_TOKEN, scoped to packages on this repository.
+#
+# NEVER `latest`. Every tag names either the upstream release or the source
+# commit, so a tag cannot quietly start meaning different code — which is the
+# failure this whole exercise exists to answer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Publish MinIO images
+
+on:
+  push:
+    branches:
+      - deploy/keel-lab
+    paths:
+      - .github/workflows/publish-minio-images.yml
+      - images/minio/**
+  workflow_dispatch:
+
+# Least privilege, stated explicitly rather than inherited from repository
+# defaults, which can be changed elsewhere without anyone editing this file.
+permissions:
+  contents: read
+  packages: write
+  id-token: write        # provenance attestation
+  attestations: write    # provenance attestation
+
+concurrency:
+  group: publish-minio-images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.image }} ${{ matrix.release }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - image: minio
+            dockerfile: images/minio/Dockerfile.server
+            upstream: minio/minio
+            release: RELEASE.2024-09-22T00-33-43Z
+            commit: 03e996320ebb887112fb2a15c6f27936e5f124a0
+          - image: minio-mc
+            dockerfile: images/minio/Dockerfile.client
+            upstream: minio/mc
+            release: RELEASE.2024-09-16T17-43-14Z
+            commit: 11ebe952ea30e426e564f66e78d178465ae7c432
+
+    steps:
+      - name: Check out the build recipe
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+
+      # ── The allowlist is the authority, not this file's matrix ────────────
+      #
+      # A git tag is mutable: it can be deleted and recreated against different
+      # code. "We built the tag" is therefore a weaker claim than it sounds, so
+      # the tag is resolved and checked against a COMMITTED commit id before any
+      # source is fetched. If upstream ever moved the tag, this stops here
+      # rather than publishing something else under our name.
+      - name: Verify the matrix against the committed allowlist
+        working-directory: recipe
+        run: |
+          set -euo pipefail
+          want=$(python3 -c '
+          import json,sys
+          a=json.load(open("images/minio/allowlist.json"))
+          for i in a["images"]:
+              if i["image"] == sys.argv[1]:
+                  print(i["upstream_repo"], i["release_tag"], i["source_commit"])
+                  break
+          else:
+              raise SystemExit("image %s is not in the allowlist" % sys.argv[1])
+          ' '${{ matrix.image }}')
+          read -r a_repo a_tag a_commit <<<"$want"
+          echo "allowlist: $a_repo $a_tag $a_commit"
+          [ "$a_repo"   = '${{ matrix.upstream }}' ] || { echo "repo mismatch";    exit 1; }
+          [ "$a_tag"    = '${{ matrix.release }}'  ] || { echo "tag mismatch";     exit 1; }
+          [ "$a_commit" = '${{ matrix.commit }}'   ] || { echo "commit mismatch";  exit 1; }
+
+      - name: Resolve the upstream tag and require it to be the allowlisted commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ref=$(gh api "repos/${{ matrix.upstream }}/git/ref/tags/${{ matrix.release }}" --jq '.object.sha + " " + .object.type')
+          read -r obj typ <<<"$ref"
+          if [ "$typ" = tag ]; then
+            obj=$(gh api "repos/${{ matrix.upstream }}/git/tags/$obj" --jq '.object.sha')
+          fi
+          echo "${{ matrix.upstream }} ${{ matrix.release }} -> $obj"
+          if [ "$obj" != '${{ matrix.commit }}' ]; then
+            echo "REFUSING TO BUILD: the upstream tag now points at $obj, not the"
+            echo "allowlisted ${{ matrix.commit }}. The tag has been moved."
+            exit 1
+          fi
+
+      # ── Source, at the commit — never at the tag ──────────────────────────
+      - name: Check out minio/minio at the pinned commit
+        if: matrix.image == 'minio'
+        uses: actions/checkout@v4
+        with:
+          repository: minio/minio
+          ref: 03e996320ebb887112fb2a15c6f27936e5f124a0
+          path: recipe/src/minio
+          persist-credentials: false
+
+      - name: Check out minio/mc at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: minio/mc
+          ref: 11ebe952ea30e426e564f66e78d178465ae7c432
+          path: recipe/src/mc
+          persist-credentials: false
+
+      - name: Confirm the checked-out trees are at those commits
+        working-directory: recipe
+        run: |
+          set -euo pipefail
+          if [ '${{ matrix.image }}' = minio ]; then
+            got=$(git -C src/minio rev-parse HEAD)
+            [ "$got" = '03e996320ebb887112fb2a15c6f27936e5f124a0' ] || { echo "minio tree at $got"; exit 1; }
+            echo "minio source tree: $got"
+          fi
+          got=$(git -C src/mc rev-parse HEAD)
+          [ "$got" = '11ebe952ea30e426e564f66e78d178465ae7c432' ] || { echo "mc tree at $got"; exit 1; }
+          echo "mc source tree: $got"
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # The job's own scoped token. No personal access token is used, and none
+        # is needed: `packages: write` above is what authorises this.
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: recipe
+          file: recipe/${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          # NEVER `latest`. The release and the source commit, and nothing else.
+          tags: |
+            ghcr.io/meetyaks/${{ matrix.image }}:${{ matrix.release }}
+            ghcr.io/meetyaks/${{ matrix.image }}:src-${{ matrix.commit }}
+          build-args: |
+            MINIO_RELEASE=RELEASE.2024-09-22T00-33-43Z
+            MINIO_COMMIT=03e996320ebb887112fb2a15c6f27936e5f124a0
+            MC_RELEASE=RELEASE.2024-09-16T17-43-14Z
+            MC_COMMIT=11ebe952ea30e426e564f66e78d178465ae7c432
+            SOURCE_REPO_URL=https://github.com/${{ matrix.upstream }}
+            BUILD_REPO_URL=${{ github.server_url }}/${{ github.repository }}
+            BUILD_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          provenance: mode=max
+          sbom: true
+
+      # ── Verify the artifact that was actually published ───────────────────
+      #
+      # Deliberately NOT a `RUN … --version` inside the Dockerfile. That tests an
+      # intermediate build stage rather than the image anyone will run, and it
+      # cannot execute at all when the build is emulated. Here the runner is
+      # native amd64 and the subject is the pushed digest itself.
+      - name: Verify the published image reports the intended release
+        env:
+          REF: ghcr.io/meetyaks/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "verifying $REF"
+
+          if [ '${{ matrix.image }}' = minio ]; then
+            v=$(docker run --rm --entrypoint /usr/bin/minio "$REF" --version)
+            echo "$v"
+            echo "$v" | grep -q 'RELEASE.2024-09-22T00-33-43Z' \
+              || { echo "server does not report the intended release"; exit 1; }
+            echo "$v" | grep -q '03e996320ebb887112fb2a15c6f27936e5f124a0' \
+              || { echo "server does not report the intended commit"; exit 1; }
+            # The stack's healthcheck is `mc ready local`, which runs in THIS image.
+            m=$(docker run --rm --entrypoint /usr/bin/mc "$REF" --version)
+            echo "$m"
+            echo "$m" | grep -q 'RELEASE.2024-09-16T17-43-14Z' \
+              || { echo "bundled mc does not report the intended release"; exit 1; }
+            docker run --rm --entrypoint /bin/sh "$REF" -c 'command -v mc >/dev/null' \
+              || { echo "mc is not on PATH; the healthcheck would never pass"; exit 1; }
+          else
+            m=$(docker run --rm --entrypoint /usr/bin/mc "$REF" --version)
+            echo "$m"
+            echo "$m" | grep -q 'RELEASE.2024-09-16T17-43-14Z' \
+              || { echo "client does not report the intended release"; exit 1; }
+            echo "$m" | grep -q '11ebe952ea30e426e564f66e78d178465ae7c432' \
+              || { echo "client does not report the intended commit"; exit 1; }
+          fi
+
+          # A CMD-SHELL healthcheck needs a shell, and the licences must travel.
+          docker run --rm --entrypoint /bin/sh "$REF" -c 'test -s /licenses/CORRESPONDING_SOURCE.txt' \
+            || { echo "CORRESPONDING_SOURCE.txt missing or empty"; exit 1; }
+          docker run --rm --entrypoint /bin/sh "$REF" -c 'ls /licenses/*/LICENSE >/dev/null' \
+            || { echo "upstream LICENSE missing"; exit 1; }
+          echo "licences present; shell present"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/meetyaks/${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── Record exactly what was produced ──────────────────────────────────
+      - name: Summarise
+        run: |
+          {
+            echo "### ghcr.io/meetyaks/${{ matrix.image }}"
+            echo
+            echo '| | |'
+            echo '|---|---|'
+            echo "| upstream | [${{ matrix.upstream }}](https://github.com/${{ matrix.upstream }}) |"
+            echo "| release tag | \`${{ matrix.release }}\` |"
+            echo "| source commit | \`${{ matrix.commit }}\` |"
+            echo "| image digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| platform | linux/amd64 |"
+            echo "| licence | AGPL-3.0-or-later |"
+            echo "| build run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
+            echo
+            echo 'Pin it as:'
+            echo
+            echo '```'
+            echo "ghcr.io/meetyaks/${{ matrix.image }}:${{ matrix.release }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The functional smoke, on linux/amd64, from a CLEAN Docker config.
+  #
+  # This runner is amd64, which is the point: these are amd64-only images and
+  # the Go binaries inside them cannot execute under emulation on an arm64
+  # workstation — they die in the Go runtime, not in their own code. So the
+  # functional check has to happen somewhere native, and here it does.
+  #
+  # It exercises the object-storage pair exactly as the deployment wires them:
+  # the same server command and credentials env, the same `mc ready local`
+  # healthcheck that runs INSIDE the server image, and the same bucket-init
+  # command the compose file issues — then a real object round-trip.
+  #
+  # `docker logout` first, and a fresh empty DOCKER_CONFIG: the build jobs above
+  # logged in, and a smoke that quietly relies on that would not be testing
+  # anonymous pullability at all.
+  # ───────────────────────────────────────────────────────────────────────────
+  smoke:
+    name: Functional smoke (linux/amd64, anonymous)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      MINIO: ghcr.io/meetyaks/minio:RELEASE.2024-09-22T00-33-43Z
+      MC: ghcr.io/meetyaks/minio-mc:RELEASE.2024-09-16T17-43-14Z
+      ACCESS_KEY: smokeaccesskey
+      SECRET_KEY: smokesecretkey123
+      BUCKET: keel-lab
+
+    steps:
+      - name: Prove the config is clean, then pull anonymously
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io || true
+          export DOCKER_CONFIG="$RUNNER_TEMP/clean-docker"
+          mkdir -p "$DOCKER_CONFIG"; printf '{}\n' > "$DOCKER_CONFIG/config.json"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "config: $(cat "$DOCKER_CONFIG/config.json")"
+
+          docker pull -q "$MINIO"
+          docker pull -q "$MC"
+          echo "both pulled with no credentials"
+          docker image inspect "$MINIO" --format '  minio  {{.Os}}/{{.Architecture}}'
+          docker image inspect "$MC"    --format '  mc     {{.Os}}/{{.Architecture}}'
+
+      - name: Runtime identity
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /usr/bin/minio "$MINIO" --version
+          docker run --rm --entrypoint /usr/bin/mc    "$MINIO" --version
+          docker run --rm --entrypoint /usr/bin/mc    "$MC"    --version
+
+      - name: MinIO health, via the deployment's own healthcheck command
+        run: |
+          set -euo pipefail
+          docker network create keel-smoke
+          docker run -d --name minio --network keel-smoke --network-alias minio \
+            -e MINIO_ROOT_USER="$ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$SECRET_KEY" \
+            "$MINIO" server /data
+
+          # The compose healthcheck verbatim: `mc ready local`, run INSIDE the
+          # server container. It is why the server image must carry mc.
+          for i in $(seq 1 30); do
+            if docker exec minio /bin/sh -c 'mc ready local' >/dev/null 2>&1; then
+              echo "mc ready local: healthy after ${i} attempt(s)"; break
+            fi
+            [ "$i" = 30 ] && { echo "never became healthy"; docker logs minio | tail -30; exit 1; }
+            sleep 2
+          done
+
+      - name: mc creates the configured bucket and exits 0
+        run: |
+          set -euo pipefail
+          # The compose one-shot's command, unchanged.
+          docker run --name bucket-init --network keel-smoke \
+            -e MINIO_ROOT_USER="$ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$SECRET_KEY" \
+            -e KEEL_BLOB_BUCKET="$BUCKET" \
+            --entrypoint /bin/sh "$MC" -c '
+              mc alias set lab http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" &&
+              mc mb --ignore-existing "lab/$KEEL_BLOB_BUCKET" &&
+              echo "bucket ready: $KEEL_BLOB_BUCKET"'
+          rc=$(docker inspect --format '{{.State.ExitCode}}' bucket-init)
+          echo "bucket-init exit code: $rc"
+          [ "$rc" = 0 ] || exit 1
+
+      - name: Independent put / list / get / delete
+        run: |
+          set -euo pipefail
+          docker run --rm --network keel-smoke \
+            -e MC_HOST_lab="http://${ACCESS_KEY}:${SECRET_KEY}@minio:9000" \
+            --entrypoint /bin/sh "$MC" -c '
+              set -e
+              echo "keel-smoke-payload" > /tmp/o.txt
+              mc ls lab
+              mc cp /tmp/o.txt "lab/'"$BUCKET"'/smoke.txt"   >/dev/null && echo "put:    ok"
+              mc stat "lab/'"$BUCKET"'/smoke.txt"            >/dev/null && echo "stat:   ok"
+              got=$(mc cat "lab/'"$BUCKET"'/smoke.txt")
+              [ "$got" = "keel-smoke-payload" ] || { echo "get: CONTENT MISMATCH: $got"; exit 1; }
+              echo "get:    ok (content verified)"
+              mc rm "lab/'"$BUCKET"'/smoke.txt"              >/dev/null && echo "delete: ok"
+              mc stat "lab/'"$BUCKET"'/smoke.txt" >/dev/null 2>&1 && { echo "delete did not remove it"; exit 1; }
+              echo "absent after delete: ok"'
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker rm -f minio bucket-init >/dev/null 2>&1 || true
+          docker network rm keel-smoke   >/dev/null 2>&1 || true

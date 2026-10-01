@@ -1,0 +1,30 @@
+---
+# roles/caddy followed by the Keel role's ACTUAL drop-in tasks.
+#
+# The pair is what matters: roles/keel consumes `/etc/caddy/conf.d`, which
+# roles/caddy owns — and under `--check` on a fresh host only PREDICTS. Running
+# either alone cannot show whether the handover survives a dry run.
+#
+# Both sides are imported by reference. A harness that restated them would pass
+# while the roles stayed broken, which this repository has been bitten by
+# before.
+- name: Caddy, then the Keel drop-in
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  roles:
+    - role: caddy
+
+  tasks:
+    # `import_role … tasks_from:`, NOT `include_tasks` on the file path. The
+    # path form leaves the role's `templates/` off the search path and loads
+    # none of its defaults, so the harness would have to restate every variable
+    # the drop-in template uses — and a harness carrying its own copy of the
+    # role's values is a harness that can pass against values the role does not
+    # have. This form runs the real tasks with the real defaults.
+    - name: The Keel role's own Caddy tasks
+      ansible.builtin.import_role:
+        name: keel
+        tasks_from: caddy

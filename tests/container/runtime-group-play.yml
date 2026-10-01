@@ -1,0 +1,47 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# The role's OWN group and directory tasks, run against a disposable Linux host.
+#
+# It `include_tasks` the real files rather than restating them. A harness that
+# re-implemented the logic would pass while the role stayed broken — which is
+# the failure mode this repository has already hit more than once.
+#
+# Only the two files under test are included: the rest of the role needs a
+# vault, a git checkout, Docker and an x86_64 host with /srv/data mounted, none
+# of which is relevant to whether a group is provisioned correctly.
+#
+# Driven by tests/run-runtime-group-scenarios.sh, which sets up the host state
+# for each scenario and inspects the result. Not meant to be run by hand.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Runtime group and directory provisioning
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    # The values the role defaults to. Restated here rather than loaded, so a
+    # scenario can override one without dragging in the whole role's defaults.
+    keel_runtime_gid: 10001
+    keel_runtime_group: keel-runtime
+    keel_owner: root
+    keel_group: root
+    keel_root: /srv/data/services/keel
+    keel_build_root: /srv/data/services/keel/builds
+    keel_data_root: /srv/data/services/keel/data
+    keel_secrets_dir: /srv/data/services/keel/secrets
+    keel_env_dir: /srv/data/services/keel/env
+    keel_pg_conf_dir: /srv/data/services/keel/pg
+    keel_secrets_dir_mode: "0750"
+    keel_data_dirs:
+      - /srv/data/services/keel/data/postgres
+      - /srv/data/services/keel/data/nats
+      - /srv/data/services/keel/data/minio
+
+  tasks:
+    - name: Provision the container's runtime group
+      ansible.builtin.include_tasks: ../../roles/keel/tasks/runtime-group.yml
+
+    - name: Create the persistent directory tree
+      ansible.builtin.include_tasks: ../../roles/keel/tasks/directories.yml

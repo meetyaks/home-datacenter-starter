@@ -1,0 +1,68 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# The dc1-x86 first-deploy sequence, reproduced exactly.
+#
+#   1. roles/caddy installs and starts Caddy — with conf.d EMPTY, so the
+#      running process's journal says "No files matching import glob pattern"
+#      and nothing is bound to :80 or :443.
+#   2. the application's upstream appears (here a stub standing in for Keel's
+#      web container, which in a real deploy started earlier in the play).
+#   3. roles/keel writes its drop-in and notifies `Reload Caddy`.
+#   4. VERIFICATION RUNS HERE — mid-play, before Ansible would flush handlers.
+#
+# Step 4 is the whole point. On dc1-x86 it ran against the configuration Caddy
+# had loaded at step 1, failed, and the failure meant the pending handler never
+# ran at all: the route stayed on disk and never became active.
+#
+# Both roles are imported by reference. A harness that restated them would pass
+# while the roles stayed broken.
+- name: First-deploy handler ordering
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  roles:
+    # (1) Caddy comes up with an empty conf.d, exactly as it did on dc1-x86.
+    - role: caddy
+
+  tasks:
+    # (2) The upstream the route will point at. In a real deploy this is the
+    # Keel web container, started before the route is written. It answers with
+    # the forwarded headers it received, so the same run also shows whether
+    # Caddy's defaults supply them without any `header_up` lines.
+    - name: Stand in for the Keel web container on the console port
+      ansible.builtin.copy:
+        dest: /etc/caddy/conf.d/zz-test-upstream.caddy
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          :8080 {
+          	respond "proto=[{http.request.header.X-Forwarded-Proto}] host=[{http.request.header.X-Forwarded-Host}] for=[{http.request.header.X-Forwarded-For}]" 200
+          }
+
+    # (3) The real Keel drop-in tasks: render, validate, notify, flush, prove.
+    - name: The Keel role's own Caddy tasks
+      ansible.builtin.import_role:
+        name: keel
+        tasks_from: caddy
+
+    # (4) VERIFICATION, MID-PLAY. This is where verify.yml sits in the real
+    # deployment, and where the old implementation tested a reload that had
+    # not happened.
+    - name: MIDPLAY VERIFICATION — the console over HTTPS
+      ansible.builtin.uri:
+        url: "https://{{ keel_hostname }}/"
+        method: GET
+        return_content: true
+        # Certificates are VERIFIED. roles/caddy publishes its root into the
+        # host trust store, so a working deployment needs no exception here —
+        # and an `validate_certs: false` would hide exactly the CA-publication
+        # failure this play is also covering.
+        status_code: [200]
+      register: midplay_console
+
+    - name: MIDPLAY VERIFICATION — report what the upstream received
+      ansible.builtin.debug:
+        msg: "MIDPLAY OK: {{ midplay_console.content | default('') | trim }}"

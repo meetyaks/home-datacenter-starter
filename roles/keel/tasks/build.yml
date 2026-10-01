@@ -1,0 +1,211 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Native linux/amd64 build on the target host.
+#
+# NO REGISTRY, by decision for this first lab deployment. The images exist only
+# in this host's local daemon, which is why the tag must carry the commit: there
+# is no digest reference to fall back on and `latest` would make two different
+# builds indistinguishable.
+#
+# IDEMPOTENCE IS THE POINT. A tag derived from an immutable commit cannot
+# legitimately mean two different images, so an existing tag is a finished build
+# and the role skips it. `keel_force_rebuild: true` overrides that deliberately.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Look for images already built for this commit
+  ansible.builtin.command:
+    cmd: docker image inspect --format '{{ '{{' }}.Id{{ '}}' }}' {{ item }}
+  loop:
+    - "{{ keel_gateway_image }}"
+    - "{{ keel_web_image }}"
+  register: keel_existing_images
+  changed_when: false
+  failed_when: false
+  # A read-only inspection: it must run in check mode too, or the build decision
+  # below is made from skipped results and reports nonsense.
+  check_mode: false
+
+- name: Record which images are already present
+  ansible.builtin.set_fact:
+    keel_gateway_present: "{{ (keel_existing_images.results[0].rc | default(1)) == 0 }}"
+    keel_web_present: "{{ (keel_existing_images.results[1].rc | default(1)) == 0 }}"
+
+- name: Report the build decision
+  ansible.builtin.debug:
+    msg: >-
+      gateway {{ 'present, skipping' if keel_gateway_present and not keel_force_rebuild else 'will build' }};
+      web {{ 'present, skipping' if keel_web_present and not keel_force_rebuild else 'will build' }}
+
+# ── Retain the outgoing images for rollback BEFORE anything replaces them ────
+#
+# Read from the live environment file rather than a variable: what is actually
+# running is the only honest answer to "what do we roll back to".
+- name: Read the currently deployed image tags
+  ansible.builtin.slurp:
+    src: "{{ keel_env_file }}"
+  register: keel_live_env
+  failed_when: false
+  check_mode: false
+
+- name: Record the previous images for rollback
+  ansible.builtin.copy:
+    content: |
+      # The images this host was running immediately before {{ keel_image_tag }}.
+      # Written by roles/keel. See roles/keel/README.md for the rollback command.
+      {{ (keel_live_env.content | b64decode)
+         | regex_findall('^KEEL_(?:WEB_)?IMAGE=.*$', multiline=True)
+         | join('\n') }}
+    dest: "{{ keel_root }}/ROLLBACK_PREVIOUS"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  when:
+    - keel_live_env.content is defined
+    - keel_image_tag not in (keel_live_env.content | b64decode)
+
+- name: Refuse to build without a platform version
+  # ⚠️ A SECOND GATE, IMMEDIATELY BEFORE THE BUILD. Preflight already derived and
+  # validated this, but preflight is a long way from here and `set_fact` can be
+  # overridden by an extra-var. The stamp is baked into the image and cannot be
+  # corrected afterwards, so the check is repeated where the value is spent.
+  ansible.builtin.assert:
+    that:
+      - keel_platform_version is defined
+      - keel_platform_version | length > 0
+      - keel_platform_version is match('^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$')
+    fail_msg: >-
+      keel_platform_version is "{{ keel_platform_version | default('(undefined)') }}".
+      Refusing to build: the gateway stamps this at build time and refuses to
+      boot on an unparseable value, so an image built now could not start.
+    success_msg: "Stamping {{ keel_gateway_image }} with platform version {{ keel_platform_version }}."
+
+- name: Build the gateway image
+  ansible.builtin.command:
+    cmd: >-
+      docker build
+      --file packages/gateway/Dockerfile
+      --tag {{ keel_gateway_image }}
+      --build-arg KEEL_PLATFORM_VERSION={{ keel_platform_version }}
+      .
+    chdir: "{{ keel_build_dir }}"
+  register: keel_gateway_build
+  changed_when: keel_gateway_build.rc == 0
+  async: "{{ keel_build_timeout_seconds }}"
+  poll: 15
+  when: keel_force_rebuild | bool or not keel_gateway_present
+
+# ── The web image's baked-in gateway base ───────────────────────────────────
+#
+# ⚠️ A BUILD ARG CHANGE DOES NOT CHANGE THE IMAGE TAG, so the "tag exists →
+# skip" rule above would keep serving an image built against a DIFFERENT
+# browser-facing origin, indefinitely, with nothing to show for it. The value is
+# recorded beside the image and compared; a mismatch forces exactly this one
+# image to rebuild.
+#
+# That matters here because the value changed: from `https://keel.dc1.lan` (an
+# absolute origin naming the console's own host, which forces the reverse proxy
+# into a path split that cannot be correct) to the `/__keel` same-origin mount
+# the application is designed around. See keel_web_gateway_mount in defaults.
+- name: Read the gateway base the existing web image was built with
+  ansible.builtin.slurp:
+    src: "{{ keel_build_root }}/WEB_GATEWAY_BASE"
+  register: keel_web_base_recorded
+  failed_when: false
+  check_mode: false
+
+- name: Decide whether the web image must be rebuilt
+  ansible.builtin.set_fact:
+    keel_web_base_changed: >-
+      {{ ((keel_web_base_recorded.content | default('') | b64decode) | trim)
+         != (keel_web_gateway_mount | trim) }}
+
+- name: Report why the web image will be rebuilt
+  ansible.builtin.debug:
+    msg: >-
+      The console image was built for
+      "{{ (keel_web_base_recorded.content | default('') | b64decode) | trim | default('(unrecorded)', true) }}"
+      but this deployment wants "{{ keel_web_gateway_mount }}". Rebuilding it —
+      the value is baked into the bundle and the image tag does not change with
+      it, so nothing else would notice.
+  when:
+    - keel_web_base_changed | bool
+    - keel_web_present | default(false)
+
+- name: Build the web image
+  # VITE_KEEL_GATEWAY_URL is baked into the SPA bundle at build time, so the
+  # browser-facing base has to be known here. KEEL_GATEWAY_INTERNAL_URL is the
+  # address nginx inside this image dials over the compose network; it never
+  # leaves the container.
+  ansible.builtin.command:
+    cmd: >-
+      docker build
+      --file apps/web/Dockerfile
+      --tag {{ keel_web_image }}
+      --build-arg VITE_KEEL_GATEWAY_URL={{ keel_web_gateway_mount }}
+      --build-arg KEEL_GATEWAY_INTERNAL_URL=http://gateway:3000
+      .
+    chdir: "{{ keel_build_dir }}"
+  register: keel_web_build
+  changed_when: keel_web_build.rc == 0
+  async: "{{ keel_build_timeout_seconds }}"
+  poll: 15
+  when: keel_force_rebuild | bool or not keel_web_present or keel_web_base_changed | bool
+
+- name: Record the gateway base this web image was built with
+  ansible.builtin.copy:
+    content: "{{ keel_web_gateway_mount }}\n"
+    dest: "{{ keel_build_root }}/WEB_GATEWAY_BASE"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Read back the built image IDs
+  ansible.builtin.command:
+    cmd: docker image inspect --format '{{ '{{' }}.Id{{ '}}' }}' {{ item }}
+  loop:
+    - "{{ keel_gateway_image }}"
+    - "{{ keel_web_image }}"
+  register: keel_image_ids
+  changed_when: false
+  # Read-only, so it runs in check mode — but on a fresh host nothing was built,
+  # so a non-zero rc is the CORRECT answer there and must not fail the run.
+  # `| default('')` below turns that into an empty identity rather than a crash.
+  failed_when: false
+  check_mode: false
+
+- name: Record the image identities
+  ansible.builtin.copy:
+    content: |
+      # Image identities for {{ keel_commit }}. Written by roles/keel.
+      # No registry: these content digests are local to this host's daemon.
+      {{ keel_gateway_image }} {{ keel_image_ids.results[0].stdout | default('') }}
+      {{ keel_web_image }} {{ keel_image_ids.results[1].stdout | default('') }}
+    dest: "{{ keel_build_dir }}/IMAGE_DIGESTS"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  # Nothing to record when nothing was built; the build directory does not exist
+  # in check mode on a fresh host either.
+  when: not ansible_check_mode
+
+- name: Require both images to exist after a real build
+  # NORMAL MODE IS STRICT. `failed_when: false` above exists for check mode, so
+  # without this a genuinely failed build would slip through with an empty digest
+  # and the deploy would proceed to reference an image that is not there.
+  ansible.builtin.assert:
+    that:
+      - (keel_image_ids.results[0].stdout | default('')) | length > 0
+      - (keel_image_ids.results[1].stdout | default('')) | length > 0
+    fail_msg: >-
+      One or both images are absent after the build step:
+      {{ keel_gateway_image }}={{ keel_image_ids.results[0].stdout | default('(missing)') }},
+      {{ keel_web_image }}={{ keel_image_ids.results[1].stdout | default('(missing)') }}.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Show the image identities
+  ansible.builtin.debug:
+    msg: >-
+      {{ keel_gateway_image }} = {{ keel_image_ids.results[0].stdout | default('(not built)') }} |
+      {{ keel_web_image }} = {{ keel_image_ids.results[1].stdout | default('(not built)') }}

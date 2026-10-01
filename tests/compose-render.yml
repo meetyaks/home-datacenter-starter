@@ -1,0 +1,85 @@
+---
+# Render one auth profile's env file and compose overlay into `render_dir`, for
+# tests/run-compose-auth-profile.sh to inspect.
+#
+# It uses the ROLE'S OWN defaults, template and assertion — nothing here restates
+# them. A harness carrying its own copy of the template would pass against a
+# template the role does not have, which is the failure mode this whole defect
+# came from: a check that tested a hand-built environment instead of the rendered
+# one.
+- name: Render an auth profile
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    # Obvious fakes. The template interpolates them; nothing asserts on them.
+    d: "not-a-real-value-compose-render"
+    keel_vault_admin_db_password: "{{ d }}"
+    keel_vault_app_db_password: "{{ d }}"
+    keel_vault_blob_access_key: "{{ d }}"
+    keel_vault_blob_secret_key: "{{ d }}"
+    keel_vault_master_key: "{{ d }}"
+    keel_vault_mfa_master_key: "{{ d }}"
+    keel_vault_jwt_private_key: "{{ d }}"
+    keel_vault_jwt_public_key: "{{ d }}"
+    keel_vault_default_tenant_id: "00000000-0000-4000-8000-0000000000ff"
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/keel/defaults/main.yml
+
+    - name: Select the auth profile under test
+      ansible.builtin.set_fact:
+        keel_auth_methods: "{{ auth_methods }}"
+
+    # ── The oidc inputs, per case ──
+    #
+    #   yes             a complete, non-self-referential provider
+    #   missing-issuer  deliberately incomplete — the assertion must refuse it
+    #   anything else   password-only: nothing is set at all
+    - name: Supply a complete oidc configuration
+      ansible.builtin.set_fact:
+        keel_oidc_issuer: "https://login.example-idp.test/v2.0"
+        keel_oidc_client_id: "keel-lab-client"
+        keel_vault_oidc_client_secret: "not-a-real-secret-compose-render"
+      when: want_oidc | default('no') == 'yes'
+
+    - name: Supply an INCOMPLETE oidc configuration
+      ansible.builtin.set_fact:
+        keel_oidc_issuer: ""
+        keel_oidc_client_id: "keel-lab-client"
+        keel_vault_oidc_client_secret: "not-a-real-secret-compose-render"
+      when: want_oidc | default('no') == 'missing-issuer'
+
+    # The role's own guard, not a copy of it. This is what must refuse the
+    # incomplete case — and it runs before anything is written, so a refused
+    # profile leaves no half-rendered env file behind.
+    - name: Assert the auth profile is complete
+      ansible.builtin.include_tasks: ../roles/keel/tasks/assert-auth-profile.yml
+
+    - name: Render the environment file
+      ansible.builtin.template:
+        src: ../roles/keel/templates/keel.env.j2
+        dest: "{{ render_dir }}/keel.env"
+        mode: "0600"
+
+    # ⚠️ CONDITIONAL, exactly as roles/keel/tasks/deploy.yml is. An earlier version
+    # of this play rendered it unconditionally, so the password-only case got an
+    # overlay full of `${VAR:?}` requirements with nothing to satisfy them and
+    # `docker compose config` failed — a harness that did not mirror the role it
+    # is supposed to be testing.
+    - name: Render the OIDC overlay (oidc mode only)
+      ansible.builtin.template:
+        src: ../roles/keel/templates/compose.auth-profile.yml.j2
+        dest: "{{ render_dir }}/compose.auth-profile.yml"
+        mode: "0644"
+      when: keel_oidc_selected | bool
+
+    - name: Remove a stale overlay when password-only
+      ansible.builtin.file:
+        path: "{{ render_dir }}/compose.auth-profile.yml"
+        state: absent
+      when: not (keel_oidc_selected | bool)

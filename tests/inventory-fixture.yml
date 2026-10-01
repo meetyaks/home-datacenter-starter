@@ -1,0 +1,15 @@
+---
+# Fixture inventory for tests/controller-delegation.yml.
+#
+# The host is DELIBERATELY unroutable: every task in that play is delegated to
+# the controller, so nothing is ever sent here. Its only job is to give the play
+# the remote identity that used to leak — ansible_user: labadmin, become: true —
+# which is the exact shape that made the controller report itself UNREACHABLE.
+all:
+  children:
+    keel_delegation_fixture:
+      hosts:
+        fixture-remote:
+          ansible_host: 192.0.2.1        # TEST-NET-1, RFC 5737: never routable
+          ansible_user: labadmin
+          ansible_connection: ssh

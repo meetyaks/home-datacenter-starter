@@ -1,0 +1,191 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLY A PENDING INGRESS CHANGE, AND PROVE IT IS ACTIVE — IN THAT ORDER.
+#
+# Called by an application role immediately after it writes its drop-in, and
+# before it verifies anything over HTTPS:
+#
+#   - name: Apply and prove the ingress change
+#     ansible.builtin.import_role:
+#       name: caddy
+#       tasks_from: reload-and-verify
+#
+# ═══ WHY THIS EXISTS ═════════════════════════════════════════════════════════
+#
+# Ansible runs handlers at the END of a play. A role that writes a route,
+# notifies `Reload Caddy` and then verifies the site is reachable is verifying
+# a reload that HAS NOT HAPPENED. That is not a theory — it is what dc1-x86
+# did:
+#
+#   · Caddy v2.11.4 installed, enabled, active
+#   · /etc/caddy/conf.d/keel.caddy present on disk
+#   · `caddy validate` against those files: Valid configuration, HTTPS on :443
+#   · the RUNNING process's journal:
+#       No files matching import glob pattern /etc/caddy/conf.d/*.caddy
+#   · no listeners on :80 or :443
+#
+# Caddy had loaded before the drop-in existed. The route was on disk, the
+# reload was pending, verification ran against the old configuration, failed —
+# and because the play failed, the pending handler never ran at all. The route
+# never became active, and the evidence pointed at files that were all correct.
+#
+# ═══ WHAT THIS FILE GUARANTEES ═══════════════════════════════════════════════
+#
+#   1. the COMPOSED configuration is valid          — before anything restarts
+#   2. the handler has RUN                          — meta: flush_handlers
+#   3. Caddy is active                              — the reload did not kill it
+#   4. :80 and :443 exist and belong to Caddy       — it is really serving
+#   5. the LOADED configuration is readable         — for the caller to assert on
+#
+# Step 5 is the point of the whole file: "the file is on disk" and "the file is
+# loaded" are different claims, and only the second one serves traffic.
+# (enforced: tests/run-caddy-handler-order.sh)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Validate the composed Caddy configuration before reloading
+  # (c) BEFORE the flush, so an invalid composed configuration fails here —
+  # with the whole config in the error — rather than inside a handler. The
+  # handler validates again immediately before the reload; that one is the
+  # guarantee, this one is the better error message and the earlier stop.
+  #
+  # Read-only: it parses files and exits. The running process is untouched
+  # whether it passes or fails, which is what makes it safe to run first.
+  ansible.builtin.command:
+    argv: "{{ caddy_validate_argv }}"
+  changed_when: false
+  check_mode: false
+  # Validation ALWAYS runs, in both modes: invalid on-disk configuration is a
+  # fault a dry run must report, and it is exactly the case where the gate
+  # below (which suppresses active-state checks in check mode) must not apply.
+  when: caddy_can_be_executed_now | default(false) | bool
+
+- name: Notice a running configuration that does not match the files
+  # (c2) BETWEEN validation and the flush, because a reload must only ever be
+  # notified for a configuration already known to be valid.
+  #
+  # Without this, the flush below applies only what a CHANGED template
+  # notified — and on a rerun after a failed deploy nothing changed, because
+  # the drop-in was already correct. That is dc1-x86 exactly: right file,
+  # stale process, no notification, nothing to flush.
+  ansible.builtin.include_tasks: detect-drift.yml
+
+- name: Apply the pending ingress change now, not at the end of the play
+  # (d) THE FIX. Without this, every check below — and every HTTPS check the
+  # caller runs afterwards — tests the configuration Caddy loaded BEFORE this
+  # play wrote anything.
+  #
+  # `meta: flush_handlers` runs every pending handler, so a notification from
+  # the caddy role itself (a package or unit change) is applied here too rather
+  # than being left to compete with the checks that follow.
+  ansible.builtin.meta: flush_handlers
+
+- name: Confirm Caddy is active after the reload
+  # (e) A reload that took the service down is not a reload. This is separate
+  # from the listener check below because "the unit died" and "the unit is up
+  # but bound nothing" are different faults with different causes.
+  ansible.builtin.command:
+    argv: [systemctl, is-active, caddy]
+  register: caddy_active_state
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
+
+- name: Caddy must be active
+  ansible.builtin.assert:
+    that:
+      # `is-active` prints "inactive" for a dead unit, and "inactive" CONTAINS
+      # "active" — so this compares the whole trimmed line, never a substring.
+      - (caddy_active_state.stdout | default('') | trim) == 'active'
+    fail_msg: >-
+      INGRESS: caddy.service is
+      '{{ caddy_active_state.stdout | default('(no output)') | trim }}' after the
+      reload. The ingress change was applied to a service that is not running,
+      so nothing below can be reaching it. Check `journalctl -u caddy`.
+    quiet: true
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
+
+- name: Read the listeners on the ingress ports
+  # (f) `ss -H` so there is no header line to parse around, and the process
+  # column so the answer is "who owns these", not merely "something does".
+  ansible.builtin.command:
+    argv: [ss, -ltnpH]
+  register: caddy_listeners
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
+
+- name: Record who owns ports 80 and 443
+  ansible.builtin.set_fact:
+    caddy_ingress_lines: >-
+      {{ caddy_listeners.stdout_lines | default([])
+         | select('search', ':(80|443)\s') | list }}
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
+
+- name: Ports 80 and 443 must exist and belong to Caddy
+  ansible.builtin.assert:
+    that:
+      # Both ports present…
+      - caddy_ingress_lines | select('search', ':80\s') | list | length > 0
+      - caddy_ingress_lines | select('search', ':443\s') | list | length > 0
+      # …and every listener on them is caddy. A second process holding one of
+      # these is how a route silently stops being the one answering.
+      - caddy_ingress_lines | reject('search', '"caddy"') | list | length == 0
+    fail_msg: >-
+      INGRESS: ports 80/443 are not both held by Caddy after the reload.
+      ss reported:
+      {{ caddy_ingress_lines | default(['(nothing listening on 80 or 443)']) | join(' | ') }}
+      — a site that adapts and validates can still bind nothing, which is
+      exactly what a stale in-memory configuration looks like from outside.
+    quiet: true
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
+
+- name: Read the configuration Caddy currently has LOADED
+  # (5) FROM THE ADMIN API, not from the files. The whole defect was that the
+  # files were right and the running process had never read them, so anything
+  # derived from disk — `caddy adapt`, a `stat`, a `grep` of conf.d — would
+  # have reported success against a process serving something else.
+  #
+  # The endpoint is the loopback-only one roles/caddy configures
+  # (`admin localhost:2019`); this reads it from the host itself and exposes
+  # nothing. `uri` runs through the managed host's Python, so no curl needed.
+  ansible.builtin.uri:
+    url: "http://{{ caddy_admin_listen }}/config/"
+    method: GET
+    return_content: true
+    status_code: [200]
+  register: caddy_loaded_config
+  changed_when: false
+  check_mode: false
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
+
+- name: Publish the loaded configuration for the caller to assert on
+  # A string, so a caller can look for its own hostname without depending on
+  # where in the JSON structure Caddy happens to put it.
+  ansible.builtin.set_fact:
+    caddy_active_config_json: "{{ caddy_loaded_config.content | default('') | string }}"
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool
+
+- name: Note that ingress activation is deferred — no Caddy on this host
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: Caddy is not installed on this host, so there is no running
+      configuration to reload or inspect. A real run applies the drop-in and
+      proves the route is live before verifying anything over HTTPS.
+  when: not (caddy_can_be_executed_now | default(false) | bool)
+
+- name: Note that ingress activation is deferred — the reload was not performed
+  # A different deferral: Caddy IS here, and its running configuration is
+  # stale. A dry run reports that and changes nothing, so the listeners and
+  # routes it could ask about are still the stale ones. Asserting on them would
+  # fail for the one reason a dry run must never fail — that it correctly
+  # declined to act. The on-disk configuration was still validated above.
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: active listener and route verification is deferred to the
+      real run, because the reload that would make them true was reported
+      rather than performed.
+  when:
+    - caddy_can_be_executed_now | default(false) | bool
+    - not (caddy_active_state_verifiable | default(true) | bool)

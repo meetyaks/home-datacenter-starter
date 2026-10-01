@@ -1,0 +1,149 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# The Keel route. ONE FILE, AND ONLY THIS ONE.
+#
+# Caddy is owned by roles/caddy: the package, the service, the main Caddyfile
+# and the drop-in directory. This role writes `keel.caddy` into that directory
+# and asks for a reload. It does not create the directory, does not read or
+# write anyone else's drop-in, and never touches the main Caddyfile — a role
+# that reconfigured shared ingress would make every other site on this host a
+# hostage to a Keel deployment.
+#
+# The prerequisite is checked in PREFLIGHT, not here: by the time this runs the
+# source has been transferred, two images built and the stack started, and
+# discovering a missing ingress now would mean having spent all of it first.
+# That is exactly how a deployment ended healthy and unreachable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Confirm Caddy's drop-in directory exists
+  ansible.builtin.stat:
+    path: "{{ keel_caddy_sites_dir }}"
+  register: keel_caddy_dir
+  # Read-only, so it runs in every mode.
+  check_mode: false
+
+- name: Fail when the drop-in directory is missing
+  # Preflight already required the caddy role to have run in this play, so
+  # reaching here means it ran and the directory still is not there — a
+  # different and more surprising fault than "Caddy was never installed".
+  ansible.builtin.assert:
+    that:
+      - keel_caddy_dir.stat.exists | default(false)
+      - keel_caddy_dir.stat.isdir | default(false)
+    fail_msg: >-
+      {{ keel_caddy_sites_dir }} does not exist even though the caddy role
+      reported success in this play. Investigate roles/caddy — it owns that
+      directory — rather than working around it here.
+    quiet: true
+  # ⚠️ NOT IN CHECK MODE ON A HOST WITHOUT CADDY. Under `--check`, roles/caddy
+  # REPORTED this directory and created nothing, so asserting on it here would
+  # abort the dry run over an artifact that was only predicted — the same
+  # defect that had the caddy role run `caddy version` against a binary apt had
+  # merely promised. `caddy_artifacts_real` is roles/caddy stating which it is,
+  # rather than this role guessing from `ansible_check_mode`: in check mode
+  # against a host that ALREADY has Caddy the directory is real, and the
+  # assertion should still hold. (enforced: tests/run-caddy-check-mode.sh)
+  when: caddy_artifacts_real | default(true) | bool
+
+- name: Note that the route is deferred until Caddy exists
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: roles/caddy reported that it would install Caddy, so
+      {{ keel_caddy_sites_dir }} does not exist yet. A real run creates it
+      before this point, and the Keel route is written into it.
+  when: not (caddy_artifacts_real | default(true) | bool)
+
+- name: Create the Keel access log with the service account as owner
+  # ⚠️ THIS MUST COME BEFORE THE ROUTE IS VALIDATED, and it is not a detail.
+  #
+  # `caddy validate` runs as root here and, for a site with a `log` directive,
+  # OPENS the log file to check the writer — creating it 0600 root:root when it
+  # is absent. Caddy itself runs as the service account, so the next reload
+  # fails on a file root made a moment earlier:
+  #
+  #   loading new config: setting up custom log 'log0': opening log writer:
+  #   open /var/log/caddy/keel.dc1.lan.log: permission denied
+  #
+  # `caddy validate` reports "Valid configuration" throughout, because the
+  # composed config IS valid — it is the file ownership that is wrong. Creating
+  # the file as the service account first means root's validate opens an
+  # existing file and leaves its ownership alone.
+  # (enforced: tests/run-caddy-check-mode.sh "the reload succeeds on a first
+  #  deploy, with the site log writable by the service account")
+  ansible.builtin.file:
+    path: "{{ keel_caddy_log_dir }}/{{ keel_hostname }}.log"
+    state: touch
+    owner: "{{ caddy_service_user | default('caddy') }}"
+    group: "{{ caddy_service_group | default('caddy') }}"
+    mode: "0640"
+    # `touch` is otherwise reported changed on every run, which would make the
+    # role never idempotent.
+    modification_time: preserve
+    access_time: preserve
+  when: caddy_artifacts_real | default(true) | bool
+
+- name: Install the Keel route
+  # ATOMIC AND VALIDATED: `template` renders to a temporary file, runs
+  # `caddy validate` against it, and only moves it into place if that passes.
+  # A syntax error therefore never reaches the directory, so the next reload —
+  # by anyone, for any site — cannot trip over it.
+  #
+  # The handler validates the COMPOSED configuration again before reloading,
+  # because a file can be valid alone and still break the whole. Both checks
+  # leave the running service untouched when they fail.
+  ansible.builtin.template:
+    src: keel.caddy.j2
+    dest: "{{ keel_caddy_site_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    # The path roles/caddy published, not a bare `caddy` off PATH and not a
+    # second copy of the constant in this role's defaults. Ansible skips
+    # `validate:` under `--check` (measured), so a fresh-host dry run does not
+    # try to run it.
+    validate: "{{ caddy_binary_path | default('/usr/bin/caddy') }} validate --adapter caddyfile --config %s"
+  notify: Reload Caddy
+
+# ═══ APPLY IT NOW. DO NOT LEAVE THE RELOAD PENDING. ══════════════════════════
+#
+# Ansible runs handlers at the END of a play, so the notification above was
+# still pending when verify.yml ran a few tasks later. Not a theory — what
+# dc1-x86 did:
+#
+#   · Caddy v2.11.4 active; /etc/caddy/conf.d/keel.caddy present
+#   · `caddy validate` on those files: Valid configuration, HTTPS on :443
+#   · the RUNNING process's journal:
+#       No files matching import glob pattern /etc/caddy/conf.d/*.caddy
+#   · nothing listening on :80 or :443
+#
+# Caddy had loaded before the drop-in existed. Verification tested the old
+# in-memory configuration and failed — and because the play failed, the
+# pending handler never ran at all. The route never became active, while every
+# file on disk was correct and every file-based check would have passed.
+#
+# roles/caddy owns the sequence, because it owns the service. This role
+# notifies the canonical handler and asks the owner to apply and prove it; it
+# carries no reload command of its own.
+# (enforced: tests/run-caddy-handler-order.sh "the route is already live at
+#  verification time")
+- name: Apply the pending reload and prove Caddy is serving it
+  ansible.builtin.import_role:
+    name: caddy
+    tasks_from: reload-and-verify
+
+- name: The Keel route must be in the configuration Caddy has LOADED
+  # THE CLAIM NO FILE CHECK CAN MAKE. During the failure the drop-in was on
+  # disk and `caddy validate` passed; what was false was that the running
+  # process had ever read it. This asks the process.
+  ansible.builtin.assert:
+    that:
+      - keel_hostname in (caddy_active_config_json | default(''))
+    fail_msg: >-
+      INGRESS: {{ keel_hostname }} is not in the configuration Caddy currently
+      has LOADED, even though {{ keel_caddy_site_file }} is on disk and
+      validates. The reload did not take effect. Look for "No files matching
+      import glob pattern" in `journalctl -u caddy` — that line means Caddy
+      started before this drop-in existed and has not re-read it since.
+    success_msg: "INGRESS: {{ keel_hostname }} is live in Caddy's loaded configuration."
+    quiet: true
+  when: caddy_active_state_verifiable | default(caddy_can_be_executed_now | default(false)) | bool

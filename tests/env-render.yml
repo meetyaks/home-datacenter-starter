@@ -1,0 +1,96 @@
+---
+# Render roles/keel/templates/keel.env.j2 with the ROLE'S OWN DEFAULTS and assert
+# the auth posture it produces.
+#
+# ═══ WHY RENDER IT RATHER THAN GREP THE TEMPLATE ═════════════════════════════
+#
+# The posture is decided by a `{% if %}` over `keel_auth_methods`. Grepping the
+# template proves the lines exist; only rendering proves which ones survive. The
+# lab deployment's previous defect was exactly a variable whose value nobody
+# evaluated — a placeholder OIDC issuer that satisfied a non-empty check.
+#
+# The vault values below are OBVIOUS FAKES and never leave this file's temp
+# output. They exist because the template interpolates them; nothing here asserts
+# on them, and the rendered file is deleted at the end.
+- name: Render the deployment environment and assert its auth posture
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    keel_admin_dummy: "not-a-real-value-render-test"
+    # The ten vault names the template interpolates.
+    keel_vault_admin_db_password: "{{ keel_admin_dummy }}"
+    keel_vault_app_db_password: "{{ keel_admin_dummy }}"
+    keel_vault_blob_access_key: "{{ keel_admin_dummy }}"
+    keel_vault_blob_secret_key: "{{ keel_admin_dummy }}"
+    keel_vault_oidc_client_secret: "{{ keel_admin_dummy }}"
+    keel_vault_master_key: "{{ keel_admin_dummy }}"
+    keel_vault_mfa_master_key: "{{ keel_admin_dummy }}"
+    keel_vault_jwt_private_key: "{{ keel_admin_dummy }}"
+    keel_vault_jwt_public_key: "{{ keel_admin_dummy }}"
+    keel_vault_default_tenant_id: "00000000-0000-4000-8000-0000000000ff"
+    render_dest: "{{ lookup('env', 'KEEL_RENDER_DEST') | default('/tmp/keel-env-render.out', true) }}"
+
+  tasks:
+    # No `name:` — the defaults land at play scope, exactly as the role's own
+    # defaults do when it runs. Loading them into a namespace and then trying to
+    # splat that namespace into a task's `vars:` does not work: Ansible requires
+    # a literal dictionary there, not a templated one.
+    - name: Load the role's real defaults, so this asserts the shipped posture
+      ansible.builtin.include_vars:
+        file: ../roles/keel/defaults/main.yml
+
+    - name: Render the environment file exactly as the role would
+      ansible.builtin.template:
+        src: ../roles/keel/templates/keel.env.j2
+        dest: "{{ render_dest }}"
+        mode: "0600"
+
+    - name: Read it back
+      ansible.builtin.slurp:
+        src: "{{ render_dest }}"
+      register: rendered_raw
+
+    - name: Split into the lines that actually set a variable
+      ansible.builtin.set_fact:
+        setting_lines: >-
+          {{ (rendered_raw.content | b64decode).splitlines()
+             | reject('match', '^\s*#')
+             | reject('match', '^\s*$')
+             | list }}
+
+    - name: The posture must be password-only, registration closed, no OIDC
+      ansible.builtin.assert:
+        that:
+          # ── declared password-only ──
+          - "'KEEL_AUTH_METHODS=password' in setting_lines"
+          # ── self-registration closed ──
+          - "'KEEL_ALLOW_PUBLIC_REGISTRATION=false' in setting_lines"
+          # ── ZERO OIDC variables. Not "empty" — absent. An empty
+          #    KEEL_OIDC_ISSUER= would still be a set variable, and the
+          #    validator's self-referential check would have nothing to catch.
+          - setting_lines | select('match', '^KEEL_OIDC_') | list | length == 0
+          # ⚠️ KEEL_ENV IS NOT ASSERTED HERE, and an earlier draft wrongly did.
+          #    It is set by infra/lab/compose.lab.yml in the Keel repository, not
+          #    by this template, so asserting it here would have been this test
+          #    claiming ownership of a variable it does not render — the same
+          #    class of mistake as a docstring naming an enforcer that is not
+          #    there. The compose file is pinned by keel_commit and checked in
+          #    tests/run-enroll-admin-path.sh's sibling gate.
+        fail_msg: >-
+          rendered posture is wrong:
+          {{ setting_lines | select('match', '^KEEL_(AUTH_METHODS|ALLOW_PUBLIC_REGISTRATION|OIDC_)') | list }}
+        success_msg: >-
+          KEEL_AUTH_METHODS=password, KEEL_ALLOW_PUBLIC_REGISTRATION=false, and
+          {{ setting_lines | select('match', '^KEEL_OIDC_') | list | length }} KEEL_OIDC_* variables.
+
+    - name: Show the auth-relevant lines, for the record
+      ansible.builtin.debug:
+        msg: "{{ setting_lines | select('match', '^KEEL_(AUTH_METHODS|ALLOW_|OIDC_)') | list }}"
+
+    - name: Remove the rendered file
+      ansible.builtin.file:
+        path: "{{ render_dest }}"
+        state: absent

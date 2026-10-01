@@ -1,0 +1,14 @@
+---
+# The caddy role's OWN tasks, against a disposable Linux host.
+#
+# Imported by reference, never re-implemented: a harness that restated the role
+# would pass while the role stayed broken, which this repository has been bitten
+# by more than once.
+- name: Caddy role
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  roles:
+    - role: caddy

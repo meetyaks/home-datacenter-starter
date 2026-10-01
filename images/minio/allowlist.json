@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "THE SOURCE IDENTITY THIS REPOSITORY IS WILLING TO BUILD.",
+    "",
+    "The workflow resolves each upstream tag at build time and refuses to",
+    "continue unless it dereferences to exactly the commit named here. A git tag",
+    "is mutable — it can be moved, deleted and recreated against different code —",
+    "so 'we built the tag' is a weaker claim than it sounds. The commit is the",
+    "immutable identity, and this file is what makes the build assert it rather",
+    "than trust it.",
+    "",
+    "These commits are independently corroborated: the withdrawn upstream images,",
+    "while they were still pullable, reported exactly these values at runtime —",
+    "'minio version RELEASE.2024-09-22T00-33-43Z (commit-id=03e996320ebb...)' and",
+    "'mc version RELEASE.2024-09-16T17-43-14Z (commit-id=11ebe952ea30...)'. So a",
+    "build from these commits reproduces the releases that were withdrawn, rather",
+    "than merely something with the same version string.",
+    "",
+    "Changing anything here is a deliberate act: it changes what we publish under",
+    "our own name."
+  ],
+  "images": [
+    {
+      "image": "minio",
+      "upstream_repo": "minio/minio",
+      "upstream_url": "https://github.com/minio/minio",
+      "release_tag": "RELEASE.2024-09-22T00-33-43Z",
+      "source_commit": "03e996320ebb887112fb2a15c6f27936e5f124a0",
+      "license": "AGPL-3.0-or-later",
+      "dockerfile": "images/minio/Dockerfile.server",
+      "note": "Ships the mc client alongside the server, as the upstream image did. The lab stack's healthcheck is `mc ready local`, which runs inside this image."
+    },
+    {
+      "image": "minio-mc",
+      "upstream_repo": "minio/mc",
+      "upstream_url": "https://github.com/minio/mc",
+      "release_tag": "RELEASE.2024-09-16T17-43-14Z",
+      "source_commit": "11ebe952ea30e426e564f66e78d178465ae7c432",
+      "license": "AGPL-3.0-or-later",
+      "dockerfile": "images/minio/Dockerfile.client",
+      "note": "The client on its own, for the one-shot bucket initialiser."
+    }
+  ],
+  "base_images": {
+    "_comment": "Pinned by digest so a rebuild resolves the same bytes. The builder is Debian-based and supplies the CA bundle the final stage copies; the runtime is Alpine because the stack's healthcheck is a CMD-SHELL and a distroless image has no shell.",
+    "builder": "golang:1.22-bookworm@sha256:3d699e4d15d0f8f13c9195c0632a16702b8cbdece2955af1c23b37ae5d55a253",
+    "runtime": "alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+  }
+}

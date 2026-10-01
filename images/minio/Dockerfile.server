@@ -1,0 +1,132 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MinIO server, built from upstream source — first-party, not a copy.
+#
+# Upstream withdrew minio/minio and minio/mc from every public registry, and
+# withdrew the binaries too (dl.min.io answers HTTP 410 GONE). The SOURCE is
+# still public, so this rebuilds the exact releases from their exact commits
+# rather than mirroring bytes we can no longer obtain.
+#
+# ⚠️ THE mc CLIENT IS INSTALLED HERE ON PURPOSE. The upstream server image
+# carried it, and the lab stack's healthcheck is `mc ready local`, which runs
+# INSIDE this container. An image with only the server binary would pass every
+# static check and then never become healthy.
+#
+# REPRODUCIBILITY. Both base images are pinned by digest. The source arrives
+# through the BUILD CONTEXT at an exact commit — nothing is cloned or downloaded
+# here — and the final stage downloads nothing at all: every file in it is
+# COPY --from an earlier stage. `-trimpath` and an explicit `-ldflags` drop the
+# build's local paths from the binary.
+#
+# LICENSING. Upstream is AGPL-3.0-or-later. The licence and notices travel with
+# the image under /licenses, and CORRESPONDING_SOURCE records where the source
+# and the recipe that built it can be obtained. See images/minio/README.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARG BUILDER=golang:1.22-bookworm@sha256:3d699e4d15d0f8f13c9195c0632a16702b8cbdece2955af1c23b37ae5d55a253
+ARG RUNTIME=alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+
+# ── Build the server ────────────────────────────────────────────────────────
+#
+# ⚠️ `--platform=$BUILDPLATFORM` — the builder runs on the MACHINE'S OWN
+# architecture and cross-compiles to the target. Go does this natively and it is
+# the difference between a build that works anywhere and one that needs
+# emulation: pinning the builder to the target platform makes the Go COMPILER
+# itself run under QEMU, where it crashes outright (a register dump, not a
+# compile error). That cost a local validation run before it was understood.
+FROM --platform=$BUILDPLATFORM ${BUILDER} AS build-minio
+
+ARG MINIO_RELEASE
+ARG MINIO_COMMIT
+# Supplied by BuildKit from the requested --platform.
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY src/minio/ /src/
+
+# CGO off so the result is static and runs on a musl base unchanged.
+# The version/commit ldflags are the same symbols upstream sets, so
+# `minio --version` reports the real release rather than "DEVELOPMENT".
+ENV CGO_ENABLED=0 GOFLAGS=-mod=mod
+RUN set -eux; \
+    export GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}"; \
+    LDF="-s -w"; \
+    LDF="$LDF -X github.com/minio/minio/cmd.Version=${MINIO_RELEASE}"; \
+    LDF="$LDF -X github.com/minio/minio/cmd.ReleaseTag=${MINIO_RELEASE}"; \
+    LDF="$LDF -X github.com/minio/minio/cmd.CommitID=${MINIO_COMMIT}"; \
+    go build -trimpath -ldflags "$LDF" -o /out/minio .
+
+# ── Build the client that ships beside it ───────────────────────────────────
+FROM --platform=$BUILDPLATFORM ${BUILDER} AS build-mc
+
+ARG MC_RELEASE
+ARG MC_COMMIT
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY src/mc/ /src/
+
+ENV CGO_ENABLED=0 GOFLAGS=-mod=mod
+RUN set -eux; \
+    export GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}"; \
+    LDF="-s -w"; \
+    LDF="$LDF -X github.com/minio/mc/cmd.Version=${MC_RELEASE}"; \
+    LDF="$LDF -X github.com/minio/mc/cmd.ReleaseTag=${MC_RELEASE}"; \
+    LDF="$LDF -X github.com/minio/mc/cmd.CommitID=${MC_COMMIT}"; \
+    go build -trimpath -ldflags "$LDF" -o /out/mc .
+
+# ── The image ───────────────────────────────────────────────────────────────
+FROM ${RUNTIME}
+
+ARG MINIO_RELEASE
+ARG MINIO_COMMIT
+ARG MC_RELEASE
+ARG MC_COMMIT
+ARG SOURCE_REPO_URL
+ARG BUILD_REPO_URL
+ARG BUILD_RUN_URL
+
+# The CA bundle comes from the builder rather than `apk add`, so this stage
+# fetches nothing and cannot drift between builds.
+COPY --from=build-minio /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+COPY --from=build-minio /out/minio /usr/bin/minio
+COPY --from=build-mc    /out/mc    /usr/bin/mc
+
+# AGPL: the licence and notices travel with the binary.
+COPY --from=build-minio /src/LICENSE /licenses/minio/LICENSE
+COPY --from=build-mc    /src/LICENSE /licenses/mc/LICENSE
+
+RUN printf '%s\n' \
+  "These images are built from unmodified upstream source." \
+  "" \
+  "minio    ${MINIO_RELEASE}  commit ${MINIO_COMMIT}" \
+  "mc       ${MC_RELEASE}  commit ${MC_COMMIT}" \
+  "" \
+  "Upstream source: ${SOURCE_REPO_URL}" \
+  "Build recipe:    ${BUILD_REPO_URL}" \
+  "Build run:       ${BUILD_RUN_URL}" \
+  "" \
+  "Both programs are licensed AGPL-3.0-or-later; their licences are under" \
+  "/licenses. The corresponding source is the upstream repository at the" \
+  "commits above, and the complete scripts controlling this build are in the" \
+  "build recipe repository above, which is public." \
+  > /licenses/CORRESPONDING_SOURCE.txt
+
+# MinIO writes to /data, which the stack bind-mounts. Root, as upstream's image
+# ran: the host directory is root-owned and a non-root default would be unable
+# to write to it.
+VOLUME /data
+EXPOSE 9000
+
+ENTRYPOINT ["/usr/bin/minio"]
+CMD ["server", "/data"]
+
+LABEL org.opencontainers.image.title="minio" \
+      org.opencontainers.image.description="MinIO server, built from upstream source at a pinned commit" \
+      org.opencontainers.image.version="${MINIO_RELEASE}" \
+      org.opencontainers.image.revision="${MINIO_COMMIT}" \
+      org.opencontainers.image.source="${BUILD_REPO_URL}" \
+      org.opencontainers.image.url="${SOURCE_REPO_URL}" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"

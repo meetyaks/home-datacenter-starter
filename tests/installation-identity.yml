@@ -1,0 +1,284 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION TEST — the installation's permanent tenant identity is validated.
+#
+#   ansible-playbook tests/installation-identity.yml
+#
+# ═══ WHAT THIS IS ABOUT ══════════════════════════════════════════════════════
+#
+# `KEEL_DEFAULT_TENANT_ID` used to be a literal UUID committed in the lab Compose
+# file. That is permanent installation identity with two defects at once:
+#
+#   REUSABLE   two installations deployed from the same repository would seed
+#              their initial tenant at the SAME id
+#   DEFAULTED  a stack could start having quietly invented its own permanent
+#              identity, which is the one decision a deployment must never make
+#              by omission
+#
+# It is now `keel_vault_default_tenant_id`, supplied per installation from the
+# encrypted vault and validated in preflight BEFORE anything is written. It
+# cannot be corrected later: bootstrap keys every row the tenant owns to it, so a
+# wrong value orphans that data, and a restore under a different value reads as
+# an empty tenant — silently, with no error.
+#
+# ═══ HOW A NEGATIVE CASE REPORTS FAILURE ═════════════════════════════════════
+#
+# ⚠️ NOT with a `fail` inside the `block`. That is the obvious shape and it does
+# not work: the rescue catches the `fail` too, prints "PASS", and the case
+# becomes incapable of failing. Seven cases across this repository's other
+# suites were written that way and were silently inert.
+#
+# Instead a case that WRONGLY PASSES records itself in `identity_leaks` with
+# `set_fact` — which does not raise, so the rescue is not entered — and a single
+# assertion at the end fails on a non-empty list. The rescue then means exactly
+# one thing: the gate rejected the value, as it must.
+#
+# ═══ THE CASES ═══════════════════════════════════════════════════════════════
+#
+#   undefined            → refused   the variable simply absent
+#   empty                → refused   defined but blank
+#   uppercase            → refused   not canonical; will not compare equal later
+#   nil UUID             → refused   all zeroes
+#   zero-run sentinel    → refused   the shape examples and dummies get copied as
+#   obvious placeholder  → refused   11111111-…, deadbeef-…
+#   a real UUID          → ACCEPTED  the control; without it a gate that refused
+#                                    everything would pass all six negatives
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Regression — installation identity gate
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    # The role's own rules, from roles/keel/tasks/preflight.yml. Restating them
+    # loosely here would let this suite pass while the role rejected a value it
+    # accepts, or the reverse.
+    keel_uuid_pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    # Eight consecutive zeros. A randomly generated UUID essentially never has a
+    # run that long; every sentinel and dummy in this repository does. This
+    # catches the nil UUID, `00000000-0000-4000-8000-000000000001`, and
+    # `0e0f5a10-0000-4000-8000-0000000000dc` alike, without trying to enumerate
+    # them.
+    keel_zero_run: '0{8}'
+    keel_placeholder_prefix: '^(11111111|12345678|deadbeef|abcdefab)-'
+
+  tasks:
+    - name: Start with no recorded leaks
+      ansible.builtin.set_fact:
+        identity_leaks: []
+
+    # ── Negative cases ──────────────────────────────────────────────────────
+
+    - name: Case — an UNDEFINED identity is refused
+      block:
+        - name: Gate with no value at all
+          ansible.builtin.assert:
+            that:
+              - keel_vault_default_tenant_id is defined
+              - (keel_vault_default_tenant_id | default('') | trim) | length > 0
+              - (keel_vault_default_tenant_id | default('') | trim) is match(keel_uuid_pattern)
+            quiet: true
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            identity_leaks: "{{ identity_leaks + ['undefined'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — an undefined identity is refused.
+
+    - name: Case — an EMPTY identity is refused
+      block:
+        - name: Gate with an empty value
+          ansible.builtin.assert:
+            that:
+              - keel_vault_default_tenant_id is defined
+              - (keel_vault_default_tenant_id | default('') | trim) | length > 0
+              - (keel_vault_default_tenant_id | default('') | trim) is match(keel_uuid_pattern)
+            quiet: true
+          vars:
+            keel_vault_default_tenant_id: ""
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            identity_leaks: "{{ identity_leaks + ['empty'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — an empty identity is refused.
+
+    - name: Case — an UPPERCASE UUID is refused
+      block:
+        - name: Gate with a non-canonical value
+          ansible.builtin.assert:
+            that:
+              - (keel_vault_default_tenant_id | default('') | trim) is match(keel_uuid_pattern)
+            quiet: true
+          vars:
+            # What `uuidgen` prints on macOS without the `tr` in the runbook.
+            keel_vault_default_tenant_id: "3F2A1B4C-5D6E-4F70-8A9B-0C1D2E3F4A5B"
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            identity_leaks: "{{ identity_leaks + ['uppercase'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — an uppercase UUID is refused.
+
+    - name: Case — the NIL UUID is refused
+      block:
+        - name: Gate with all zeroes
+          ansible.builtin.assert:
+            that:
+              - (keel_vault_default_tenant_id | default('') | trim) != '00000000-0000-0000-0000-000000000000'
+              - not ((keel_vault_default_tenant_id | default('') | trim) is search(keel_zero_run))
+            quiet: true
+          vars:
+            keel_vault_default_tenant_id: "00000000-0000-0000-0000-000000000000"
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            identity_leaks: "{{ identity_leaks + ['nil uuid'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — the nil UUID is refused.
+
+    - name: Case — a zero-run SENTINEL is refused
+      block:
+        - name: Gate with a sentinel-shaped value
+          ansible.builtin.assert:
+            that:
+              - not ((keel_vault_default_tenant_id | default('') | trim) is search(keel_zero_run))
+            quiet: true
+          vars:
+            # The exact dummy the compose-check scripts export for rendering. If
+            # one of those ever reached a vault, it must not deploy.
+            keel_vault_default_tenant_id: "00000000-0000-4000-8000-000000000001"
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            identity_leaks: "{{ identity_leaks + ['zero-run sentinel'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — a zero-run sentinel is refused.
+
+    - name: Case — an obvious PLACEHOLDER is refused
+      block:
+        - name: Gate with a placeholder
+          ansible.builtin.assert:
+            that:
+              - not ((keel_vault_default_tenant_id | default('') | trim) is search(keel_placeholder_prefix))
+            quiet: true
+          vars:
+            keel_vault_default_tenant_id: "deadbeef-5d6e-4f70-8a9b-0c1d2e3f4a5b"
+        - name: Record the leak
+          ansible.builtin.set_fact:
+            identity_leaks: "{{ identity_leaks + ['placeholder'] }}"
+      rescue:
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — an obvious placeholder is refused.
+
+    # ── The control ─────────────────────────────────────────────────────────
+
+    - name: Case — a REAL per-installation UUID is accepted
+      block:
+        - name: Gate with a well-formed, non-sentinel value
+          ansible.builtin.assert:
+            that:
+              - keel_vault_default_tenant_id is defined
+              - (keel_vault_default_tenant_id | default('') | trim) | length > 0
+              - (keel_vault_default_tenant_id | default('') | trim) is match(keel_uuid_pattern)
+              - (keel_vault_default_tenant_id | default('') | trim) != '00000000-0000-0000-0000-000000000000'
+              - not ((keel_vault_default_tenant_id | default('') | trim) is search(keel_zero_run))
+              - not ((keel_vault_default_tenant_id | default('') | trim) is search(keel_placeholder_prefix))
+            quiet: true
+          vars:
+            # A fixture, not this or any other installation's identity.
+            keel_vault_default_tenant_id: "3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b"
+        - name: Case passed
+          ansible.builtin.debug:
+            msg: PASS — a real per-installation UUID is accepted.
+      rescue:
+        # HERE the `fail` belongs in the rescue: for a positive case the rescue
+        # means the gate wrongly REFUSED, which is the failure.
+        - name: Case FAILED
+          ansible.builtin.fail:
+            msg: >-
+              REGRESSION: a valid UUID was REJECTED. Without this control a gate
+              that refused everything would pass all six negative cases and look
+              correct.
+
+    - name: No invalid identity may have been accepted
+      # The single place a negative case can fail the play. Anything recorded
+      # above got through a gate that should have stopped it.
+      ansible.builtin.assert:
+        that:
+          - (identity_leaks | default([])) | length == 0
+        fail_msg: >-
+          REGRESSION: {{ (identity_leaks | default([])) | length }} invalid
+          identity value(s) were ACCEPTED —
+          {{ (identity_leaks | default([])) | join(', ') }}. Each of these is a
+          value nobody chose, and accepting one means an installation can be
+          bootstrapped at an identity shared with every other installation that
+          copied it.
+        success_msg: Every invalid identity was refused.
+        quiet: true
+
+    # ── And the repository must carry no reusable value ─────────────────────
+
+    - name: Check the role defaults for a tenant identity
+      ansible.builtin.shell:
+        cmd: >-
+          grep -cE '^[[:space:]]*keel(_vault)?_default_tenant_id[[:space:]]*:'
+          roles/keel/defaults/main.yml || true
+        chdir: "{{ playbook_dir }}/.."
+      register: keel_default_decl
+      changed_when: false
+      failed_when: false
+
+    - name: The role must define no default identity
+      ansible.builtin.assert:
+        that:
+          - (keel_default_decl.stdout | default('0') | trim | int) == 0
+        fail_msg: >-
+          roles/keel/defaults/main.yml declares a tenant identity. A default here
+          is reusable across installations and lets a deploy proceed without the
+          operator ever choosing one. It must come from the vault, and absence
+          must stop the run.
+        success_msg: >-
+          No default tenant identity in role defaults — it can only come from the
+          vault.
+
+    - name: Check the committed vault example carries the name but no value
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          grep -E '^keel_vault_default_tenant_id:'
+          inventory/group_vars/linux_servers/vault.yml.example
+        executable: /bin/bash
+        chdir: "{{ playbook_dir }}/.."
+      register: keel_example_decl
+      changed_when: false
+      failed_when: false
+
+    - name: The example must name it and leave it empty
+      ansible.builtin.assert:
+        that:
+          - (keel_example_decl.rc | default(1)) == 0
+          - (keel_example_decl.stdout | default('')) is search('keel_vault_default_tenant_id:\s*""\s*$')
+        fail_msg: >-
+          inventory/group_vars/linux_servers/vault.yml.example must declare
+          keel_vault_default_tenant_id with an EMPTY value. A usable sample there
+          would be copied, and every installation that copied it would share one
+          tenant identity. Found:
+          {{ keel_example_decl.stdout | default('(absent)') | trim }}
+        success_msg: >-
+          The vault example names the variable and supplies no value.
+
+    - name: All installation-identity cases passed
+      ansible.builtin.debug:
+        msg: >-
+          PASS — undefined, empty, uppercase, nil, sentinel and placeholder
+          identities are all refused; a real one is accepted; the role carries no
+          default; and the committed example names it without a value.
