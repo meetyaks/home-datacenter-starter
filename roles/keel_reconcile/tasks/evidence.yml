@@ -49,23 +49,68 @@
     group: "{{ keel_group }}"
     mode: "0640"
 
+# ⚠️ `| default('')` AND A GUARD, BECAUSE THIS RUNS IN A RESCUE AND MUST NOT
+# ADD A FAILURE OF ITS OWN. `keel_compose_cmd` belongs to roles/keel, whose
+# defaults go out of scope the moment its include returns — so if the
+# deployment failed BEFORE or DURING that include, it is simply not defined
+# here.
+#
+# That is not hypothetical: the first real reconcile failed in roles/keel's
+# preflight, and then this task died with `'keel_compose_cmd' is undefined`.
+# The collector whose entire job is preserving the state of a failed run
+# destroyed the record of why it failed, and replaced the real error with
+# its own.
+#
+# It cannot be anchored the way keel_root and keel_owner are: it is itself a
+# template over keel_env_file, keel_compose_file and keel_oidc_selected, so
+# rendering it outside the role fails two layers deeper. Degrading is the
+# honest answer — capture what we can, and SAY what we could not.
+- name: Note whether the compose command is even known here
+  ansible.builtin.set_fact:
+    keel_reconcile_compose_known: "{{ (keel_compose_cmd | default('') | trim) | length > 0 }}"
+
 - name: Capture container state
   ansible.builtin.shell:
     cmd: >-
-      {{ keel_compose_cmd }} ps --all
+      {{ keel_compose_cmd | default('') }} ps --all
       > {{ keel_reconcile_evidence_run_dir }}/compose-ps.txt 2>&1
   changed_when: true
   failed_when: false
+  when: keel_reconcile_compose_known | bool
 
 - name: Capture recent logs per service
   # `failed_when: false` throughout — this runs in a rescue, and evidence
   # collection that can itself fail would replace the real error with its own.
   ansible.builtin.shell:
     cmd: >-
-      {{ keel_compose_cmd }} logs --no-color --tail {{ keel_diagnostic_log_lines }}
+      {{ keel_compose_cmd | default('') }} logs --no-color
+      --tail {{ keel_diagnostic_log_lines | default(80) }}
       > {{ keel_reconcile_evidence_run_dir }}/compose-logs.txt 2>&1
   changed_when: true
   failed_when: false
+  when: keel_reconcile_compose_known | bool
+
+- name: Say so in the evidence when container state could not be captured
+  # ⚠️ A FILE, NOT JUST A SKIPPED TASK. Somebody reading this directory
+  # months later has to be able to tell "the containers were fine" from
+  # "nobody looked" — an absent compose-ps.txt alone cannot say which.
+  ansible.builtin.copy:
+    content: |
+      Container state and logs were NOT captured for this failure.
+
+      The deployment failed before roles/keel had defined its compose
+      command — typically in preflight, before any container was touched.
+      There was therefore nothing running that this release had started,
+      and no compose project to query.
+
+      Look at the Ansible output for the originating failure; the attempt
+      record beside this file names the release and the policy in force.
+    dest: "{{ keel_reconcile_evidence_run_dir }}/compose-ps.txt"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0640"
+  failed_when: false
+  when: not (keel_reconcile_compose_known | bool)
 
 - name: Record the images the host actually holds for this release
   ansible.builtin.shell:
