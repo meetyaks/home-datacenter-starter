@@ -189,6 +189,26 @@
     # What stays here is the boundary this role owns: the reconciler itself
     # must not become a second scheduler.
 
+    - name: Read the deployer's own defaults, to learn which names it owns
+      ansible.builtin.slurp:
+        src: ../roles/keel/defaults/main.yml
+      register: deployer_defaults_raw
+
+    - name: Work out which of them this role actually interpolates
+      # ⚠️ COMMENTS STRIPPED FIRST. `keel_hostname` appears only in a comment
+      # explaining why include_vars is namespaced; counting that would
+      # demand an anchor for a variable the role never reads.
+      ansible.builtin.set_fact:
+        reconcile_code: "{{ reconcile_text | regex_replace('(?m)^\\s*#.*$', '') }}"
+        deployer_vars: >-
+          {{ (deployer_defaults_raw.content | b64decode)
+             | regex_findall('(?m)^(keel_[a-z0-9_]+):')
+             | select('in', reconcile_text) | list }}
+
+    - name: Say which ones are in play
+      ansible.builtin.debug:
+        msg: "{{ deployer_vars | length }} deployer variable(s) reachable from this role: {{ deployer_vars | join(', ') }}"
+
     - name: EVERY DEPLOYER VARIABLE IT USES IS ANCHORED BEFORE USE
       # ⚠️ THIS CHECK EXISTS BECAUSE A REAL DEPLOYMENT FAILED ON IT. The role
       # creates its state directories under `keel_root` BEFORE it includes
@@ -203,17 +223,31 @@
       # task from the lock onwards is invisible to --check, and a green dry
       # run is NOT evidence that a real run reaches the end. A structural
       # check is the only thing that covers that window without a host.
+      # ⚠️ THE SET IS COMPUTED, NOT LISTED. A hand-written list is what let
+      # this bite twice: the first fix named keel_owner and keel_group, and
+      # the very next run died on keel_compose_cmd — which was not on the
+      # list, because the list was written from the failure rather than from
+      # the code. This reads roles/keel's own defaults, intersects them with
+      # what the reconciler actually interpolates, and checks every one.
       ansible.builtin.assert:
         that:
-          - reconcile_text is search('keel_' ~ item ~ ':\s*"\{\{ keel_' ~ item ~ ' \| default\(keel_layout')
+          # Anchored from the layout, OR never used bare — `{{ x }}` with no
+          # `| default(...)` is the only form that can explode at runtime.
+          - (reconcile_text is search('    ' ~ item ~ ':\s*>?-?\s*"?\{\{ ' ~ item ~ ' \| default\(keel_layout'))
+            or (not (reconcile_code is search(item ~ '\s*\}\}')))
         fail_msg: >-
-          roles/keel_reconcile uses `keel_{{ item }}` but never anchors it
-          from keel_layout. It is a roles/keel default, and this role touches
-          it BEFORE including that role — so at runtime it is undefined, and
-          the run dies partway with "'keel_{{ item }}' is undefined" after
-          the decision has already been made.
-        success_msg: "keel_{{ item }} is anchored from the deployer's layout."
-      loop: [root, source_repo, owner, group]
+          roles/keel_reconcile interpolates `{{ '{{' }} {{ item }} {{ '}}' }}`
+          bare, but never anchors it from keel_layout.
+          It is a roles/keel default, and this role uses it OUTSIDE the
+          include of that role — before it on the way in, or in the rescue
+          path on the way out, where an included role's defaults have already
+          gone out of scope. At runtime it is undefined and the run dies with
+          "'{{ item }}' is undefined".
+          Either anchor it beside keel_root, or give every use a default().
+        success_msg: "{{ item }}: anchored, or never used bare."
+      loop: "{{ deployer_vars }}"
+      loop_control:
+        label: "{{ item }}"
 
     - name: The reconcile role does not schedule itself
       # A role that installed its own timer, plist or cron entry would be a

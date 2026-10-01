@@ -57,6 +57,16 @@
     keel_source_repo: "{{ keel_source_repo | default(keel_layout.keel_source_repo, true) }}"
     keel_owner: "{{ keel_owner | default(keel_layout.keel_owner, true) }}"
     keel_group: "{{ keel_group | default(keel_layout.keel_group, true) }}"
+    # ⚠️ NEEDED BY THE FAILURE PATH, WHICH IS WHY THEY WERE MISSED TWICE.
+    # tasks/evidence.yml runs in the rescue of the deploy block — AFTER
+    # `include_role: keel` has returned — and an included role's defaults go
+    # out of scope when it does. So the evidence collector could not see
+    # them, and the first real deployment failed to record WHY it had
+    # failed: `'keel_compose_cmd' is undefined`, losing the container state
+    # and logs for the very run that needed them.
+    keel_compose_cmd: "{{ keel_compose_cmd | default(keel_layout.keel_compose_cmd, true) }}"
+    keel_diagnostic_log_lines: >-
+      {{ keel_diagnostic_log_lines | default(keel_layout.keel_diagnostic_log_lines, true) }}
 
 # ── 1. CAN THIS CONTROLLER READ THE CHANNEL AT ALL? ─────────────────────────
 #
