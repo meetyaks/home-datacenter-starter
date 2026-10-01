@@ -286,6 +286,44 @@ fi
 
 # ── 6. THE WRAPPER'S CONFIGURATION ──────────────────────────────────────────
 #
+# ⚠️ RESOLVING ansible-playbook UNDER sudo IS NOT `command -v`. This script
+# runs as root, and sudo sanitises PATH — on a Mac where Ansible came from
+# Homebrew, /opt/homebrew/bin is simply not in it. The first version wrote
+#
+#     KEEL_ANSIBLE_PLAYBOOK=$(command -v ansible-playbook || echo /usr/local/bin/ansible-playbook)
+#
+# which, on exactly that machine, recorded /usr/local/bin/ansible-playbook —
+# A PATH THAT DOES NOT EXIST THERE. The wrapper would then refuse with "no
+# executable ansible-playbook at …", on a console where `ansible-playbook`
+# works perfectly from a login shell. Found on dc1-arm-1, where Ansible is
+# at /opt/homebrew/bin and the file said /usr/local/bin.
+#
+# So: ask the invoking user's environment first — they are the one who has
+# it on PATH — then the known locations, and never write a path that is not
+# executable.
+resolve_ansible_playbook() {
+  candidate=$(command -v ansible-playbook 2>/dev/null || true)
+  if [ -z "$candidate" ] && [ -n "${SUDO_USER:-}" ]; then
+    candidate=$(sudo -u "$SUDO_USER" -i sh -lc 'command -v ansible-playbook' 2>/dev/null || true)
+  fi
+  if [ -z "$candidate" ]; then
+    for c in /opt/homebrew/bin/ansible-playbook \
+             /usr/local/bin/ansible-playbook \
+             /usr/bin/ansible-playbook; do
+      [ -x "$c" ] && candidate="$c" && break
+    done
+  fi
+  printf '%s' "$candidate"
+}
+ANSIBLE_PLAYBOOK_PATH=$(resolve_ansible_playbook)
+if [ -z "$ANSIBLE_PLAYBOOK_PATH" ] || [ ! -x "$ANSIBLE_PLAYBOOK_PATH" ]; then
+  die "cannot find an executable ansible-playbook on this console.
+          Install Ansible, then re-run. Writing a path that does not exist
+          would make the wrapper refuse later with a message about the
+          wrapper rather than about Ansible."
+fi
+
+#
 # ⚠️ PATHS ONLY. No token, no passphrase. bin/keel-reconcile-dev sources this,
 # so a value here would end up in a world-readable file for no reason — every
 # secret reaches Ansible through the vault instead.
@@ -299,7 +337,7 @@ elif act; then
     echo "# never a token, never a passphrase: this file is world-readable."
     echo "KEEL_CHECKOUT=$CHECKOUT"
     echo "KEEL_VAULT_PASSWORD_FILE=$VAULT_PASS"
-    echo "KEEL_ANSIBLE_PLAYBOOK=$(command -v ansible-playbook || echo /usr/local/bin/ansible-playbook)"
+    echo "KEEL_ANSIBLE_PLAYBOOK=$ANSIBLE_PLAYBOOK_PATH"
     echo "KEEL_RECONCILE_LOG=$LOG_DIR/reconcile-dev.log"
   } > "$staged"
   install -o root -g wheel -m 0644 "$staged" "$RECONCILE_CONF"
