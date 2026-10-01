@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ NOT THE DEV SCHEDULER. THE DEV CONSOLE RUNS macOS.
+#
+# The administration console is a Mac mini: /bin/launchctl, and no systemctl
+# at all. This unit was written before anybody checked, and installing it
+# there is not possible. The scheduler the DEV path actually uses is
+#
+#     roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist
+#
+# This file is kept, unused, as the variant for a FUTURE Linux controller. It
+# is retained rather than deleted because a Linux console is a plausible next
+# step and the hardening below is worth not re-deriving — but nothing in the
+# DEV path references it, and tests/controller-scheduler.yml fails if the
+# documentation starts claiming it operates on macOS.
+#
+# ⚠️ IT CALLS THE WRAPPER, EXACTLY AS THE PLIST DOES. The inventory, the vault
+# path, the timeout and the concurrency rule live in bin/keel-reconcile-dev
+# and nowhere else. If this ever becomes the live scheduler, it must not grow
+# its own copy of them — two schedulers with two policies is the drift this
+# arrangement exists to prevent.
+#
+# ⚠️ NOT INSTALLED BY THIS REPOSITORY, and NOT ON A CI RUNNER. CI decides
+# eligibility; a site decides when to deploy.
+# ─────────────────────────────────────────────────────────────────────────────
+[Unit]
+Description=Reconcile the Keel DEV site to its release channel (Linux controller variant — UNUSED)
+Documentation=https://github.com/meetyaks/home-datacenter-starter/blob/main/docs/keel-dev-reconcile.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# ⚠️ THESE TWO ARE PLACEHOLDERS, NOT OBSERVED VALUES. No Linux console
+# exists, so there is no real account and no real checkout path to put here.
+# The launchd variant solved this by becoming a template the bootstrap
+# renders; if this file ever goes live it must do the same, because a plausible
+# constant is how the macOS plist came to name a directory that was not there.
+User=keeladmin
+WorkingDirectory=/opt/home-datacenter-starter
+
+# Paths only. No token, no passphrase, no key material — a unit file is
+# world-readable and `systemctl show` prints its environment.
+Environment=KEEL_CHECKOUT=/opt/home-datacenter-starter
+Environment=KEEL_RECONCILE_CONF=/etc/keel/reconcile.conf
+
+ExecStart=/opt/home-datacenter-starter/bin/keel-reconcile-dev
+
+# ⚠️ NO Restart=. The role's attempt ledger bounds retries with state that
+# survives a reboot; a restart loop on top of it would defeat that bound and
+# hammer the site.
+Restart=no
+
+# The backstop, above the wrapper's own 3000s ceiling. This bounds a wrapper
+# that wedged before starting Ansible, not the Ansible run itself.
+TimeoutStartSec=3600
+
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp /var/log/keel /var/run
+NoNewPrivileges=false

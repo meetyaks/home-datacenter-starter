@@ -1,0 +1,145 @@
+---
+# One case for tests/release-contract.yml. Writes the fixture, runs the ROLE'S
+# OWN tasks/release.yml against it, and records whether it was accepted.
+#
+# ⚠️ IT RUNS THE ROLE'S TASKS. Nothing here re-implements a single assertion —
+# a harness carrying its own copy of the contract would pass against a contract
+# the role does not have, which is the failure mode this repository has already
+# had once.
+
+- name: "{{ case.name }} — write the fixture"
+  ansible.builtin.copy:
+    content: "{{ case.manifest | to_nice_json(indent=2) }}\n"
+    dest: "{{ case_file }}"
+    mode: "0644"
+
+# ⚠️ A RECORDING STUB FOR `gh`, AND IT IS EVIDENCE, NOT A WORKAROUND.
+#
+# A `persisted` fixture cannot be verified offline — its digests were never
+# published, so the real `gh attestation verify` exits non-zero and the role
+# correctly refuses. Stubbing `gh` lets the ACCEPTANCE path be tested; and
+# because the stub LOGS every invocation, the same mechanism proves the two
+# claims that matter most:
+#
+#   · a persisted release DOES reach attestation verification
+#   · an unavailable release NEVER does
+#
+# Those are asserted below from the log, so "we skipped verification" cannot
+# pass as "we verified".
+- name: "{{ case.name }} — reset the gh invocation log"
+  ansible.builtin.copy:
+    content: ""
+    dest: "{{ gh_log }}"
+    mode: "0644"
+
+- name: "{{ case.name }} — run the role's own release resolution"
+  block:
+    - name: "{{ case.name }} — include tasks/release.yml"
+      ansible.builtin.include_tasks: ../roles/keel/tasks/release.yml
+      args:
+        apply:
+          environment:
+            PATH: "{{ gh_stub_dir }}:{{ lookup('env', 'PATH') }}"
+      vars:
+        keel_release_manifest_file: "{{ case_file }}"
+        # ⚠️ EACH CASE STATES ITS OWN POLICY — THERE IS NO "TURN VERIFICATION
+        # OFF" ANY MORE. The retired boolean let a fixture skip every check;
+        # now a fixture must pick one of the two real policies and satisfy
+        # that policy's contract in full. A case that wants to be accepted
+        # offline declares `allow_unavailable` AND supplies a complete
+        # `unavailable` provenance statement — reason, mechanism `none`, SBOM
+        # identity — exactly as a real release must.
+        keel_release_provenance_policy: "{{ case.policy | default('allow_unavailable') }}"
+
+    - name: "{{ case.name }} — it was accepted"
+      ansible.builtin.set_fact:
+        case_result: accepted
+        case_error: ""
+
+  rescue:
+    - name: "{{ case.name }} — it was refused"
+      # ⚠️ A LOOPED TASK'S OWN `msg` IS "One or more items failed", NOT the
+      # reason. The per-item messages are in `.results`, and they are the whole
+      # point of checking WHY a fixture was refused — without them this suite
+      # would accept any refusal at all as a pass.
+      ansible.builtin.set_fact:
+        case_result: refused
+        case_error: >-
+          {{ (ansible_failed_result.msg | default('')) ~ ' | ' ~
+             (ansible_failed_result.results | default([])
+              | selectattr('failed', 'defined') | selectattr('failed')
+              | map(attribute='msg') | join(' | ')) }}
+
+- name: "{{ case.name }} — the outcome is the expected one"
+  ansible.builtin.assert:
+    that:
+      - case_result == case.expect
+    fail_msg: >-
+      {{ case.name }}: expected the contract to {{ case.expect[:-1] }} this
+      manifest, but it was {{ case_result }}.
+      {{ ('The refusal said: ' ~ case_error) if case_result == 'refused'
+         else 'It was accepted, so a malformed release would have been deployed.' }}
+    success_msg: "{{ case.name }} → {{ case_result }}"
+
+- name: "{{ case.name }} — the refusal names the field at fault"
+  # ⚠️ A REFUSAL FOR THE WRONG REASON IS NOT A PASS. Every one of these fixtures
+  # is invalid in exactly one way; if the message does not mention that way, the
+  # contract rejected it by accident and the intended check is untested.
+  ansible.builtin.assert:
+    that:
+      - case_error is search(case.because)
+    fail_msg: >-
+      {{ case.name }}: refused, but for the wrong reason. Expected a message
+      matching /{{ case.because }}/ and got: {{ case_error }}
+    success_msg: "{{ case.name }} → refused because {{ case.because }}"
+  when:
+    - case.expect == 'refused'
+    - case.because is defined
+
+# ── DID ATTESTATION VERIFICATION RUN, OR NOT? ───────────────────────────────
+#
+# Read from the stub's log, so this is what HAPPENED rather than what the
+# tasks appear to say.
+- name: "{{ case.name }} — read the gh invocation log"
+  ansible.builtin.slurp:
+    src: "{{ gh_log }}"
+  register: gh_log_raw
+
+- name: "{{ case.name }} — set the invocation count"
+  ansible.builtin.set_fact:
+    gh_calls: >-
+      {{ ((gh_log_raw.content | b64decode) | trim | length) == 0
+         | ternary(0, (gh_log_raw.content | b64decode) | trim | split('\n') | length) }}
+
+- name: "{{ case.name }} — a persisted release IS verified"
+  ansible.builtin.assert:
+    that:
+      - (gh_log_raw.content | b64decode) is search('attestation verify')
+    fail_msg: >-
+      {{ case.name }}: the release declares persisted provenance and was
+      accepted, but `gh attestation verify` never ran. An accepted persisted
+      release that was not verified is the worst of both outcomes.
+    success_msg: "{{ case.name }}: attestation verification ran, as it must"
+  when:
+    - case.expect == 'accepted'
+    - (case.manifest.provenance.attestation.status | default('')) == 'persisted'
+
+- name: "{{ case.name }} — an unavailable release is NEVER verified"
+  # ⚠️ NOT MERELY "it passed". Calling `gh attestation verify` on a release
+  # that declares it has no attestation would either fail (breaking DEV) or
+  # appear to succeed against something unrelated. It must not be called.
+  ansible.builtin.assert:
+    that:
+      - not ((gh_log_raw.content | b64decode) is search('attestation verify'))
+    fail_msg: >-
+      {{ case.name }}: the release declares UNAVAILABLE provenance, yet
+      `gh attestation verify` was invoked. There is nothing to verify.
+    success_msg: "{{ case.name }}: no attestation call, as it must be"
+  when:
+    - case.expect == 'accepted'
+    - (case.manifest.provenance.attestation.status | default('')) == 'unavailable'
+
+- name: "{{ case.name }} — clean up the fixture"
+  ansible.builtin.file:
+    path: "{{ case_file }}"
+    state: absent

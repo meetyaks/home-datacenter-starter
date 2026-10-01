@@ -1,0 +1,44 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Reconcile the DEV site towards the release its channel names.
+#
+#   dry run   ansible-playbook playbooks/keel-reconcile.yml --check --diff --ask-vault-pass --ask-become-pass
+#   run       ansible-playbook playbooks/keel-reconcile.yml --ask-vault-pass --ask-become-pass
+#   report    ansible-playbook playbooks/keel-reconcile.yml -e keel_reconcile_auto_deploy=false …
+#
+# ═══ THIS PLAYBOOK IS THE DEPLOYMENT CONTROLLER, AND WHERE IT RUNS MATTERS ═══
+#
+# It runs on the ADMINISTRATION CONSOLE, which is already the Ansible control
+# node for this repository. Deliberately NOT on a CI runner: CI decides what is
+# ELIGIBLE and publishes it, a site decides when to run it, and collapsing those
+# two authorities turns "CI is green" into "CI can deploy into the datacenter".
+# A CI runner also has no business holding this site's vault passphrase, its SSH
+# key, or a route to its database and durable storage.
+#
+# It is also not a daemon on the managed host. A host that decides what to run
+# could decide wrongly, and would need its own credentials to fetch releases.
+#
+# ⚠️ UNATTENDED RUNS NEED THE SECRETS WITHOUT A PROMPT. `--ask-vault-pass` and
+# `--ask-become-pass` are for a human at a terminal. The timer unit in
+# roles/keel_reconcile/files/ uses a vault password FILE readable only by the
+# operator account, and a passwordless become rule scoped to this playbook —
+# both provisioned by the administrator, neither committed here. See
+# docs/keel-dev-reconcile.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Reconcile the DEV site to its release channel
+  hosts: "{{ keel_reconcile_hosts | default('linux_servers') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    # Same reasoning as playbooks/keel.yml: Ansible needs a staging directory
+    # before it runs a task, so this must be at play scope and must be an
+    # absolute path valid on both the controller and the managed host.
+    ansible_remote_tmp: /tmp/ansible-keel
+
+  tasks:
+    - name: Reconcile
+      ansible.builtin.include_role:
+        name: keel_reconcile
+      tags: [reconcile]

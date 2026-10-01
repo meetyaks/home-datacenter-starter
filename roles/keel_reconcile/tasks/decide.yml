@@ -1,0 +1,65 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE DECISION, AS A FACT.
+#
+# Given what the channel names (`keel_reconcile_channel_doc`), what this host
+# last deployed (`keel_reconcile_current`) and how many times this release has
+# already been tried (`keel_reconcile_attempts`), decide what to do — and say
+# so, without doing it.
+#
+# ⚠️ WHY A FACT AND NOT AN ACTION. Three reasons, and the third is the one that
+# matters most:
+#
+#   · it can be TESTED without a host, a registry or a deployment — every
+#     branch below is reachable from a fixture;
+#   · it can be REPORTED — `--check`, or `keel_reconcile_auto_deploy: false`,
+#     prints the decision and changes nothing, which is what an operator asking
+#     "what would this do right now" actually wants;
+#   · an unattended controller that deployed nothing must be able to say WHY.
+#     "No changes" in a 3am timer log is indistinguishable from a broken run.
+#     A recorded decision and reason is the difference between a site that is
+#     converged and a site that has quietly stopped reconciling.
+#
+# Outcomes:
+#   converged         already running this release, successfully
+#   deploy            move to it
+#   refuse-backwards  the channel names something OLDER, without declaring a rollback
+#   refuse-attempts   this release already used up its retry allowance here
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Decide what this host should do
+  ansible.builtin.set_fact:
+    keel_reconcile_decision: >-
+      {{
+        'converged'        if (keel_reconcile_current.releaseId | default('')) == keel_reconcile_channel_doc.release.releaseId
+                              and (keel_reconcile_current.outcome | default('')) == 'deployed'
+        else 'refuse-backwards' if (keel_reconcile_current.createdAt is defined
+                              and keel_reconcile_channel_doc.release.createdAt < keel_reconcile_current.createdAt
+                              and not (keel_reconcile_channel_doc.advanced.rollback | default(false) | bool))
+        else 'refuse-attempts'  if (keel_reconcile_attempts | int) >= (keel_reconcile_max_attempts | int)
+        else 'deploy'
+      }}
+
+- name: Say why, in the words an operator will read at 3am
+  ansible.builtin.set_fact:
+    keel_reconcile_reason: >-
+      {{
+        ('already running ' ~ keel_reconcile_channel_doc.release.releaseId)
+          if keel_reconcile_decision == 'converged'
+        else ('the channel names ' ~ keel_reconcile_channel_doc.release.releaseId ~ ' (built '
+              ~ keel_reconcile_channel_doc.release.createdAt ~ ') but this host deployed '
+              ~ (keel_reconcile_current.releaseId | default('?')) ~ ' (built '
+              ~ (keel_reconcile_current.createdAt | default('?')) ~ '), which is NEWER, and the '
+              ~ 'channel does not declare a rollback')
+          if keel_reconcile_decision == 'refuse-backwards'
+        else (keel_reconcile_channel_doc.release.releaseId ~ ' already failed '
+              ~ keel_reconcile_attempts ~ ' time(s) here, its allowance of '
+              ~ keel_reconcile_max_attempts)
+          if keel_reconcile_decision == 'refuse-attempts'
+        else ('moving from ' ~ (keel_reconcile_current.releaseId | default('(nothing)')) ~ ' to '
+              ~ keel_reconcile_channel_doc.release.releaseId)
+      }}
+
+- name: State the decision
+  ansible.builtin.debug:
+    msg: "DECISION {{ keel_reconcile_decision }} — {{ keel_reconcile_reason }}"

@@ -1,0 +1,207 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE DEV ENVIRONMENT IS NAMED, AND THE NAMES ARE THE RIGHT ONES.
+#
+#   ansible-playbook tests/dev-environment-identity.yml
+#
+# ⚠️ READ FROM THE INVENTORY, NEVER RESTATED. Every value below is read out of
+# inventory/hosts.yml and inventory/group_vars/keel_dev/. A suite carrying its
+# own copy of "keel-dev.dc1.lan" would pass while the inventory said something
+# else — which is the failure this repository has already had once, with a
+# deployment pin that lived in two hand-maintained places.
+#
+# Controller-only: reads two files, contacts nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The DEV environment's identity
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Read the inventory
+      ansible.builtin.include_vars:
+        file: ../inventory/hosts.yml
+        name: inv
+
+    - name: Read the DEV group's variables
+      ansible.builtin.include_vars:
+        file: ../inventory/group_vars/keel_dev/environment.yml
+        name: devvars
+
+    # ── THE GROUP EXISTS AND HOLDS THE RIGHT HOST ───────────────────────────
+
+    - name: There is a keel_dev group, and dc1-x86 is in it
+      ansible.builtin.assert:
+        that:
+          - inv.all.children.keel_dev is defined
+          - inv.all.children.keel_dev.hosts is defined
+          - "'dc1-x86' in inv.all.children.keel_dev.hosts"
+        fail_msg: >-
+          dc1-x86 is not in the keel_dev group, so the DEV identity in
+          inventory/group_vars/keel_dev/ is loaded for nothing and the
+          environment is still unnamed.
+        success_msg: "dc1-x86 is the DEV environment."
+
+    - name: It is still a managed Linux server, so the vault still loads
+      # ⚠️ BOTH GROUPS, NOT A MOVE. `linux_servers` is where the encrypted vault
+      # and its loading canary live. A host moved OUT of it would lose every
+      # `keel_vault_*` value, and the failure would look like a Vault problem.
+      ansible.builtin.assert:
+        that:
+          - "'dc1-x86' in inv.all.children.linux_servers.hosts"
+        fail_msg: >-
+          dc1-x86 was removed from linux_servers, so
+          inventory/group_vars/linux_servers/ no longer loads for it — every
+          secret would be undefined and the loading canary would fail.
+        success_msg: "dc1-x86 remains in linux_servers; the vault still loads."
+
+    # ── NEITHER CI VM MAY BE A DEPLOYMENT TARGET ────────────────────────────
+
+    - name: No CI runner is in the DEV group
+      # ⚠️ THE BOUNDARY THIS WHOLE DESIGN KEEPS. CI decides what is ELIGIBLE and
+      # publishes it; a site decides when to run it. A CI VM in this group
+      # would be a runner that deploys — holding DEV's vault passphrase, its
+      # SSH key and a route to its database and durable storage.
+      ansible.builtin.assert:
+        that:
+          - item not in (inv.all.children.keel_dev.hosts | default({}))
+        fail_msg: >-
+          {{ item }} is a CI runner and it is in the keel_dev group. A CI VM
+          must never be the DEV runtime or the deployment controller.
+        success_msg: "{{ item }} is not a DEV deployment target."
+      loop:
+        - dc1-ci-1
+        - dc1-ci-tw-1
+
+    - name: No CI runner is anywhere in this inventory at all
+      ansible.builtin.assert:
+        that:
+          - item not in (inv.all.children.linux_servers.hosts | default({}))
+        fail_msg: >-
+          {{ item }} appears in linux_servers, so the base roles and the vault
+          would apply to a CI runner.
+        success_msg: "{{ item }} is absent from the inventory."
+      loop:
+        - dc1-ci-1
+        - dc1-ci-tw-1
+
+    # ── THE NAMES ───────────────────────────────────────────────────────────
+
+    - name: The environment names itself dev, at site dc1
+      ansible.builtin.assert:
+        that:
+          - devvars.keel_environment == 'dev'
+          - devvars.keel_site == 'dc1'
+        fail_msg: >-
+          The DEV group declares environment
+          "{{ devvars.keel_environment | default('(unset)') }}" at site
+          "{{ devvars.keel_site | default('(unset)') }}".
+        success_msg: >-
+          Environment {{ devvars.keel_environment }}, site {{ devvars.keel_site }}.
+
+    - name: DEV is keel-dev.dc1.lan
+      ansible.builtin.assert:
+        that:
+          - devvars.keel_hostname == 'keel-dev.dc1.lan'
+        fail_msg: "DEV's hostname is {{ devvars.keel_hostname | default('(unset)') }}."
+        success_msg: "DEV is {{ devvars.keel_hostname }}."
+
+    - name: keel.dc1.lan is RESERVED, and DEV does not hold it
+      # ⚠️ RESERVED, NOT RECYCLED. It is the future PROD name, on separate
+      # hardware. Leaving DEV on it would mean the eventual PROD cutover has to
+      # take a name away from a running environment — the sort of change that
+      # gets done at 2am under pressure.
+      ansible.builtin.assert:
+        that:
+          - devvars.keel_hostname != 'keel.dc1.lan'
+        fail_msg: >-
+          DEV is using keel.dc1.lan, which is reserved for PROD on separate
+          hardware. PROD would then have to take the name from a running DEV.
+        success_msg: "keel.dc1.lan is free for PROD."
+
+    # ── RELEASE CONSUMPTION ─────────────────────────────────────────────────
+
+    - name: DEV follows the dev channel, automatically
+      ansible.builtin.assert:
+        that:
+          - devvars.keel_reconcile_channel == 'dev'
+          - devvars.keel_reconcile_auto_deploy | bool
+        fail_msg: >-
+          DEV follows channel
+          "{{ devvars.keel_reconcile_channel | default('(unset)') }}" with
+          auto-deploy {{ devvars.keel_reconcile_auto_deploy | default('(unset)') }}.
+        success_msg: "DEV reconciles automatically to the dev channel."
+
+    - name: DEV explicitly declares the reduced-assurance policy
+      # ⚠️ EXPLICIT, AND ONLY HERE. The role's default is `require_persisted`;
+      # DEV opts out in writing because the producer genuinely cannot persist
+      # attestations for this repository type. An environment that accepts an
+      # unattested release without saying so is the thing this asserts against.
+      ansible.builtin.assert:
+        that:
+          - devvars.keel_release_provenance_policy is defined
+          - devvars.keel_release_provenance_policy == 'allow_unavailable'
+        fail_msg: >-
+          DEV declares keel_release_provenance_policy
+          "{{ devvars.keel_release_provenance_policy | default('(unset)') }}".
+          It must be exactly `allow_unavailable` — DEV is the one environment
+          permitted to consume a release whose provenance could not be
+          persisted, and it has to say so.
+        success_msg: "DEV declares allow_unavailable, explicitly."
+
+    - name: The retired boolean is absent from the DEV inventory
+      ansible.builtin.assert:
+        that:
+          - devvars.keel_release_require_provenance is not defined
+        fail_msg: >-
+          The DEV inventory still sets keel_release_require_provenance. It no
+          longer controls anything and the role now refuses when it is
+          present, because an operator who sets it believes they configured
+          something they did not.
+        success_msg: "The retired boolean is gone from DEV."
+
+    - name: NO OTHER INVENTORY PERMITS AN UNATTESTED RELEASE
+      # ⚠️ THE CONTAINMENT CHECK. `allow_unavailable` spreading by
+      # copy-and-paste is how a future PROD quietly inherits DEV's exception,
+      # so spreading it is a test failure rather than a habit. Scans every
+      # group_vars and host_vars file EXCEPT keel_dev.
+      ansible.builtin.find:
+        paths:
+          - ../inventory/group_vars
+          - ../inventory/host_vars
+        patterns: '*.yml'
+        recurse: true
+        excludes: []
+      register: inv_files
+      failed_when: false
+
+    - name: Read each one
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: inv_contents
+      loop: "{{ inv_files.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Only keel_dev may say allow_unavailable
+      ansible.builtin.assert:
+        that:
+          - not ((item.content | b64decode) is search('allow_unavailable'))
+        fail_msg: >-
+          {{ item.item.path }} contains `allow_unavailable`, but only
+          inventory/group_vars/keel_dev/ may. A production environment must
+          inherit `require_persisted` from the role default by saying nothing.
+        success_msg: "{{ item.item.path | basename }}: no unattested exception."
+      loop: "{{ inv_contents.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path | basename }}"
+      when: "'/keel_dev/' not in item.item.path"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          DEV identity: {{ devvars.keel_environment }}@{{ devvars.keel_site }}
+          on {{ devvars.keel_hostname }}, channel
+          {{ devvars.keel_reconcile_channel }}, auto-deploy
+          {{ devvars.keel_reconcile_auto_deploy }}.

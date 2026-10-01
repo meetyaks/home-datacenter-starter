@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ═══════════════════════════════════════════════════════════════════════════
+  UNATTENDED DEV RECONCILIATION ON THE ADMINISTRATION CONSOLE, WHICH IS A Mac.
+
+  Install to /Library/LaunchDaemons/com.meetyaks.keel-reconcile-dev.plist
+
+  ⚠️ THE CONSOLE RUNS macOS, SO IT RUNS launchd. This repository shipped
+  systemd units first, written for a Linux console that does not exist: the
+  console is a Mac mini with /bin/launchctl and no systemctl at all. Those
+  units are kept, unused, under files/systemd/ for a future Linux controller
+  and are NOT part of the DEV path. A unit that cannot start is not a
+  fallback; it is a thing somebody will one day believe is running.
+
+  ⚠️ A TEMPLATE, BECAUSE launchd HAS NO VARIABLES. Every path in a plist is
+  absolute, and the console's checkout path is a fact about the machine — so
+  the choice is between a constant somebody has to keep in step and a
+  placeholder something renders. An earlier version was the former, naming
+  `/opt/home-datacenter-starter`, which was invented rather than observed and
+  does not exist on the real console. The daemon would have failed at load
+  with status 127 and nothing would have explained why.
+
+  scripts/bootstrap-dev-controller.sh renders it:
+
+      @@CHECKOUT@@      the deployment checkout, derived from where the
+                        bootstrap script itself lives
+      @@SERVICE_USER@@  the account the daemon runs as
+      @@LOG_DIR@@       where stdout and stderr go
+
+  ⚠️ NOT INSTALLED BY THIS REPOSITORY. Rendered and placed by an
+  administrator, because it depends on three things that must never be
+  committed: the vault password file, the SSH deploy key, and the scoped sudo
+  rule on the DEV host. See docs/keel-dev-reconcile.md.
+
+  ⚠️ NOT ON A CI RUNNER. CI decides eligibility; a site decides when to
+  deploy. A runner holding this would hold the vault passphrase, the SSH keys
+  and a route to DEV's database — the boundary this whole design keeps.
+
+      sudo launchctl bootstrap system /Library/LaunchDaemons/com.meetyaks.keel-reconcile-dev.plist
+      sudo launchctl print system/com.meetyaks.keel-reconcile-dev
+      sudo launchctl kickstart -p system/com.meetyaks.keel-reconcile-dev
+      sudo launchctl bootout   system/com.meetyaks.keel-reconcile-dev
+  ═══════════════════════════════════════════════════════════════════════════
+-->
+<plist version="1.0">
+<dict>
+
+  <key>Label</key>
+  <string>com.meetyaks.keel-reconcile-dev</string>
+
+  <!--
+    ⚠️ THE WRAPPER, AND ONLY THE WRAPPER. No inventory, no vault path, no
+    timeout and no concurrency rule here: all of that is in
+    bin/keel-reconcile-dev, which is the single behavioural owner. A plist
+    that called ansible-playbook directly would be a second place those
+    decisions live, and the copies would drift.
+
+    ⚠️ ABSOLUTE PATH. launchd gives a daemon a minimal PATH that does not
+    include /opt or /usr/local/bin, so a bare command name does not resolve
+    and the job fails with status 127 and no useful message.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@CHECKOUT@@/bin/keel-reconcile-dev</string>
+  </array>
+
+  <!--
+    ⚠️ A DEDICATED SERVICE ACCOUNT, NOT root AND NOT A PERSON. It owns the
+    deployment checkout, the vault password file and the SSH keys; privilege
+    on the managed host comes from the scoped sudo rule there, not from being
+    root here. Running as a person's account would make the deployment depend
+    on that person's login session, keychain and shell configuration.
+
+    The account must exist before bootstrap. See docs/keel-dev-reconcile.md.
+  -->
+  <key>UserName</key>
+  <string>@@SERVICE_USER@@</string>
+  <key>GroupName</key>
+  <string>staff</string>
+
+  <key>WorkingDirectory</key>
+  <string>@@CHECKOUT@@</string>
+
+  <!--
+    ⚠️ PATHS ONLY. NO TOKEN, NO PASSPHRASE, NO KEY MATERIAL. A plist in
+    /Library/LaunchDaemons is world-readable and its environment is visible
+    to `launchctl print`. Every secret reaches Ansible through the vault,
+    whose password file is named by path and read by the service account.
+    tests/controller-scheduler.yml fails if anything secret-shaped appears
+    in this file.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>KEEL_CHECKOUT</key>
+    <string>@@CHECKOUT@@</string>
+    <key>KEEL_RECONCILE_CONF</key>
+    <string>/etc/keel/reconcile.conf</string>
+    <!-- launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin. Ansible,
+         git and docker all live outside it on a Mac. -->
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <!--
+    ⚠️ StartInterval, AND launchd WILL NOT OVERLAP A RUN WITH ITSELF. If the
+    previous invocation is still alive when the interval elapses, launchd
+    skips the tick rather than starting a second copy. The wrapper's own lock
+    covers the other case — an operator running it by hand while a tick fires
+    — and the role's host-side lock covers two deployers.
+
+    900s = 15 minutes, matching the systemd timer this replaces. A converged
+    site reads one small JSON document and stops, so checking often costs
+    close to nothing.
+  -->
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <!--
+    ⚠️ NO KeepAlive, AND THIS IS THE IMPORTANT ONE. KeepAlive restarts a job
+    the moment it exits — so a reconciliation that fails would be restarted
+    immediately, forever, at whatever rate launchd's throttle allows. The
+    role's attempt ledger bounds retries deliberately (two attempts, then it
+    stops and waits for a person); a KeepAlive loop would defeat that bound
+    and bury the one informative failure under a thousand identical ones.
+
+    RunAtLoad is false for the same reason it is not wanted on boot: the
+    first reconciliation of a release should be watched by a person, and
+    bootstrapping this daemon should not itself start a deployment.
+  -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!--
+    ⚠️ AN ABSOLUTE CEILING, SEPARATE FROM THE WRAPPER'S OWN. The wrapper
+    bounds the Ansible run at 3000s; this bounds the whole job, including a
+    wrapper that somehow wedged before starting Ansible. launchd SIGKILLs at
+    this point, so it is set well above the inner timeout — it is the
+    backstop, not the mechanism.
+  -->
+  <key>ExitTimeOut</key>
+  <integer>3600</integer>
+
+  <!--
+    ⚠️ EXPLICIT, PROTECTED FILES. Without these, output goes to the unified
+    log where it is awkward to read and impossible to keep. The directory is
+    created by the administrator as 0750 keeladmin:staff; the files inherit
+    that, and nothing secret is written to them because the role prints no
+    secret and every task handling one is `no_log: true`.
+  -->
+  <key>StandardOutPath</key>
+  <string>@@LOG_DIR@@/reconcile-dev.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@LOG_DIR@@/reconcile-dev.err</string>
+
+  <!-- Deployment is not interactive work and must not compete with it. -->
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+
+</dict>
+</plist>

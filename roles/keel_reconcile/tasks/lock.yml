@@ -1,0 +1,79 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# TAKE THE DEPLOYMENT LOCK, OR REFUSE AND SAY WHY.
+#
+# Two reconciliations deploying at once would interleave `docker compose up`
+# with a migration, which is how a schema ends up half-applied. A systemd timer
+# will not overlap itself; an operator running the playbook by hand while the
+# timer fires is the ordinary case this exists for.
+#
+# Released in the `always` block of the caller, so a failed deployment does not
+# wedge every future run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Check for an existing lock
+  ansible.builtin.stat:
+    path: "{{ keel_reconcile_lock_dir }}"
+  register: keel_reconcile_lock_stat
+
+- name: Ask the host what time it is now
+  # ⚠️ NOT `ansible_date_time.epoch`. That fact is captured once, when facts are
+  # gathered at the START of the play, while the lock's ctime is read here — so
+  # the difference understates the age by however long the play has been
+  # running, and in a test that creates the lock mid-play it goes NEGATIVE
+  # ("-3s ago"), which is how this was found. It must also be the HOST's clock,
+  # because that is the clock the ctime came from.
+  ansible.builtin.command:
+    argv: [date, +%s]
+  register: keel_reconcile_now
+  changed_when: false
+  when: keel_reconcile_lock_stat.stat.exists
+
+- name: Work out how old it is
+  ansible.builtin.set_fact:
+    keel_reconcile_lock_age: >-
+      {{ [0, ((keel_reconcile_now.stdout | int) - (keel_reconcile_lock_stat.stat.ctime | int))] | max
+         if keel_reconcile_lock_stat.stat.exists else 0 }}
+
+- name: Refuse while another reconciliation holds the lock
+  # ⚠️ REPORTED, NEVER BROKEN AUTOMATICALLY — not even when it is old. "Probably
+  # stale" is doing far too much work when being wrong means a second deployer
+  # running against a half-applied migration. The staleness threshold changes
+  # what the message SAYS, never what the role DOES.
+  ansible.builtin.fail:
+    msg: >-
+      REFUSING: {{ keel_reconcile_lock_dir }} exists, so another reconciliation
+      is in progress or died holding the lock ({{ keel_reconcile_lock_age }}s
+      ago).
+      {{ 'That is past the ' ~ keel_reconcile_lock_max_age_seconds ~ 's staleness
+         threshold, so it is probably abandoned — but this role will not decide
+         that for you.'
+         if (keel_reconcile_lock_age | int) > (keel_reconcile_lock_max_age_seconds | int)
+         else 'It is within the staleness threshold, so a deployment is most
+         likely running right now.' }}
+      Confirm no deployment is running, then: rmdir {{ keel_reconcile_lock_dir }}
+  when: keel_reconcile_lock_stat.stat.exists
+
+- name: Take the lock
+  # ⚠️ `mkdir` AND NOT `file: state=directory`. The file module is idempotent —
+  # it SUCCEEDS when the directory already exists, which is precisely the case
+  # a lock must fail on. A bare mkdir is atomic on POSIX and fails if the name
+  # is taken, and that atomicity is the entire mechanism: the check above is a
+  # courtesy that produces a good error message, not the guarantee.
+  ansible.builtin.command:
+    argv: [mkdir, "{{ keel_reconcile_lock_dir }}"]
+  changed_when: true
+
+- name: Say who holds it
+  # Not part of the mechanism — the directory's existence is. This is for the
+  # person who finds a lock at 3am and needs to know whose run left it.
+  ansible.builtin.copy:
+    content: |
+      {{ {
+           'takenAt': ansible_date_time.iso8601,
+           'takenBy': lookup('env', 'USER') ~ '@' ~ lookup('env', 'HOSTNAME'),
+           'release': keel_reconcile_channel_doc.release.releaseId | default('(unknown)'),
+           'host': inventory_hostname
+         } | to_nice_json(indent=2) }}
+    dest: "{{ keel_reconcile_lock_dir }}/holder.json"
+    mode: "0640"

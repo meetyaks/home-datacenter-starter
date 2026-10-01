@@ -118,5 +118,124 @@ echo
 echo "══ installation identity (7 cases + no committed value) ════════════"
 ansible-playbook tests/installation-identity.yml
 
+# ═══ DEV RELEASE DELIVERY ═══════════════════════════════════════════════════
+#
+# The site half of the DEV channel: read a published release, verify it, and
+# deploy it through roles/keel rather than building on the host.
+
+echo
+echo "══ DEV environment identity (12 checks, read from inventory) ══════"
+# The names are read out of inventory/hosts.yml and
+# inventory/group_vars/keel_dev/ — never restated here. Also asserts that
+# neither CI VM is a deployment target, which is the boundary the whole
+# delivery design rests on.
+ansible-playbook tests/dev-environment-identity.yml
+
+echo
+echo "══ release contract (14 cases, the site's own reader) ═════════════"
+# roles/keel/tasks/release.yml is this repository's reader for
+# keel.release/v1; the producing side has its own. A contract only one side
+# can check is not a contract, and this is what makes the second reader real.
+# Runs the ROLE'S tasks against fixtures — it restates no assertion.
+ansible-playbook tests/release-contract.yml
+
+echo
+echo "══ reconcile decisions (8 cases + 3 shipped-posture checks) ═══════"
+# Every state a DEV site can be in: converged, behind, moved backwards,
+# rolled back explicitly, out of retries, previously failed.
+ansible-playbook tests/reconcile-decisions.yml
+
+echo
+echo "══ deployment lock (3 scenarios, real directory) ══════════════════"
+# ⚠️ EXERCISED, NOT GREPPED. That a second acquisition FAILS is the only
+# property that matters, and it is exactly the one `file: state=directory`
+# would silently lose.
+ansible-playbook tests/reconcile-lock.yml
+
+echo
+echo "══ reconcile boundaries (9 structural checks) ═════════════════════"
+# One deployer, one migration owner, no path that weakens provenance
+# verification, no systemd restart loop — and the reconciler records which
+# policy and what assurance it deployed under, which is the half of that rule
+# a prohibition alone cannot express.
+ansible-playbook tests/reconcile-boundaries.yml
+
+echo
+echo "══ reconcile check mode (13 checks, real channel repository) ══════"
+# ⚠️ A REAL --check RUN. The role takes a lock and writes an attempt record
+# BEFORE it reaches roles/keel, and neither is a dry run of anything. Builds a
+# local git repository so the real `git` task is exercised without a network.
+tests/run-reconcile-check-mode.sh
+
+echo
+echo "══ the controller's scheduler (25 checks) ════════════════════════"
+# ⚠️ IT ASKS THE MACHINE WHICH OS IT IS. The repository shipped systemd units
+# for a console that runs macOS and has no systemctl at all; nothing said so
+# until somebody tried. The live scheduler is a launchd plist, the systemd
+# units are a retained Linux variant, and both are held to the same rules:
+# invoke the wrapper, never restart into a loop, carry no credential.
+ansible-playbook tests/controller-scheduler.yml
+
+echo
+echo "══ the wrapper, executed (20 checks) ═════════════════════════════"
+# ⚠️ EXERCISED, NOT GREPPED. That a SECOND concurrent run is refused, and
+# that Ansible's exit status survives unchanged, are exactly the properties a
+# careless rewrite loses and a structural check cannot see.
+tests/run-wrapper-behaviour.sh
+
+echo
+echo "══ the github host-key pin (9 checks) ════════════════════════════"
+# ⚠️ THE GUARD THAT MATTERS MOST ON THIS PATH. The controller decides what DEV
+# runs, from a document it fetches over SSH. `ssh-keyscan` — the usual way to
+# fill known_hosts — pins whatever answers on port 22 and authenticates
+# nothing. This proves the replacement actually REJECTS a tampered document
+# rather than merely fetching a good one.
+tests/run-known-hosts-pin.sh
+
+echo
+echo "══ the credential contract (99 checks) ═══════════════════════════"
+# ⚠️ NEITHER CREDENTIAL EXISTS YET. Nothing here proves authentication works
+# — only that the code refuses without it, cannot leak it, and gives it back.
+# Those must be right BEFORE a real credential is created, because afterwards
+# a mistake is a disclosed secret rather than a failing test.
+ansible-playbook tests/credential-contract.yml
+
+echo
+echo "══ the published release, read by this reader ════════════════════"
+# ⚠️ THE ONE SUITE WHOSE INPUT THIS REPOSITORY DID NOT WRITE. Every fixture
+# above agrees with the reader because the same hand wrote both. This runs the
+# reader against a byte-for-byte copy of the document meetyaks/keel actually
+# published to release/dev: refused under the shipped default, resolved under
+# DEV's policy, and never verified — because it declares there is nothing to
+# verify. Read-only; deploys nothing.
+ansible-playbook tests/published-release-proof.yml
+tests/run-published-release-check-mode.sh
+
+echo
+echo "══ provenance mutations (14 checks) ══════════════════════════════"
+# ⚠️ A GUARD THAT HAS NEVER FAILED IS NOT A GUARD. Breaks the policy eleven
+# ways in turn and proves the suites above go red FOR THAT REASON — a
+# rejection for the wrong reason is not a pass. Restores every file it edits.
+#
+# Slow: it runs three suites twelve times. Set KEEL_SKIP_MUTATIONS=1 to leave
+# it out of a quick loop, and never out of a release check.
+if [ "${KEEL_SKIP_MUTATIONS:-0}" = "1" ]; then
+  echo "SKIPPED by KEEL_SKIP_MUTATIONS=1 — the policy guards are UNPROVEN in this run."
+else
+  tests/run-provenance-mutations.sh
+fi
+
+echo
+echo "══ scheduler and credential mutations (20 checks) ════════════════"
+# ⚠️ THE SAME DISCIPLINE, APPLIED TO THE GUARDS THAT PROTECT SECRETS. These
+# decide whether a read-only token reaches a process table, whether a failed
+# deployment leaves a credential on the host, and whether an unattended
+# controller accepts a release document from whatever answered on port 22.
+if [ "${KEEL_SKIP_MUTATIONS:-0}" = "1" ]; then
+  echo "SKIPPED by KEEL_SKIP_MUTATIONS=1 — the credential guards are UNPROVEN in this run."
+else
+  tests/run-auth-mutations.sh
+fi
+
 echo
 echo "All regression suites passed."

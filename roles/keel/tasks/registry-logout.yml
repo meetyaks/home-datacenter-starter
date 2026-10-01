@@ -1,0 +1,49 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# GIVE THE CREDENTIAL BACK.
+#
+# ⚠️ IN AN `always` BLOCK, WHICH IS THE ONLY REASON THIS IS A SEPARATE FILE.
+# `docker login` writes a base64 of "username:token" into the host's
+# ~/.docker/config.json — not encrypted, just encoded. Left there, a read-only
+# registry credential becomes a permanent file on dc1-x86 that outlives the
+# deployment, survives reboots, and is readable by anything running as that
+# account.
+#
+# A logout that only ran on success would leave it behind in exactly the case
+# where somebody is about to go poking around the host: a failed deployment.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Log out of the private registry
+  # `failed_when: false` deliberately: this runs in an `always` block, and a
+  # logout that fails must not replace the real failure — the deployment error
+  # the operator needs to see — with a tidying-up error.
+  ansible.builtin.command:
+    argv: [docker, logout, "{{ keel_release_registry }}"]
+  changed_when: false
+  failed_when: false
+  register: keel_registry_logout
+
+- name: Confirm the stored credential is gone
+  # ⚠️ `docker logout` EXITING 0 IS NOT THE STATEMENT THAT MATTERS. It reports
+  # success when there was nothing to remove, and on some versions when the
+  # config file could not be rewritten. This asks the host what it now holds.
+  ansible.builtin.slurp:
+    src: "{{ ansible_env.HOME }}/.docker/config.json"
+  register: keel_docker_config
+  failed_when: false
+  no_log: true
+
+- name: Say whether anything was left behind
+  ansible.builtin.assert:
+    that:
+      - (keel_docker_config.content is not defined) or
+        (keel_release_registry not in (keel_docker_config.content | b64decode))
+    fail_msg: >-
+      {{ keel_release_registry }} still has an entry in the host's
+      ~/.docker/config.json after logout. A read-only registry token is now a
+      persistent file on this host. Remove it by hand and investigate why
+      `docker logout` did not.
+    # ⚠️ NEVER PRINTS THE CONFIG, on success or failure. The whole point of
+    # reading it was to check for a credential; echoing it back would be the
+    # leak this task exists to prevent.
+    success_msg: "No {{ keel_release_registry }} credential remains on the host."

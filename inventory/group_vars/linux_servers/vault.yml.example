@@ -21,6 +21,28 @@ keel_vault_blob_secret_key: ""
 
 keel_vault_oidc_client_secret: ""
 
+# ── THE PRIVATE REGISTRY, READ-ONLY ─────────────────────────────────────────
+#
+# ⚠️ ghcr.io/meetyaks/keel AND keel-web ARE PRIVATE PACKAGES. In release mode
+# the host pulls two exact digests from them, and an anonymous pull is
+# refused with `denied`. There is no fallback: release mode does not build.
+#
+# ⚠️ A DEDICATED, READ-ONLY CREDENTIAL. A classic PAT with `read:packages`
+# and nothing else, or a fine-grained token scoped to those two packages. NOT
+# an operator's personal token, NOT one that can write, and NOT the token CI
+# publishes with — the site only ever reads, and a credential that could
+# push is one that could replace the artifact it just verified.
+#
+# ⚠️ IT IS NOT A SUBSTITUTE FOR PROVENANCE. Authenticating to a registry
+# proves who you are to it; it says nothing about who built the image. The
+# digest and the provenance policy do that.
+#
+# Used by roles/keel/tasks/registry.yml: passed to `docker login` over STDIN,
+# never as an argument, under `no_log: true`, and logged out again in an
+# `always` block whether the deployment succeeded or failed.
+keel_vault_registry_username: ""
+keel_vault_registry_token: ""
+
 keel_vault_master_key: ""
 keel_vault_mfa_master_key: ""
 

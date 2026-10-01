@@ -29,6 +29,15 @@
 # made the earlier failure so easy to miss.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ⚠️ FIRST, BECAUSE IT DECIDES WHAT `keel_commit` IS. In release mode the
+#    commit and the image digests come from a verified `keel.release/v1`
+#    manifest rather than from this role's defaults, and every assertion below
+#    then applies to the release's own commit. In ordinary mode this is a no-op
+#    and the pinned `keel_commit` in defaults stands unchanged.
+- name: Resolve and verify the release, when one was named
+  ansible.builtin.include_tasks: release.yml
+  when: keel_release_manifest_file | length > 0
+
 - name: Verify the deployment candidate is a full commit SHA
   ansible.builtin.assert:
     that:
@@ -135,9 +144,22 @@
   ansible.builtin.include_tasks: source.yml
   when: not ansible_check_mode
 
+- name: Verify the transferred bundle and pull the release's exact images
+  # Release mode's replacement for the host build: the artifact already exists,
+  # so there is nothing to build — only to prove and fetch.
+  ansible.builtin.include_tasks: release-bundle.yml
+  when:
+    - keel_release_manifest_file | length > 0
+    - not ansible_check_mode
+
 - name: Build the images natively on this host
+  # ⚠️ SKIPPED IN RELEASE MODE. Building here would produce an image with a
+  # different digest than the one the release names, gated and attested — and
+  # the deployment would then be of something no gate ever saw.
   ansible.builtin.include_tasks: build.yml
-  when: not ansible_check_mode
+  when:
+    - keel_release_manifest_file | length == 0
+    - not ansible_check_mode
 
 - name: Deploy the Compose stack
   ansible.builtin.include_tasks: deploy.yml
@@ -169,7 +191,9 @@
       - "An ordinary run would then:"
       - "  1. git archive {{ keel_commit_short }} on the controller and unpack it to the build dir"
       - "  2. verify the deployment manifest names this exact commit"
-      - "  3. build {{ keel_gateway_image }} and {{ keel_web_image }} natively here"
+      - "  3. {{ 'pull ' ~ keel_gateway_image ~ ' and ' ~ keel_web_image ~ ' by digest'
+                 if keel_release_manifest_file | length > 0
+                 else 'build ' ~ keel_gateway_image ~ ' and ' ~ keel_web_image ~ ' natively here' }}"
       - "  4. install the stack from the built commit and refuse any non-loopback publish"
       - "  5. run migrations once, and stop if they exit non-zero"
       - "  6. start the stack and wait for health"

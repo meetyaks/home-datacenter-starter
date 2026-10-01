@@ -1,0 +1,31 @@
+---
+# One case for tests/reconcile-decisions.yml. Sets the three inputs the
+# decision reads, runs the ROLE'S OWN decide.yml, and checks the outcome.
+
+- name: "{{ case.name }} — set the inputs the decision reads"
+  ansible.builtin.set_fact:
+    keel_reconcile_channel_doc: "{{ case.channel }}"
+    keel_reconcile_current: "{{ case.current }}"
+    keel_reconcile_attempts: "{{ case.attempts }}"
+
+- name: "{{ case.name }} — run the role's own decision"
+  ansible.builtin.include_tasks: ../roles/keel_reconcile/tasks/decide.yml
+
+- name: "{{ case.name }} — it decided what it should have"
+  ansible.builtin.assert:
+    that:
+      - keel_reconcile_decision == case.expect
+    fail_msg: >-
+      {{ case.name }}: expected "{{ case.expect }}" and the controller decided
+      "{{ keel_reconcile_decision }}" — {{ keel_reconcile_reason }}
+    success_msg: "{{ case.name }} → {{ keel_reconcile_decision }}"
+
+- name: "{{ case.name }} — and it can say why"
+  # ⚠️ AN UNATTENDED CONTROLLER THAT CANNOT EXPLAIN ITSELF IS INDISTINGUISHABLE
+  # FROM A BROKEN ONE. "No changes" in a 3am timer log means nothing without a
+  # reason beside it, so an empty reason is a defect in its own right.
+  ansible.builtin.assert:
+    that:
+      - keel_reconcile_reason | trim | length > 0
+    fail_msg: "{{ case.name }}: decided {{ keel_reconcile_decision }} with no stated reason."
+    success_msg: "{{ case.name }}: {{ keel_reconcile_reason }}"

@@ -1,0 +1,140 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# roles/keel_reconcile — the DEV site controller.
+#
+# ═══ WHAT THIS ROLE IS, AND WHAT IT IS NOT ═══════════════════════════════════
+#
+# It DECIDES: read the channel, verify what it names, work out whether this host
+# should move, and refuse when it should not. It does not deploy — `roles/keel`
+# is the deployer and this role invokes it in release mode. There is exactly one
+# thing here that knows how to put Keel on a host, and it is not this role.
+#
+# ⚠️ WHERE IT RUNS. On the administration console, which is already the Ansible
+# control node. NOT on a CI runner — CI decides what is ELIGIBLE and publishes
+# it; a site decides when to run it, and the two must not be the same authority
+# or "CI is green" becomes "CI can deploy". And not as a daemon installed on the
+# managed host either: a host that could decide what to run could decide wrongly
+# and would need credentials to fetch releases.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── WHICH CHANNEL, AND WHERE IT LIVES ───────────────────────────────────────
+keel_reconcile_channel: dev
+
+# ⚠️ SSH, NOT HTTPS, AND THAT IS THE WHOLE POINT. meetyaks/keel is PRIVATE, so
+# the channel branch is private too. Over HTTPS this resolves through git's
+# credential helper — which on a developer's Mac means their keychain and
+# their personal token. That works when a person runs the playbook and fails
+# the moment a scheduler does, as a different account with no keychain, and
+# the failure arrives at 3am as "Authentication failed".
+#
+# An interactive developer credential is not proof that an unattended
+# controller can read this. So the controller uses a DEDICATED, READ-ONLY
+# DEPLOY KEY, named by path below and never by value, and the preflight in
+# tasks/credentials.yml refuses to run without it.
+keel_reconcile_channel_repo: git@github.com:meetyaks/keel.git
+keel_reconcile_channel_branch: release/dev
+keel_reconcile_channel_path: channels/dev.json
+keel_reconcile_channel_schema_version: keel.channel/v1
+
+# Where the channel is fetched to on the CONTROLLER. Under the controller's own
+# temp area: it is a cache of a published document, never state.
+keel_reconcile_workdir: "/tmp/keel-reconcile-{{ keel_reconcile_channel }}"
+
+# ── THE DEPLOY KEY: A PATH, NEVER A VALUE ───────────────────────────────────
+#
+# ⚠️ ONE KEY SERVES BOTH READS, BECAUSE THEY ARE THE SAME REPOSITORY. The
+# channel branch (release/dev) and the release's source commit both live in
+# meetyaks/keel, so a single repository-scoped read-only deploy key covers
+# the channel clone AND the `git fetch` that makes the release's commit
+# present on the controller. Nothing here needs a second credential, and
+# nothing here needs write access.
+#
+# ⚠️ PROVISIONED BY AN ADMINISTRATOR, NOT BY THIS REPOSITORY. The private key
+# exists only on the controller, owned by the service account, mode 0400.
+# tasks/credentials.yml refuses to continue if it is absent, unreadable,
+# group- or world-readable, or owned by somebody else — because a deploy key
+# a second account can read is not a dedicated credential.
+keel_reconcile_deploy_key: /etc/keel/keel-deploy-key
+
+# ⚠️ STRICT, AND NOT NEGOTIABLE. An unattended run is exactly the case where
+# an unrecognised host key must be a hard failure: there is nobody to read
+# "The authenticity of host 'github.com' can't be established", so the
+# alternative to refusing is accepting whatever answered. `BatchMode=yes`
+# turns every would-be prompt into an error instead of a hang.
+#
+# The known_hosts file is provisioned alongside the key and pinned to
+# GitHub's published host keys. It is NOT ~/.ssh/known_hosts: the service
+# account's home directory is not where a reviewed pin belongs.
+keel_reconcile_known_hosts: /etc/keel/known_hosts
+
+# Who this reconciliation is running as on the controller. The deploy key must
+# belong to this account — a 0400 key owned by somebody else is one this
+# process cannot read, and "Permission denied (publickey)" names the wrong
+# cause. Derived rather than hard-coded so a manual run by an operator and a
+# scheduled run as `keeladmin` are both checked against whoever is actually
+# running, which is the invariant that matters.
+keel_reconcile_controller_user: "{{ lookup('env', 'USER') }}"
+keel_reconcile_ssh_command: >-
+  ssh -i {{ keel_reconcile_deploy_key }}
+  -o IdentitiesOnly=yes
+  -o IdentityAgent=none
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=yes
+  -o UserKnownHostsFile={{ keel_reconcile_known_hosts }}
+
+# ── AUTOMATIC DEPLOYMENT ────────────────────────────────────────────────────
+#
+# True for DEV: the environment reconciles to eligible releases without a human
+# in the loop. That is the point of this milestone. Set false to make the role
+# report the drift and change nothing, which is what a PROD site would want.
+keel_reconcile_auto_deploy: true
+
+# ── STATE ON THE HOST ───────────────────────────────────────────────────────
+#
+# ⚠️ THE RECORD LIVES WHERE THE THING IT DESCRIBES LIVES. "What is this host
+# running" is a fact about the host, so the answer is on the host — not in the
+# controller's working directory, which is a laptop that may be reimaged, and
+# not only in a log that rotates. It sits beside the role's existing builds/,
+# data/, secrets/ and env/ directories and adds nothing to their semantics.
+keel_reconcile_state_dir: "{{ keel_root }}/releases"
+keel_reconcile_current_file: "{{ keel_reconcile_state_dir }}/current.json"
+keel_reconcile_attempts_dir: "{{ keel_reconcile_state_dir }}/attempts"
+keel_reconcile_evidence_dir: "{{ keel_reconcile_state_dir }}/evidence"
+
+# ── THE LOCK ────────────────────────────────────────────────────────────────
+#
+# Two reconcilers deploying at once would interleave `docker compose up` with a
+# migration, which is how a schema ends up half-applied. A systemd timer will
+# not overlap ITSELF, but an operator running the playbook by hand while the
+# timer fires is the ordinary case, not the exotic one.
+keel_reconcile_lock_dir: "{{ keel_reconcile_state_dir }}/reconcile.lock"
+
+# ⚠️ REPORTED, NEVER BROKEN AUTOMATICALLY. A lock older than this is probably
+# stale — but "probably" is doing far too much work when being wrong means two
+# deployments at once. The role refuses and prints the exact command to clear
+# it, so a human decides whether the previous run is really gone.
+keel_reconcile_lock_max_age_seconds: 3600
+
+# ── RETRY POLICY ────────────────────────────────────────────────────────────
+#
+# ⚠️ A TIMER PLUS AN UNCONDITIONAL RETRY IS AN INFINITE RETRY. Without this, a
+# release that cannot deploy would be attempted every time the timer fires,
+# forever: restarting the stack each time, filling the evidence directory, and
+# burying the first and only useful failure under a thousand identical ones.
+#
+# Two attempts: one for a genuinely transient failure (a registry blip, a
+# temporarily unreachable host), and then it stops and waits for a person.
+keel_reconcile_max_attempts: 2
+
+# How many evidence directories to keep. Enough to see a regression and the two
+# releases either side of it, bounded so it cannot fill the data volume.
+keel_reconcile_evidence_keep: 20
+
+# ── ESCALATION ──────────────────────────────────────────────────────────────
+#
+# When a deployment fails after migrations may have run, the release's own
+# `migrations.requiresManualRecoveryOnFailure` says the site must escalate
+# rather than claim a rollback fixed it. Keel's migrations are forward-only and
+# there is no down-migration runner, so redeploying the previous image does NOT
+# restore the previous schema.
+keel_reconcile_auto_rollback: false

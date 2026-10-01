@@ -37,6 +37,90 @@
 # unset means absent.
 keel_commit: 9b0d36f008e726f830d96c4a3932b28d13bf68dd
 
+# ── RELEASE MODE ────────────────────────────────────────────────────────────
+#
+# Empty means the ordinary mode above: deploy the pinned `keel_commit` by
+# building its images on the host. Set to a `keel.release/v1` manifest on the
+# CONTROLLER and the role instead deploys that release — its commit, its exact
+# image digests — and skips the host build entirely. See tasks/release.yml.
+#
+# ⚠️ IT IS A CONTROLLER PATH, NOT A HOST PATH. The instruction about what to run
+# is fetched, verified and decided on the administration side; a managed host is
+# never asked what it should be running.
+keel_release_manifest_file: ""
+
+# The contract this controller implements. A manifest declaring anything else is
+# refused rather than best-effort parsed.
+keel_release_schema_version: keel.release/v1
+
+# This controller's own version, compared against the release's
+# `minimumControllerVersion`. Bump it when this role gains the ability to honour
+# a new required field — that is what lets a producer say "a site older than
+# this must refuse me" and be believed.
+keel_controller_version: "1.0.0"
+
+# ⚠️ THE ONLY REGISTRY THIS SITE WILL AUTHENTICATE TO. Derived-then-checked:
+# release-bundle.yml reads the registry out of the release's own image
+# repositories and refuses if it is not this one. Without the check, a
+# manifest naming an unqualified repository would make `docker login` default
+# to Docker Hub and send a GHCR token to a different company.
+keel_release_expected_registry: ghcr.io
+
+# The image roles compose.lab.yml resolves: `${KEEL_IMAGE}` and
+# `${KEEL_WEB_IMAGE}`. A release that does not name both cannot be deployed
+# here, and saying so early beats compose failing after the stack is down.
+keel_release_required_roles:
+  - gateway
+  - web
+
+# ── WHAT PROVENANCE THIS ENVIRONMENT WILL ACCEPT ────────────────────────────
+#
+# ⚠️ THIS REPLACED A BOOLEAN, AND THE BOOLEAN IS GONE RATHER THAN KEPT BESIDE
+# IT. `keel_release_require_provenance: true/false` could not express the
+# question that actually arises. It conflated three different things:
+#
+#   · "this release carries persisted provenance"      (a fact about a release)
+#   · "verify it"                                       (an action)
+#   · "I am a fixture with nothing to verify"           (a test concession)
+#
+# so `false` was the only way to run a release that genuinely cannot be
+# attested — and `false` also silently disabled verification for one that
+# could. An operator reading it could not tell which situation they were in,
+# and a fixture's concession was the same switch as a production bypass.
+#
+# The producer now states, in the release itself, whether provenance was
+# persisted (`provenance.attestation.status`). So the site's question is no
+# longer "verify or not" but WHICH RELEASES THIS ENVIRONMENT WILL ACCEPT:
+#
+#   require_persisted  — only a release whose provenance was actually
+#                        persisted and verifies. THE DEFAULT, and what every
+#                        environment gets unless it says otherwise.
+#   allow_unavailable  — additionally accept a release that HONESTLY DECLARES
+#                        it could not be attested, provided it still carries
+#                        immutable digests, an SBOM identity and a reason.
+#                        A persisted release is still verified normally.
+#
+# ⚠️ THE DEFAULT IS THE STRICT ONE, SO A FUTURE PROD INHERITS IT BY EXISTING.
+# `allow_unavailable` has to be written down, in one inventory, on purpose —
+# and `inventory/group_vars/keel_dev/` is the only place it is. A new
+# environment that says nothing gets `require_persisted`, which is the safe
+# direction for the mistake somebody will eventually make.
+#
+# ⚠️ AND THERE IS NO "TURN VERIFICATION OFF". Offline fixtures declare
+# `allow_unavailable` and must then satisfy the unavailable contract in full
+# (status, mechanism `none`, a reason, a well-formed SBOM identity). A fixture
+# can no longer skip the checks by asserting nothing.
+#
+# Anything other than these two exact values fails closed — see the policy
+# gate at the top of tasks/release.yml.
+keel_release_provenance_policy: require_persisted
+
+# The two values the policy gate accepts. Named here so the role, the tests and
+# the failure message all read the same list rather than three copies of it.
+keel_release_provenance_policies:
+  - require_persisted
+  - allow_unavailable
+
 # Derived. `sha-9b0d36f0` — short enough to read, long enough to be unambiguous.
 keel_commit_short: "{{ keel_commit[:8] }}"
 keel_image_tag: "sha-{{ keel_commit_short }}"

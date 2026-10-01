@@ -1,0 +1,209 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE BOUNDARIES THE DEV DELIVERY DESIGN DEPENDS ON.
+#
+#   ansible-playbook tests/reconcile-boundaries.yml
+#
+# These are STRUCTURAL checks, and that is a deliberate and limited claim. They
+# prove that the code has no path which bypasses a guarantee — they do not
+# prove the guarantee holds at runtime. Where a property can be exercised it is
+# exercised instead, in tests/release-contract.yml, tests/reconcile-lock.yml
+# and tests/reconcile-decisions.yml. What is left here is the class of property
+# whose failure mode is "somebody added a second way to do it", and for that a
+# structural check is the right instrument.
+#
+# Controller-only: reads files.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Structural boundaries of the DEV delivery path
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    reconcile_tasks:
+      - ../roles/keel_reconcile/tasks/main.yml
+      - ../roles/keel_reconcile/tasks/decide.yml
+      - ../roles/keel_reconcile/tasks/lock.yml
+      - ../roles/keel_reconcile/tasks/evidence.yml
+
+  tasks:
+    - name: Read every task file of the reconcile role
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      register: reconcile_raw
+      loop: "{{ reconcile_tasks }}"
+
+    - name: As one body of text
+      ansible.builtin.set_fact:
+        reconcile_text: >-
+          {{ reconcile_raw.results | map(attribute='content') | map('b64decode') | join('\n') }}
+
+    # ── ONE DEPLOYER ────────────────────────────────────────────────────────
+
+    - name: The reconciler deploys through roles/keel and not by itself
+      # ⚠️ IMPROVE THE CANONICAL OWNER, DO NOT STAND UP A SECOND ONE. roles/keel
+      # is this repository's deployer. A reconciler that grew its own
+      # `docker compose up` would be a second deployer, and the two would drift
+      # — the first divergence being the one nobody notices.
+      ansible.builtin.assert:
+        that:
+          # ⚠️ QUOTED. An unquoted `- x is search('name: keel')` contains ": "
+          # and YAML reads the whole item as a MAPPING, which Ansible then
+          # rejects with "Conditional expressions must be strings".
+          - reconcile_text is search('include_role')
+          - "reconcile_text is search('name: keel')"
+        fail_msg: >-
+          roles/keel_reconcile does not include roles/keel, so it is deploying
+          by some other means. There must be exactly one thing that knows how
+          to put Keel on a host.
+        success_msg: "The reconciler delegates to roles/keel."
+
+    - name: It never runs migrations itself
+      # ⚠️ THE CANONICAL MIGRATION OWNER IS THE COMPOSE `migrate` SERVICE,
+      # driven by roles/keel deploy.yml. A second migration path would run
+      # against the same database with different ordering guarantees, and
+      # Keel's migrations are forward-only — a wrong one is not undoable.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is not search('migrate-cli')
+          - reconcile_text is not search('run migrate')
+          - reconcile_text is not search('psql')
+        fail_msg: >-
+          roles/keel_reconcile appears to run migrations directly. Migrations
+          belong to the compose `migrate` service that roles/keel drives; a
+          second runner against the same forward-only schema is unrecoverable
+          when it is wrong.
+        success_msg: "Migrations stay with their canonical owner."
+
+    - name: It never builds an image
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is not search('docker build')
+        fail_msg: >-
+          roles/keel_reconcile builds an image. A site never builds — that is
+          the entire point of deploying an attested artifact by digest.
+        success_msg: "The site does not build."
+
+    # ── NO PATH THAT SKIPS VERIFICATION ─────────────────────────────────────
+
+    - name: The reconciler may READ the policy but never SET it
+      # ⚠️ THE DISTINCTION IS THE WHOLE POINT, and the first version of this
+      # check could not make it. It forbade the string outright — which was
+      # right while the reconciler had no business knowing the policy, and
+      # became wrong the moment it had to RECORD the policy in the attempt
+      # record, current.json and failure evidence. Banning the name would
+      # have forced the recording out, and "what assurance did this
+      # deployment have" would be unanswerable from the host.
+      #
+      # So: an ASSIGNMENT (`keel_release_provenance_policy:` as a key, or a
+      # `vars:` entry) is forbidden — that is the reconciler overriding the
+      # environment's decision. A READ inside `{{ … }}` is required.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is not search('^\s*keel_release_provenance_policy\s*:')
+        fail_msg: >-
+          roles/keel_reconcile ASSIGNS keel_release_provenance_policy. The
+          reconciler must not choose the site's posture — that belongs in
+          inventory, where an operator reads it. Reading the value to record
+          it is fine; setting it is not.
+        success_msg: "The reconciler records the policy but cannot set it."
+
+    - name: And it DOES record what assurance the deployment had
+      # ⚠️ THE OTHER HALF OF THE RULE ABOVE, AND THE LOAD-BEARING ONE. Forbidding
+      # the reconciler to SET the policy is only half a guarantee; if it also
+      # failed to WRITE DOWN which policy applied and what the attestation
+      # said, then months later nothing on the host could answer "was the
+      # release this box is running ever attested?" — and the honest
+      # `allow_unavailable` concession would have become invisible, which is
+      # precisely the outcome the enum replaced the boolean to prevent.
+      #
+      # current.json is the host's standing answer, so all four fields are
+      # required there.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is search("'provenancePolicy':")
+          - reconcile_text is search("'attestation':")
+          - reconcile_text is search("'sbom':")
+          - reconcile_text is search("'assurance':")
+        fail_msg: >-
+          roles/keel_reconcile does not record the full provenance state it
+          deployed under. current.json must carry provenancePolicy,
+          attestation, sbom and assurance — without them the host cannot say
+          afterwards whether what it is running was ever attested, and the
+          DEV exception stops being visible anywhere a person would look.
+        success_msg: "The reconciler records the policy, attestation, SBOM and assurance."
+
+    - name: And the retired boolean appears nowhere in the reconciler
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is not search('keel_release_require_provenance')
+        fail_msg: >-
+          roles/keel_reconcile still mentions keel_release_require_provenance,
+          which no longer controls anything.
+        success_msg: "The retired boolean is absent from the reconciler."
+
+    - name: The manifest is handed over as a file, not as a variable
+      # `gh attestation verify` checks BYTES. A manifest passed as a dict and
+      # re-serialised somewhere else is a different sequence of bytes, and
+      # would verify against nothing.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is search('keel_release_manifest_file')
+        fail_msg: >-
+          The release is not handed to the deployer as a file path, so the
+          exact signed bytes are not what gets verified.
+        success_msg: "The signed bytes are what gets verified."
+
+    # ── THE DEPLOYER'S OWN GUARANTEE ────────────────────────────────────────
+
+    - name: Read the deployer's entry point
+      ansible.builtin.slurp:
+        src: ../roles/keel/tasks/main.yml
+      register: keel_main_raw
+
+    - name: Release mode skips the host build, and ordinary mode still builds
+      # Both directions matter. A release-mode run that also built would
+      # publish-then-overwrite with an unattested local image; an ordinary run
+      # that stopped building would break every existing deployment.
+      ansible.builtin.assert:
+        that:
+          - (keel_main_raw.content | b64decode) is search('keel_release_manifest_file \| length == 0')
+          - (keel_main_raw.content | b64decode) is search('build.yml')
+        fail_msg: >-
+          roles/keel/tasks/main.yml does not gate build.yml on release mode. In
+          release mode the host would build an image with a different digest
+          than the one that was gated and attested.
+        success_msg: "Release mode pulls; ordinary mode still builds."
+
+    # ── THE SCHEDULER ───────────────────────────────────────────────────────
+    #
+    # ⚠️ MOVED TO tests/controller-scheduler.yml, AND NOT LOST. The scheduling
+    # assertions used to live here and read the systemd units directly. They
+    # are now a suite of their own because the question grew: the console runs
+    # macOS, so the live scheduler is a launchd plist, the systemd units are a
+    # retained Linux variant, and both must be held to the same rule — invoke
+    # the wrapper, never restart into a loop, carry no credential. A check
+    # that reads one scheduler's file by name cannot say that.
+    #
+    # What stays here is the boundary this role owns: the reconciler itself
+    # must not become a second scheduler.
+
+    - name: The reconcile role does not schedule itself
+      # A role that installed its own timer, plist or cron entry would be a
+      # second place the schedule is decided — and the one nobody thinks to
+      # look at when the site deploys at an unexpected moment.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is not search('cron')
+          - reconcile_text is not search('launchctl')
+          - reconcile_text is not search('systemd_service')
+        fail_msg: >-
+          roles/keel_reconcile installs or manipulates a scheduler. WHEN to
+          reconcile is the scheduler's decision and the administrator's to
+          install; this role only ever answers WHETHER to deploy right now.
+        success_msg: "The reconciler decides whether, never when."
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "boundaries: one deployer, one migration owner, no verification bypass, no self-scheduling."
