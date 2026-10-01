@@ -133,14 +133,70 @@
           auto-deploy {{ devvars.keel_reconcile_auto_deploy | default('(unset)') }}.
         success_msg: "DEV reconciles automatically to the dev channel."
 
-    - name: DEV verifies provenance
+    - name: DEV explicitly declares the reduced-assurance policy
+      # ⚠️ EXPLICIT, AND ONLY HERE. The role's default is `require_persisted`;
+      # DEV opts out in writing because the producer genuinely cannot persist
+      # attestations for this repository type. An environment that accepts an
+      # unattested release without saying so is the thing this asserts against.
       ansible.builtin.assert:
         that:
-          - devvars.keel_release_require_provenance | bool
+          - devvars.keel_release_provenance_policy is defined
+          - devvars.keel_release_provenance_policy == 'allow_unavailable'
         fail_msg: >-
-          DEV does not verify release provenance, so any manifest that merely
-          parses would be deployed.
-        success_msg: "DEV verifies release provenance."
+          DEV declares keel_release_provenance_policy
+          "{{ devvars.keel_release_provenance_policy | default('(unset)') }}".
+          It must be exactly `allow_unavailable` — DEV is the one environment
+          permitted to consume a release whose provenance could not be
+          persisted, and it has to say so.
+        success_msg: "DEV declares allow_unavailable, explicitly."
+
+    - name: The retired boolean is absent from the DEV inventory
+      ansible.builtin.assert:
+        that:
+          - devvars.keel_release_require_provenance is not defined
+        fail_msg: >-
+          The DEV inventory still sets keel_release_require_provenance. It no
+          longer controls anything and the role now refuses when it is
+          present, because an operator who sets it believes they configured
+          something they did not.
+        success_msg: "The retired boolean is gone from DEV."
+
+    - name: NO OTHER INVENTORY PERMITS AN UNATTESTED RELEASE
+      # ⚠️ THE CONTAINMENT CHECK. `allow_unavailable` spreading by
+      # copy-and-paste is how a future PROD quietly inherits DEV's exception,
+      # so spreading it is a test failure rather than a habit. Scans every
+      # group_vars and host_vars file EXCEPT keel_dev.
+      ansible.builtin.find:
+        paths:
+          - ../inventory/group_vars
+          - ../inventory/host_vars
+        patterns: '*.yml'
+        recurse: true
+        excludes: []
+      register: inv_files
+      failed_when: false
+
+    - name: Read each one
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: inv_contents
+      loop: "{{ inv_files.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Only keel_dev may say allow_unavailable
+      ansible.builtin.assert:
+        that:
+          - not ((item.content | b64decode) is search('allow_unavailable'))
+        fail_msg: >-
+          {{ item.item.path }} contains `allow_unavailable`, but only
+          inventory/group_vars/keel_dev/ may. A production environment must
+          inherit `require_persisted` from the role default by saying nothing.
+        success_msg: "{{ item.item.path | basename }}: no unattested exception."
+      loop: "{{ inv_contents.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path | basename }}"
+      when: "'/keel_dev/' not in item.item.path"
 
     - name: Done
       ansible.builtin.debug:

@@ -26,6 +26,8 @@
 
   vars:
     case_file: /tmp/keel-release-contract-fixture.json
+    gh_stub_dir: /tmp/keel-release-contract-ghstub
+    gh_log: /tmp/keel-release-contract-ghstub/invocations.log
     d64: "1111111111111111111111111111111111111111111111111111111111111111"
     e64: "2222222222222222222222222222222222222222222222222222222222222222"
     sha40: "938f25ac6474b7408d425be600220ce9c52de87e"
@@ -39,22 +41,63 @@
       ansible.builtin.include_vars:
         file: ../roles/keel/defaults/main.yml
 
+    # ── THE RECORDING `gh` STUB ─────────────────────────────────────────────
+    #
+    # A persisted fixture's digests were never published, so the real
+    # verifier exits non-zero and the role correctly refuses — which would
+    # make the acceptance cases untestable offline. The stub records every
+    # invocation instead, and the per-case assertions read that log to prove
+    # verification ran for `persisted` and did NOT run for `unavailable`.
+    #
+    # ⚠️ IT NEVER PRETENDS A REAL VERIFICATION SUCCEEDED anywhere outside this
+    # suite: it exists only on a PATH this play constructs, in /tmp, and is
+    # removed at the end.
+    - name: Create the gh stub directory
+      ansible.builtin.file:
+        path: "{{ gh_stub_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install the recording gh stub
+      ansible.builtin.copy:
+        dest: "{{ gh_stub_dir }}/gh"
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          # Test double. Records what it was asked to do and succeeds.
+          echo "$*" >> "{{ gh_log }}"
+          exit 0
+
     # ── THE SHIPPED POSTURE ─────────────────────────────────────────────────
     #
-    # ⚠️ ASSERTED BEFORE ANY CASE RUNS, because every case below turns
-    # provenance verification OFF to work offline. Without this, the suite
-    # would be compatible with a role that never verifies provenance at all —
-    # which is the single most important thing the role does.
-    - name: Provenance verification is ON by default, as shipped
+    # ⚠️ ASSERTED BEFORE ANY CASE RUNS. Most cases below declare
+    # `allow_unavailable` so they can run offline; without this the suite
+    # would be equally happy with a role that SHIPPED permissive, which is
+    # the one thing that must never be true.
+    - name: The shipped policy is the strict one
       ansible.builtin.assert:
         that:
-          - keel_release_require_provenance | bool
+          - keel_release_provenance_policy == 'require_persisted'
         fail_msg: >-
           roles/keel/defaults/main.yml ships
-          keel_release_require_provenance=false. Every release would then be
-          deployed without checking that its images and manifest came from the
-          expected repository — and every case in this suite would still pass.
-        success_msg: "Shipped default verifies provenance."
+          keel_release_provenance_policy={{ keel_release_provenance_policy }}.
+          The default must be `require_persisted` so that a new environment —
+          including a future PROD — inherits the strict policy by saying
+          nothing at all.
+        success_msg: "Shipped default is require_persisted."
+
+    - name: The retired boolean is gone from the role entirely
+      # Not merely unused: absent. A variable that still exists is one an
+      # operator can set and believe in.
+      ansible.builtin.assert:
+        that:
+          - keel_release_require_provenance is not defined
+        fail_msg: >-
+          keel_release_require_provenance still exists in the role's defaults.
+          It was replaced by keel_release_provenance_policy; leaving it would
+          give an operator a switch that looks like it controls verification
+          and does not.
+        success_msg: "The retired boolean is gone."
 
     - name: Release mode is OFF by default, so an ordinary deploy is unchanged
       ansible.builtin.assert:
@@ -95,11 +138,33 @@
                 expectStatus: 200
               - path: /readyz
                 expectStatus: 200
-          provenance:
-            mechanism: github-artifact-attestation
+          provenance: &prov_unavailable
+            # The DEFAULT fixture shape is the one the real channel carries
+            # today: honestly unattested. Cases that need a persisted release
+            # override `provenance` with `*prov_persisted` below.
+            mechanism: none
             repository: meetyaks/keel
             workflowRef: meetyaks/keel/.github/workflows/dev-release.yml@refs/heads/main
             runId: "999"
+            attestation:
+              status: unavailable
+              reason: GitHub artifact attestations are not available for user-owned private repositories
+            sbom:
+              format: spdx-json
+              sha256: "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"
+
+    - name: A persisted provenance statement, for the cases that need one
+      ansible.builtin.set_fact:
+        prov_persisted: &prov_persisted
+          mechanism: github-artifact-attestation
+          repository: meetyaks/keel
+          workflowRef: meetyaks/keel/.github/workflows/dev-release.yml@refs/heads/main
+          runId: "999"
+          attestation:
+            status: persisted
+          sbom:
+            format: spdx-json
+            sha256: "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"
 
     - name: Run every case
       ansible.builtin.include_tasks: release-contract-case.yml
@@ -250,10 +315,170 @@
           manifest:
             <<: *base
             minimumControllerVersion: "99.0.0"
+
+        # ── PROVENANCE POLICY ───────────────────────────────────────────────
+        #
+        # The question this whole enum exists to answer: which releases will
+        # THIS environment deploy. A malformed statement is refused for
+        # everybody; a well-formed `unavailable` only by an environment that
+        # has not opted in.
+
+        - name: persisted under require_persisted is accepted
+          expect: accepted
+          policy: require_persisted
+          manifest:
+            <<: *base
+            provenance: *prov_persisted
+
+        - name: persisted under allow_unavailable is still accepted
+          # allow_unavailable WIDENS what is accepted; it does not weaken what
+          # is checked. A persisted release is verified either way.
+          expect: accepted
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance: *prov_persisted
+
+        - name: unavailable with a reason under allow_unavailable is accepted
+          expect: accepted
+          policy: allow_unavailable
+          manifest: *base
+
+        - name: UNAVAILABLE UNDER require_persisted IS REFUSED
+          # The case the default exists for. A future PROD inherits this by
+          # saying nothing at all.
+          expect: refused
+          because: policy is `require_persisted`
+          policy: require_persisted
+          manifest: *base
+
+        - name: unavailable without a reason is refused
+          expect: refused
+          because: with no reason
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance:
+              mechanism: none
+              repository: meetyaks/keel
+              workflowRef: wf@refs/heads/main
+              runId: "999"
+              attestation: {status: unavailable}
+              sbom: {format: spdx-json, sha256: "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"}
+
+        - name: unavailable claiming the attestation mechanism is refused
+          # The forgery: looks signed to whichever field a reader trusts.
+          expect: refused
+          because: contradict each other
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance:
+              mechanism: github-artifact-attestation
+              repository: meetyaks/keel
+              workflowRef: wf@refs/heads/main
+              runId: "999"
+              attestation: {status: unavailable, reason: cannot sign}
+              sbom: {format: spdx-json, sha256: "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"}
+
+        - name: persisted with mechanism none is refused
+          expect: refused
+          because: contradict each other
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance:
+              mechanism: none
+              repository: meetyaks/keel
+              workflowRef: wf@refs/heads/main
+              runId: "999"
+              attestation: {status: persisted}
+              sbom: {format: spdx-json, sha256: "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"}
+
+        - name: a release with no attestation statement is refused
+          expect: refused
+          because: complete provenance statement
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance:
+              mechanism: none
+              repository: meetyaks/keel
+              workflowRef: wf@refs/heads/main
+              runId: "999"
+              sbom: {format: spdx-json, sha256: "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"}
+
+        - name: an unknown attestation status is refused
+          expect: refused
+          because: does not define
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance:
+              mechanism: none
+              repository: meetyaks/keel
+              workflowRef: wf@refs/heads/main
+              runId: "999"
+              attestation: {status: probably-fine, reason: x}
+              sbom: {format: spdx-json, sha256: "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"}
+
+        - name: a release with no SBOM identity is refused
+          expect: refused
+          because: complete provenance statement
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance:
+              mechanism: none
+              repository: meetyaks/keel
+              workflowRef: wf@refs/heads/main
+              runId: "999"
+              attestation: {status: unavailable, reason: cannot sign}
+
+        - name: a malformed SBOM sha256 is refused
+          expect: refused
+          because: complete provenance statement
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance:
+              mechanism: none
+              repository: meetyaks/keel
+              workflowRef: wf@refs/heads/main
+              runId: "999"
+              attestation: {status: unavailable, reason: cannot sign}
+              sbom: {format: spdx-json, sha256: deadbeef}
+
+        - name: a missing SBOM format is refused
+          expect: refused
+          because: complete provenance statement
+          policy: allow_unavailable
+          manifest:
+            <<: *base
+            provenance:
+              mechanism: none
+              repository: meetyaks/keel
+              workflowRef: wf@refs/heads/main
+              runId: "999"
+              attestation: {status: unavailable, reason: cannot sign}
+              sbom: {sha256: "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"}
+
+        - name: an invalid policy value is refused
+          # Fail closed: a typo must not fall through to the permissive branch.
+          expect: refused
+          because: does not understand
+          policy: allow-unavailable
+          manifest: *base
+
+        - name: an empty policy value is refused
+          expect: refused
+          because: does not understand
+          policy: ""
+          manifest: *base
       loop_control:
         loop_var: case
         label: "{{ case.name }}"
 
     - name: All cases behaved as specified
       ansible.builtin.debug:
-        msg: "release contract: 14 cases (2 accepted, 12 refused for the stated reason)."
+        msg: "release contract: 28 cases (schema, digests, identity, roles, controller version, provenance policy)."

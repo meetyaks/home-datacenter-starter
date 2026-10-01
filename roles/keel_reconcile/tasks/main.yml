@@ -144,6 +144,15 @@
       - "host has       {{ keel_reconcile_current.releaseId | default('(no record — never reconciled)') }}"
       - "attempts       {{ keel_reconcile_attempts }} of {{ keel_reconcile_max_attempts }}"
       - "auto-deploy    {{ keel_reconcile_auto_deploy | bool }}"
+      # ⚠️ DRIFT IS NOT ONLY "WHICH RELEASE". Moving from a persisted release
+      # to an unavailable one is a change in assurance, and an operator
+      # reading this line should see it before the deployment, not discover it
+      # in current.json afterwards.
+      - "running        {{ (keel_reconcile_current.attestation.status | default('unknown'))
+                           if keel_reconcile_current.releaseId is defined else 'n/a' }} provenance"
+      - "offered        {{ keel_reconcile_channel_doc.release.provenance.attestation.status
+                           | default('(absent)') }} provenance"
+      - "policy         {{ keel_release_provenance_policy | default('(from role default)') }}"
 
 # ── 3. THE DECISION ─────────────────────────────────────────────────────────
 
@@ -280,7 +289,11 @@
                'gitSha': keel_reconcile_channel_doc.release.gitSha,
                'attempts': (keel_reconcile_attempts | int) + 1,
                'lastAttemptAt': ansible_date_time.iso8601,
-               'lastAttemptBy': lookup('env', 'USER') ~ '@' ~ lookup('env', 'HOSTNAME')
+               'lastAttemptBy': lookup('env', 'USER') ~ '@' ~ lookup('env', 'HOSTNAME'),
+               'provenancePolicy': keel_release_provenance_policy | default('(unset)'),
+               'attestation': keel_reconcile_channel_doc.release.provenance.attestation
+                              | default({'status': '(absent)'}),
+               'sbom': keel_reconcile_channel_doc.release.provenance.sbom | default({})
              } | to_nice_json(indent=2) }}
         dest: "{{ keel_reconcile_attempts_dir }}/{{ keel_reconcile_channel_doc.release.releaseId }}.json"
         owner: "{{ keel_owner }}"
@@ -311,7 +324,11 @@
                'deployedAt': ansible_date_time.iso8601,
                'deployedBy': lookup('env', 'USER') ~ '@' ~ lookup('env', 'HOSTNAME'),
                'channel': keel_reconcile_channel,
-               'channelAdvanced': keel_reconcile_channel_doc.advanced
+               'channelAdvanced': keel_reconcile_channel_doc.advanced,
+               'provenancePolicy': keel_release_provenance_policy | default('(unset)'),
+               'attestation': keel_reconcile_channel_doc.release.provenance.attestation,
+               'sbom': keel_reconcile_channel_doc.release.provenance.sbom,
+               'assurance': keel_release_assurance | default('(unrecorded)')
              } | to_nice_json(indent=2) }}
         dest: "{{ keel_reconcile_current_file }}"
         owner: "{{ keel_owner }}"

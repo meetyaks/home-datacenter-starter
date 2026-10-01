@@ -153,9 +153,11 @@ echo "══ deployment lock (3 scenarios, real directory) ═══════
 ansible-playbook tests/reconcile-lock.yml
 
 echo
-echo "══ reconcile boundaries (8 structural checks) ═════════════════════"
+echo "══ reconcile boundaries (9 structural checks) ═════════════════════"
 # One deployer, one migration owner, no path that weakens provenance
-# verification, no systemd restart loop.
+# verification, no systemd restart loop — and the reconciler records which
+# policy and what assurance it deployed under, which is the half of that rule
+# a prohibition alone cannot express.
 ansible-playbook tests/reconcile-boundaries.yml
 
 echo
@@ -164,6 +166,31 @@ echo "══ reconcile check mode (13 checks, real channel repository) ═══
 # BEFORE it reaches roles/keel, and neither is a dry run of anything. Builds a
 # local git repository so the real `git` task is exercised without a network.
 tests/run-reconcile-check-mode.sh
+
+echo
+echo "══ the published release, read by this reader ════════════════════"
+# ⚠️ THE ONE SUITE WHOSE INPUT THIS REPOSITORY DID NOT WRITE. Every fixture
+# above agrees with the reader because the same hand wrote both. This runs the
+# reader against a byte-for-byte copy of the document meetyaks/keel actually
+# published to release/dev: refused under the shipped default, resolved under
+# DEV's policy, and never verified — because it declares there is nothing to
+# verify. Read-only; deploys nothing.
+ansible-playbook tests/published-release-proof.yml
+tests/run-published-release-check-mode.sh
+
+echo
+echo "══ provenance mutations (14 checks) ══════════════════════════════"
+# ⚠️ A GUARD THAT HAS NEVER FAILED IS NOT A GUARD. Breaks the policy eleven
+# ways in turn and proves the suites above go red FOR THAT REASON — a
+# rejection for the wrong reason is not a pass. Restores every file it edits.
+#
+# Slow: it runs three suites twelve times. Set KEEL_SKIP_MUTATIONS=1 to leave
+# it out of a quick loop, and never out of a release check.
+if [ "${KEEL_SKIP_MUTATIONS:-0}" = "1" ]; then
+  echo "SKIPPED by KEEL_SKIP_MUTATIONS=1 — the policy guards are UNPROVEN in this run."
+else
+  tests/run-provenance-mutations.sh
+fi
 
 echo
 echo "All regression suites passed."

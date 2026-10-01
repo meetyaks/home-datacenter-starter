@@ -1,0 +1,66 @@
+{
+  "schemaVersion": "keel.channel/v1",
+  "channel": "dev",
+  "release": {
+    "schemaVersion": "keel.release/v1",
+    "releaseId": "keel-20261001T010103Z-5bb120c97b56",
+    "gitSha": "5bb120c97b56bfe4c5da7d05d46de368fab62955",
+    "createdAt": "2026-10-01T01:01:03Z",
+    "images": [
+      {
+        "role": "gateway",
+        "repository": "ghcr.io/meetyaks/keel",
+        "digest": "sha256:2a70d34568b040b578b88132d127ebcda7cb927d13399fc020ec5383aeffbab5"
+      },
+      {
+        "role": "web",
+        "repository": "ghcr.io/meetyaks/keel-web",
+        "digest": "sha256:89c9e466cf8ee4717501806ed2026276d1803e55674482966b437a8d22f23c0a"
+      }
+    ],
+    "bundle": {
+      "composePath": "infra/lab/compose.lab.yml",
+      "sha256": "74033b96ae9b37a83e4bd3aab9ee91a13afef6f425041316a062d77c63be9aad"
+    },
+    "migrations": {
+      "headId": "306_app_actor_scoped_bindings.sql",
+      "count": 298,
+      "requiresManualRecoveryOnFailure": true
+    },
+    "minimumControllerVersion": "1.0.0",
+    "platformVersion": "0.1.2",
+    "health": {
+      "version": 1,
+      "endpoints": [
+        {
+          "path": "/healthz",
+          "expectStatus": 200
+        },
+        {
+          "path": "/readyz",
+          "expectStatus": 200
+        }
+      ]
+    },
+    "provenance": {
+      "mechanism": "none",
+      "repository": "meetyaks/keel",
+      "workflowRef": "meetyaks/keel/.github/workflows/dev-release.yml@refs/heads/main",
+      "runId": "36796599475",
+      "attestation": {
+        "status": "unavailable",
+        "reason": "GitHub artifact attestations are not available for user-owned private repositories (observed on run 36689645463); this release carries immutable image digests and an SBOM identity but no persisted provenance."
+      },
+      "sbom": {
+        "format": "spdx-json",
+        "sha256": "d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea"
+      }
+    }
+  },
+  "advanced": {
+    "at": "2026-10-01T01:01:04Z",
+    "by": "meetyaks/keel/.github/workflows/dev-release.yml@refs/heads/main run 36796599475 by meetyaks",
+    "reason": "the channel is empty",
+    "rollback": false
+  }
+}

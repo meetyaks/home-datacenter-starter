@@ -1,0 +1,306 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE READER, AGAINST THE RELEASE THAT ACTUALLY EXISTS.
+#
+#   ansible-playbook tests/published-release-proof.yml
+#
+# Every other suite here runs on fixtures this repository wrote, and fixtures
+# agree with the reader because the same person wrote both. This one runs on
+# tests/published-release-dev-channel.json — a byte-for-byte copy of
+# channels/dev.json as published by meetyaks/keel on the `release/dev` branch
+# at commit f0bf450565ee3f4e0890b143368eaf4c9f15150d, the first real
+# keel.release/v1 publication. Nothing in it was written to make this pass.
+#
+# ⚠️ IT IS A RECORDING, NOT A MIRROR. The channel will advance; this file will
+# not. It is pinned evidence that the reader shipped in this PR understands the
+# document the producer shipped — which is a claim about a moment, and the
+# assertions below name that moment's release id. When the channel advances,
+# this suite keeps testing the recorded release and keeps being true. It is not
+# a substitute for the live read the operator does at deploy time.
+#
+# ⚠️ READ-ONLY, AND NOTHING IS DEPLOYED. This resolves the release and stops.
+# It contacts no host, pulls no image, writes no lock, no attempt record and no
+# current.json. `gh` is replaced by a stub that FAILS — see below — so a run
+# that reaches acceptance has provably not verified anything.
+#
+# Controller-only.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The site reader against the published release/dev document
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    channel_file: published-release-dev-channel.json
+    workdir: /tmp/keel-published-release-proof
+    manifest_file: /tmp/keel-published-release-proof/release.json
+    gh_stub_dir: /tmp/keel-published-release-proof/bin
+    gh_log: /tmp/keel-published-release-proof/gh.log
+
+    # What the published document says, restated here so the assertions are
+    # about SPECIFIC VALUES rather than about whatever happens to be in the
+    # file. An assertion that read its expectation out of the same document it
+    # is checking would pass against any document at all.
+    expect_release_id: keel-20261001T010103Z-5bb120c97b56
+    expect_git_sha: 5bb120c97b56bfe4c5da7d05d46de368fab62955
+    expect_gateway: >-
+      ghcr.io/meetyaks/keel@sha256:2a70d34568b040b578b88132d127ebcda7cb927d13399fc020ec5383aeffbab5
+    expect_web: >-
+      ghcr.io/meetyaks/keel-web@sha256:89c9e466cf8ee4717501806ed2026276d1803e55674482966b437a8d22f23c0a
+    expect_sbom_sha: d3dfdb1b0e7285a81126d9b67c9b55c58ced0322acdaf62448dac7c939434fea
+
+  tasks:
+    - name: Load the role's real defaults
+      # ⚠️ THE ROLE'S OWN, NOT A COPY. keel_controller_version,
+      # keel_release_schema_version and keel_release_required_roles all come
+      # from roles/keel/defaults/main.yml, so this proves the SHIPPED
+      # controller reads the SHIPPED release.
+      ansible.builtin.include_vars:
+        file: ../roles/keel/defaults/main.yml
+
+    - name: Make a workspace
+      ansible.builtin.file:
+        path: "{{ gh_stub_dir }}"
+        state: directory
+        mode: "0755"
+
+    # ── A `gh` THAT REFUSES TO WORK ─────────────────────────────────────────
+    #
+    # The published release declares `attestation.status: unavailable`, which
+    # means there is nothing signed to check and the reader must not try. A
+    # stub that LOGS AND EXITS 1 turns that into something provable: if any
+    # code path invoked `gh attestation verify`, this play fails. Acceptance
+    # below is therefore evidence that verification was skipped — not an
+    # assumption that it was.
+    - name: Install a gh stub that fails if it is ever called
+      ansible.builtin.copy:
+        dest: "{{ gh_stub_dir }}/gh"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          echo "gh $*" >> "{{ gh_log }}"
+          echo "STUB gh: this release has no attestation; nothing to verify" >&2
+          exit 1
+
+    - name: Start the invocation log empty
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ gh_log }}"
+        mode: "0644"
+
+    # ── MATERIALISE THE RELEASE EXACTLY AS THE RECONCILER DOES ──────────────
+
+    - name: Read the published channel document
+      ansible.builtin.slurp:
+        src: "{{ channel_file }}"
+      register: channel_raw
+
+    - name: Parse it
+      ansible.builtin.set_fact:
+        channel_doc: "{{ channel_raw.content | b64decode | from_json }}"
+
+    - name: It is the channel document this proof was recorded from
+      # If somebody refreshes the recording, these numbers change and the
+      # suite says so rather than silently proving something about a different
+      # release.
+      ansible.builtin.assert:
+        that:
+          - channel_doc.schemaVersion == 'keel.channel/v1'
+          - channel_doc.channel == 'dev'
+          - channel_doc.release.releaseId == expect_release_id
+        fail_msg: >-
+          tests/{{ channel_file }} is not the recorded publication. Expected
+          {{ expect_release_id }} on channel dev, found
+          "{{ channel_doc.release.releaseId | default('(absent)') }}" on
+          "{{ channel_doc.channel | default('(absent)') }}". Update the
+          expected values in this play deliberately, or restore the recording.
+        success_msg: "Recorded publication: {{ channel_doc.release.releaseId }}."
+
+    - name: Write the release out the way roles/keel_reconcile writes it
+      # ⚠️ THE SAME SERIALISATION, DELIBERATELY. `to_nice_json(indent=2)` plus a
+      # trailing newline is what tasks/main.yml does. Using a different one
+      # here would test a document the reconciler never produces.
+      ansible.builtin.copy:
+        content: "{{ channel_doc.release | to_nice_json(indent=2) }}\n"
+        dest: "{{ manifest_file }}"
+        mode: "0644"
+
+    # ── 1. UNDER THE SHIPPED DEFAULT, THIS RELEASE IS REFUSED ───────────────
+
+    - name: Resolve it under require_persisted
+      block:
+        - name: "require_persisted — run the role's reader"
+          ansible.builtin.include_tasks: ../roles/keel/tasks/release.yml
+          args:
+            apply:
+              environment:
+                PATH: "{{ gh_stub_dir }}:{{ lookup('env', 'PATH') }}"
+          vars:
+            keel_release_manifest_file: "{{ manifest_file }}"
+            keel_release_provenance_policy: require_persisted
+
+        - name: "require_persisted — it was accepted"
+          ansible.builtin.set_fact:
+            strict_result: accepted
+            strict_error: ""
+
+      rescue:
+        - name: "require_persisted — it was refused"
+          ansible.builtin.set_fact:
+            strict_result: refused
+            strict_error: >-
+              {{ (ansible_failed_result.msg | default('')) ~ ' | ' ~
+                 (ansible_failed_result.results | default([])
+                  | selectattr('failed', 'defined') | selectattr('failed')
+                  | map(attribute='msg') | join(' | ')) }}
+
+    - name: THE PUBLISHED RELEASE IS REFUSED BY THE SHIPPED DEFAULT
+      # This is the whole point of the enum. A future PROD inherits
+      # `require_persisted` by saying nothing, and this release — honest,
+      # digest-pinned, and unsigned — does not get deployed there.
+      ansible.builtin.assert:
+        that:
+          - strict_result == 'refused'
+        fail_msg: >-
+          The published release was ACCEPTED under require_persisted. Its
+          attestation status is "unavailable"; an environment on the strict
+          default must refuse it.
+        success_msg: "require_persisted refuses the published release."
+
+    - name: And the refusal names the unavailable attestation, not something else
+      # ⚠️ A REFUSAL FOR THE WRONG REASON IS NOT A PASS. If the reader rejected
+      # this document over, say, a digest format, the policy would be untested
+      # and the suite would still be green.
+      ansible.builtin.assert:
+        that:
+          - strict_error is search('unavailable')
+          - strict_error is search('require_persisted')
+          - strict_error is search(expect_release_id)
+        fail_msg: >-
+          require_persisted refused the release, but not for its provenance.
+          Expected a message naming {{ expect_release_id }}, "unavailable" and
+          "require_persisted". Got: {{ strict_error }}
+        success_msg: >-
+          Refused because its provenance is unavailable and the policy is
+          require_persisted.
+
+    - name: Nothing was verified on the way to that refusal
+      ansible.builtin.slurp:
+        src: "{{ gh_log }}"
+      register: gh_after_strict
+
+    - name: "require_persisted — gh was never invoked"
+      ansible.builtin.assert:
+        that:
+          - (gh_after_strict.content | b64decode) | trim | length == 0
+        fail_msg: >-
+          `gh` was invoked while refusing an unavailable release:
+          {{ gh_after_strict.content | b64decode }}
+        success_msg: "No attestation call: there was nothing to verify."
+
+    # ── 2. UNDER DEV'S EXPLICIT POLICY, IT RESOLVES ─────────────────────────
+
+    - name: "allow_unavailable — run the role's reader"
+      ansible.builtin.include_tasks: ../roles/keel/tasks/release.yml
+      args:
+        apply:
+          environment:
+            PATH: "{{ gh_stub_dir }}:{{ lookup('env', 'PATH') }}"
+      vars:
+        keel_release_manifest_file: "{{ manifest_file }}"
+        keel_release_provenance_policy: allow_unavailable
+
+    - name: It resolved the exact digests the producer published
+      # ⚠️ DIGESTS, NOT TAGS, AND THE SPECIFIC ONES. These two strings are the
+      # artifact. If the reader resolved anything else — a tag, the wrong role,
+      # a repository without its digest — this environment would deploy
+      # something other than what was gated.
+      ansible.builtin.assert:
+        that:
+          - keel_commit == expect_git_sha
+          - keel_gateway_image | trim == expect_gateway | trim
+          - keel_web_image | trim == expect_web | trim
+        fail_msg: >-
+          The reader resolved
+          gateway={{ keel_gateway_image | trim }},
+          web={{ keel_web_image | trim }},
+          commit={{ keel_commit }} — not the published artifact.
+        success_msg: >-
+          Resolved {{ keel_gateway_image | trim }} and
+          {{ keel_web_image | trim }} at commit {{ keel_commit[:12] }}.
+
+    - name: It recorded the SBOM identity and the reduced assurance
+      ansible.builtin.assert:
+        that:
+          - keel_release_sbom.format == 'spdx-json'
+          - keel_release_sbom.sha256 == expect_sbom_sha
+          - keel_release_attestation_status == 'unavailable'
+          - keel_release_attestation_mechanism == 'none'
+          - keel_release_attestation_reason | length > 0
+          - keel_release_assurance is search('NOT ATTESTED')
+        fail_msg: >-
+          The resolution did not carry the provenance state forward.
+          status={{ keel_release_attestation_status | default('(unset)') }},
+          mechanism={{ keel_release_attestation_mechanism | default('(unset)') }},
+          sbom={{ keel_release_sbom | default('(unset)') }},
+          assurance={{ keel_release_assurance | default('(unset)') }}.
+          Without these, nothing written to the host afterwards can say what
+          assurance this deployment had.
+        success_msg: >-
+          Recorded: spdx-json sha256:{{ expect_sbom_sha[:16] }}…, assurance
+          "{{ keel_release_assurance | trim }}".
+
+    - name: AND IT NEVER CLAIMED TO HAVE VERIFIED ANYTHING
+      ansible.builtin.slurp:
+        src: "{{ gh_log }}"
+      register: gh_after_permissive
+
+    - name: "allow_unavailable — gh was never invoked either"
+      # The stub exits 1. Reaching this task at all means it was not called —
+      # this assertion makes the evidence explicit rather than implicit.
+      ansible.builtin.assert:
+        that:
+          - (gh_after_permissive.content | b64decode) | trim | length == 0
+          - not (keel_release_assurance is search('(?i)verified'))
+        fail_msg: >-
+          Either `gh attestation verify` ran against a release that declares
+          it has no attestation
+          ({{ gh_after_permissive.content | b64decode }}), or the recorded
+          assurance claims verification: "{{ keel_release_assurance }}".
+        success_msg: >-
+          Accepted without verification, and says so: nothing claims this
+          release was verified.
+
+    # ── 3. THE CONTROLLER VERSION THE PRODUCER ASKED FOR ────────────────────
+
+    - name: This controller satisfies the release's declared minimum
+      # Stage F's decision, executable. The published release asks for
+      # >= 1.0.0 and this controller is 1.0.0. See docs for why consuming a
+      # declared-unavailable attestation did not raise that number.
+      ansible.builtin.assert:
+        that:
+          - channel_doc.release.minimumControllerVersion == '1.0.0'
+          - keel_controller_version is version(channel_doc.release.minimumControllerVersion, '>=')
+        fail_msg: >-
+          The published release requires controller
+          >= {{ channel_doc.release.minimumControllerVersion }} and this one is
+          {{ keel_controller_version }}.
+        success_msg: >-
+          Controller {{ keel_controller_version }} satisfies the published
+          minimum {{ channel_doc.release.minimumControllerVersion }}.
+
+    - name: Clean up the workspace
+      ansible.builtin.file:
+        path: "{{ workdir }}"
+        state: absent
+
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "published release {{ expect_release_id }}"
+          - "require_persisted  REFUSED — provenance unavailable"
+          - "allow_unavailable  resolved {{ keel_commit[:12] }},
+             2 digests, sbom sha256:{{ expect_sbom_sha[:16] }}…"
+          - "attestation        never verified, never claimed verified"
+          - "deployed           NOTHING — this proof is read-only"

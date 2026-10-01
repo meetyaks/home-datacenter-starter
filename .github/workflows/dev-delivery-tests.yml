@@ -8,12 +8,12 @@
 # its guards: digest-only images, provenance verification, the backwards
 # refusal, the retry bound, the deployment lock.
 #
-# ⚠️ WHY ONLY SIX SUITES AND NOT `run-all.sh`. The rest of that script needs
-# Docker containers with systemd, and one step reaches a real registry to ask
-# "can this be fetched anonymously right now". Both belong on a machine someone
+# ⚠️ WHY NOT ALL OF `run-all.sh`. The rest of that script needs Docker
+# containers with systemd, and one step reaches a real registry to ask "can
+# this be fetched anonymously right now". Both belong on a machine someone
 # owns, not on an ephemeral hosted runner — and a lane that is red for reasons
-# unrelated to the change stops being read. These six are controller-only: they
-# create nothing outside /tmp and contact nothing.
+# unrelated to the change stops being read. The suites below are
+# controller-only: they create nothing outside /tmp and contact nothing.
 #
 # ⚠️ NOT `self-hosted`. That label is dc1-ci-1, which is Keel's CI runner. A
 # deployment repository's tests running on a CI VM is the first step towards a
@@ -42,7 +42,9 @@ jobs:
   suites:
     name: Controller-only suites
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The mutation suite runs three playbooks twelve times, so this lane is
+    # minutes rather than seconds. Raised from 15 when it was added.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -74,6 +76,27 @@ jobs:
 
       - name: Reconcile check mode — a real --check run
         run: tests/run-reconcile-check-mode.sh
+
+      # ⚠️ THE ONE SUITE WHOSE INPUT THIS REPOSITORY DID NOT WRITE. Every
+      #    fixture above agrees with the reader because the same hand wrote
+      #    both. This runs the reader against a byte-for-byte copy of the
+      #    document meetyaks/keel actually published to release/dev.
+      #
+      #    Its check-mode companion needs a Keel checkout containing the
+      #    published commit, which a hosted runner does not have, so it is
+      #    deliberately NOT run here — it would SKIP, and a step that always
+      #    skips is a step nobody reads. It runs from tests/run-all.sh on a
+      #    console that has the checkout.
+      - name: The published release, read by this reader
+        run: ansible-playbook tests/published-release-proof.yml
+
+      # ⚠️ A GUARD THAT HAS NEVER FAILED IS NOT A GUARD. Breaks the provenance
+      #    policy eleven ways in turn and proves the suites above go red FOR
+      #    THAT REASON. This is what makes the three suites above load-bearing
+      #    rather than decorative; without it, a deleted assertion is a silent
+      #    green.
+      - name: Provenance mutations — every guard is proved to fail
+        run: tests/run-provenance-mutations.sh
 
       # ── The static guard check from the existing preflight suite. Its runtime
       #    half needs a source tree this runner does not have, so only the

@@ -42,7 +42,30 @@ keel_hostname: keel-dev.dc1.lan
 keel_reconcile_channel: dev
 keel_reconcile_auto_deploy: true
 
-# ⚠️ PROVENANCE IS VERIFIED HERE. Stated explicitly rather than inherited: this
-# is the file an operator reads to answer "is DEV checking where its images came
-# from", and the answer should not require knowing a role default.
-keel_release_require_provenance: true
+# ⚠️ STATED HERE RATHER THAN INHERITED. This is the file an operator reads to
+# answer "what does DEV know about where its images came from", and that answer
+# must not require knowing a role default — least of all when the answer is
+# "less than you would assume".
+#
+# ⚠️ DEV ACCEPTS A RELEASE THAT HONESTLY SAYS IT COULD NOT BE ATTESTED, AND
+# THIS LINE IS THE ONLY REASON IT MAY.
+#
+# GitHub cannot persist artifact attestations for a user-owned private
+# repository, so the producer publishes `provenance.attestation.status:
+# unavailable` with a reason rather than a release that merely looks signed
+# (meetyaks/keel run 36689645463). The current channel release,
+# keel-20261001T010103Z-5bb120c97b56, is exactly that.
+#
+# What DEV still gets, and what it gives up:
+#
+#   KEPT  immutable image digests, an SBOM identity, the migration head, the
+#         bundle hash — it knows exactly what will run
+#   LOST  any signature tying those bytes to a build in meetyaks/keel. A
+#         manifest edited to name someone else's image would satisfy every
+#         structural check.
+#
+# ⚠️ THIS IS A DEV-ONLY EXCEPTION AND MUST NOT BE COPIED. The role's default
+# is `require_persisted`; a future PROD group inherits it by saying nothing.
+# `tests/dev-environment-identity.yml` fails if any other inventory sets
+# `allow_unavailable`, so spreading it is a test failure rather than a habit.
+keel_release_provenance_policy: allow_unavailable

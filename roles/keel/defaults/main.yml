@@ -66,12 +66,53 @@ keel_release_required_roles:
   - gateway
   - web
 
-# ⚠️ NEVER FALSE IN AN OPERATIONAL RUN. Every schema assertion in release.yml
-# passes just as happily on a manifest someone edited to point at their own
-# image; only the attestation ties the bytes to a build that actually happened.
-# The single supported reason to disable it is an offline test fixture that was
-# never published and therefore has nothing to verify against.
-keel_release_require_provenance: true
+# ── WHAT PROVENANCE THIS ENVIRONMENT WILL ACCEPT ────────────────────────────
+#
+# ⚠️ THIS REPLACED A BOOLEAN, AND THE BOOLEAN IS GONE RATHER THAN KEPT BESIDE
+# IT. `keel_release_require_provenance: true/false` could not express the
+# question that actually arises. It conflated three different things:
+#
+#   · "this release carries persisted provenance"      (a fact about a release)
+#   · "verify it"                                       (an action)
+#   · "I am a fixture with nothing to verify"           (a test concession)
+#
+# so `false` was the only way to run a release that genuinely cannot be
+# attested — and `false` also silently disabled verification for one that
+# could. An operator reading it could not tell which situation they were in,
+# and a fixture's concession was the same switch as a production bypass.
+#
+# The producer now states, in the release itself, whether provenance was
+# persisted (`provenance.attestation.status`). So the site's question is no
+# longer "verify or not" but WHICH RELEASES THIS ENVIRONMENT WILL ACCEPT:
+#
+#   require_persisted  — only a release whose provenance was actually
+#                        persisted and verifies. THE DEFAULT, and what every
+#                        environment gets unless it says otherwise.
+#   allow_unavailable  — additionally accept a release that HONESTLY DECLARES
+#                        it could not be attested, provided it still carries
+#                        immutable digests, an SBOM identity and a reason.
+#                        A persisted release is still verified normally.
+#
+# ⚠️ THE DEFAULT IS THE STRICT ONE, SO A FUTURE PROD INHERITS IT BY EXISTING.
+# `allow_unavailable` has to be written down, in one inventory, on purpose —
+# and `inventory/group_vars/keel_dev/` is the only place it is. A new
+# environment that says nothing gets `require_persisted`, which is the safe
+# direction for the mistake somebody will eventually make.
+#
+# ⚠️ AND THERE IS NO "TURN VERIFICATION OFF". Offline fixtures declare
+# `allow_unavailable` and must then satisfy the unavailable contract in full
+# (status, mechanism `none`, a reason, a well-formed SBOM identity). A fixture
+# can no longer skip the checks by asserting nothing.
+#
+# Anything other than these two exact values fails closed — see the policy
+# gate at the top of tasks/release.yml.
+keel_release_provenance_policy: require_persisted
+
+# The two values the policy gate accepts. Named here so the role, the tests and
+# the failure message all read the same list rather than three copies of it.
+keel_release_provenance_policies:
+  - require_persisted
+  - allow_unavailable
 
 # Derived. `sha-9b0d36f0` — short enough to read, long enough to be unambiguous.
 keel_commit_short: "{{ keel_commit[:8] }}"

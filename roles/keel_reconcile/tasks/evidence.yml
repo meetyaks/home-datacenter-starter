@@ -33,6 +33,10 @@
     content: |
       {{ {
            'attemptedRelease': keel_reconcile_channel_doc.release,
+           'provenancePolicy': keel_release_provenance_policy | default('(unset)'),
+           'attestation': keel_reconcile_channel_doc.release.provenance.attestation
+                          | default({'status': '(absent)'}),
+           'sbom': keel_reconcile_channel_doc.release.provenance.sbom | default({}),
            'channelAdvanced': keel_reconcile_channel_doc.advanced,
            'previousRelease': keel_reconcile_current | default({}, true),
            'attemptNumber': (keel_reconcile_attempts | int) + 1,

@@ -171,7 +171,151 @@
       {{ keel_release_required_roles | difference(keel_release.images | map(attribute='role') | list) }}.
     success_msg: "The release covers every image the bundle resolves."
 
-# ── PROVENANCE ──────────────────────────────────────────────────────────────
+# ── PROVENANCE: WHAT THE RELEASE CLAIMS, AND WHAT THIS SITE ACCEPTS ─────────
+#
+# Two separate questions, deliberately kept separate:
+#
+#   1. does the release make a COHERENT, COMPLETE provenance statement?
+#      (asked of every release, under every policy)
+#   2. is that statement one THIS ENVIRONMENT is willing to deploy?
+#      (asked of the policy)
+#
+# Conflating them is how "we could not attest it" quietly became "we did not
+# check". Below, a malformed statement is refused for everybody, and a
+# well-formed `unavailable` is refused by everybody except an environment that
+# has explicitly opted in.
+
+- name: The provenance policy is one this role understands
+  # ⚠️ FAIL CLOSED ON ANYTHING ELSE, INCLUDING EMPTY. A typo
+  # (`allow-unavailable`, `Allow_Unavailable`, `yes`) must not fall through to
+  # the permissive branch, and an unset value must not fall through to
+  # anything at all.
+  ansible.builtin.assert:
+    that:
+      - keel_release_provenance_policy is defined
+      - keel_release_provenance_policy in keel_release_provenance_policies
+    fail_msg: >-
+      keel_release_provenance_policy is
+      "{{ keel_release_provenance_policy | default('(unset)') }}", which this
+      controller does not understand. It must be exactly one of
+      {{ keel_release_provenance_policies | join(' | ') }}. It is not
+      defaulted at the point of use: accepting a release without persisted
+      provenance is a decision an environment makes on purpose.
+    success_msg: "Provenance policy: {{ keel_release_provenance_policy }}."
+
+- name: The retired boolean cannot bypass the policy
+  # ⚠️ IT IS GONE, NOT DEPRECATED. If an old inventory, group_vars file or
+  # `-e` still carries `keel_release_require_provenance`, that operator
+  # believes they are controlling verification and they are not. Refusing is
+  # the only honest response — silently ignoring it would leave somebody
+  # convinced they had disabled or enabled something.
+  ansible.builtin.assert:
+    that:
+      - keel_release_require_provenance is not defined
+    fail_msg: >-
+      keel_release_require_provenance is set, and it no longer does anything.
+      It was replaced by keel_release_provenance_policy
+      ({{ keel_release_provenance_policies | join(' | ') }}) because a boolean
+      could not distinguish "this release cannot be attested" from "do not
+      check". Remove it and state the policy instead — leaving it would mean
+      believing you had configured something you had not.
+    success_msg: "The retired boolean is absent; the policy is the only authority."
+
+- name: The release makes a complete provenance statement
+  # Required of EVERY release regardless of policy. A document that omits any
+  # of these is not "probably fine" — it is one a site cannot reason about.
+  ansible.builtin.assert:
+    that:
+      - keel_release.provenance.repository is defined
+      - keel_release.provenance.repository | length > 0
+      - keel_release.provenance.workflowRef is defined
+      - keel_release.provenance.workflowRef | length > 0
+      - keel_release.provenance.runId is defined
+      - (keel_release.provenance.runId | string) | length > 0
+      - keel_release.provenance.mechanism is defined
+      - keel_release.provenance.attestation is defined
+      - keel_release.provenance.attestation.status is defined
+      - keel_release.provenance.sbom is defined
+      - keel_release.provenance.sbom.format is defined
+      - keel_release.provenance.sbom.format | length > 0
+      - keel_release.provenance.sbom.sha256 is defined
+      - keel_release.provenance.sbom.sha256 is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      Release {{ keel_release.releaseId }} does not make a complete provenance
+      statement. Required: provenance.repository, .workflowRef, .runId,
+      .mechanism, .attestation.status, .sbom.format and a 64-hex
+      .sbom.sha256. Got attestation=
+      {{ keel_release.provenance.attestation | default('(absent)') }}, sbom=
+      {{ keel_release.provenance.sbom | default('(absent)') }}.
+    # ⚠️ NO DEREFERENCING HERE EITHER. Ansible templates success_msg even when
+    # the assertion fails, so naming `.sbom.format` would turn "the SBOM is
+    # missing" into "object has no attribute 'sbom'" and hide the real reason.
+    # The SBOM identity is printed by the summary task at the end instead.
+    success_msg: "Provenance statement complete."
+
+- name: The attestation status is one the contract defines
+  ansible.builtin.assert:
+    that:
+      - keel_release.provenance.attestation.status in ['persisted', 'unavailable']
+    fail_msg: >-
+      provenance.attestation.status is
+      "{{ keel_release.provenance.attestation.status }}", which keel.release/v1
+      does not define. REFUSING rather than guessing which way an unknown
+      status should be read.
+    success_msg: "Attestation status: {{ keel_release.provenance.attestation.status }}."
+
+- name: The mechanism agrees with the status
+  # ⚠️ THE FORGERY THIS STOPS. Without it, `status: unavailable` beside
+  # `mechanism: github-artifact-attestation` is a document that looks signed
+  # to whichever field a reader happens to trust. The producer enforces the
+  # same pairing; the site does not take that on faith.
+  ansible.builtin.assert:
+    that:
+      - keel_release.provenance.mechanism ==
+        ('github-artifact-attestation' if keel_release.provenance.attestation.status == 'persisted' else 'none')
+    fail_msg: >-
+      provenance.mechanism is "{{ keel_release.provenance.mechanism }}" but
+      the status is "{{ keel_release.provenance.attestation.status }}", which
+      requires
+      "{{ 'github-artifact-attestation' if keel_release.provenance.attestation.status == 'persisted' else 'none' }}".
+      A release whose two provenance fields contradict each other is refused.
+    success_msg: "Mechanism agrees with the status."
+
+- name: An unattestable release says why
+  ansible.builtin.assert:
+    that:
+      - keel_release.provenance.attestation.reason is defined
+      - (keel_release.provenance.attestation.reason | trim) | length > 0
+    fail_msg: >-
+      {{ keel_release.releaseId }} declares attestation status "unavailable"
+      with no reason. An operator accepting reduced assurance must be told
+      what was unavailable and why; "not attested, no explanation" is not a
+      statement a site will act on.
+    # ⚠️ THE SUCCESS MESSAGE MUST NOT DEREFERENCE `.reason`. Ansible templates
+    # success_msg even when the assertion FAILS, so reading a field that is
+    # missing — which is exactly the case being tested — raises a template
+    # error that replaces the real explanation with "object has no attribute".
+    success_msg: "Reason recorded for the unavailable attestation."
+  when: keel_release.provenance.attestation.status == 'unavailable'
+
+- name: THIS ENVIRONMENT REFUSES A RELEASE WITHOUT PERSISTED PROVENANCE
+  # ⚠️ BEFORE ANY MUTATION. Nothing has been pulled, written or stopped at
+  # this point — the images are not fetched until release-bundle.yml and the
+  # stack is not touched until deploy.yml. Refusing here costs nothing and
+  # leaves the running site exactly as it was.
+  ansible.builtin.fail:
+    msg: >-
+      REFUSING {{ keel_release.releaseId }}: its provenance is
+      "unavailable" ({{ keel_release.provenance.attestation.reason }}) and this
+      environment's policy is `require_persisted`. An environment that may
+      deploy an unattested release must say so explicitly with
+      `keel_release_provenance_policy: allow_unavailable` — which the DEV
+      inventory does and no other inventory may.
+  when:
+    - keel_release.provenance.attestation.status == 'unavailable'
+    - keel_release_provenance_policy != 'allow_unavailable'
+
+# ── PERSISTED: VERIFY IT, AND A FAILURE IS A REFUSAL ────────────────────────
 
 - name: Verify each image was built by the expected workflow
   # ⚠️ SHAPE CANNOT DETECT SUBSTITUTION. Every assertion above passes just as
@@ -179,6 +323,9 @@
   # still schema-valid, still digest-pinned, still internally consistent. Only
   # an attestation ties these bytes to a build that actually happened in the
   # expected repository and workflow.
+  #
+  # Run for a `persisted` release under EITHER policy — `allow_unavailable`
+  # widens what is accepted, it does not weaken what is checked.
   ansible.builtin.command:
     argv:
       - gh
@@ -193,12 +340,12 @@
   loop: "{{ keel_release.images }}"
   loop_control:
     label: "{{ item.role }}"
-  when: keel_release_require_provenance | bool
+  when: keel_release.provenance.attestation.status == 'persisted'
 
 - name: Verify the manifest bytes themselves
-  # The manifest is a signed subject in its own right. Verifying only the images
-  # would leave the document that CHOOSES them unverified — and that document
-  # also carries the bundle hash and the migration recovery flag.
+  # The manifest is a signed subject in its own right. Verifying only the
+  # images would leave the document that CHOOSES them unverified — and that
+  # document also carries the bundle hash and the migration recovery flag.
   ansible.builtin.command:
     argv:
       - gh
@@ -210,21 +357,40 @@
   delegate_to: localhost
   become: false
   changed_when: false
-  when: keel_release_require_provenance | bool
+  when: keel_release.provenance.attestation.status == 'persisted'
 
-- name: Record that provenance was deliberately not verified
-  # ⚠️ LOUD, BECAUSE SILENCE HERE WOULD BE THE WHOLE VULNERABILITY. The only
-  # supported reason to disable this is a test fixture that has no attestation
-  # because it was never published. If this appears in an operational run, the
-  # deployment is unverified whatever else it reports.
+# ── UNAVAILABLE: ACCEPTED, AND SAID OUT LOUD ────────────────────────────────
+
+- name: Announce that DEV is deploying a release without persisted provenance
+  # ⚠️ LOUD, AND NEVER THE WORD "VERIFIED". This is the one place the operator
+  # learns that the thing about to run carries no signature. It is permitted,
+  # it is recorded, and it is not dressed up.
   ansible.builtin.debug:
-    msg: >-
-      ⚠️ PROVENANCE VERIFICATION DISABLED (keel_release_require_provenance is
-      false). {{ keel_release.releaseId }} is being deployed WITHOUT checking
-      that its images and manifest came from
-      {{ keel_release.provenance.repository }}. This is supported only for
-      offline fixtures.
-  when: not (keel_release_require_provenance | bool)
+    msg:
+      - "⚠️ NOT ATTESTED — explicitly permitted by DEV policy"
+      - "release   {{ keel_release.releaseId }}"
+      - "reason    {{ keel_release.provenance.attestation.reason }}"
+      - "assurance immutable digests + SBOM identity only; nothing signed ties
+         these bytes to {{ keel_release.provenance.repository }}"
+      - "sbom      {{ keel_release.provenance.sbom.format }}
+         sha256:{{ keel_release.provenance.sbom.sha256 }}"
+      - "policy    keel_release_provenance_policy=allow_unavailable
+         (inventory/group_vars/keel_dev/)"
+  when: keel_release.provenance.attestation.status == 'unavailable'
+
+- name: Carry the provenance state forward for the records
+  # Read by keel_reconcile when it writes the attempt record, current.json and
+  # failure evidence, so "what assurance did this deployment have" is answerable
+  # from the host afterwards rather than only from a workflow log that expires.
+  ansible.builtin.set_fact:
+    keel_release_attestation_status: "{{ keel_release.provenance.attestation.status }}"
+    keel_release_attestation_mechanism: "{{ keel_release.provenance.mechanism }}"
+    keel_release_attestation_reason: "{{ keel_release.provenance.attestation.reason | default('') }}"
+    keel_release_sbom: "{{ keel_release.provenance.sbom }}"
+    keel_release_assurance: >-
+      {{ 'attested (' ~ keel_release.provenance.mechanism ~ ')'
+         if keel_release.provenance.attestation.status == 'persisted'
+         else 'NOT ATTESTED — explicitly permitted by DEV policy' }}
 
 # ── ADOPT THE RELEASE'S IDENTITY ────────────────────────────────────────────
 
@@ -253,5 +419,8 @@
       - "bundle        {{ keel_release.bundle.composePath }} sha256:{{ keel_release.bundle.sha256 }}"
       - "migrations    head {{ keel_release.migrations.headId }}, manual recovery on failure:
          {{ keel_release.migrations.requiresManualRecoveryOnFailure }}"
-      - "provenance    {{ 'verified against ' ~ keel_release.provenance.repository
-                          if keel_release_require_provenance | bool else '⚠️ NOT VERIFIED' }}"
+      - "provenance    {{ ('verified against ' ~ keel_release.provenance.repository)
+                          if keel_release_attestation_status == 'persisted'
+                          else '⚠️ NOT ATTESTED — explicitly permitted by DEV policy' }}"
+      - "sbom          {{ keel_release_sbom.format }} sha256:{{ keel_release_sbom.sha256 }}"
+      - "policy        {{ keel_release_provenance_policy }}"
