@@ -121,7 +121,11 @@ jobs:
       - name: Provenance mutations — every guard is proved to fail
         run: tests/run-provenance-mutations.sh
 
-      # The same discipline, applied to the guards that protect secrets.
+      # The same discipline, applied to the guards that protect secrets. One
+      # of its seventeen mutations breaks the plist's XML, and the guard that
+      # catches it is `plutil -lint` — a Mac tool. It SKIPS here, loudly, and
+      # is proved on the console itself, which is the machine that has to
+      # load the file.
       - name: Scheduler and credential mutations
         run: tests/run-auth-mutations.sh
 

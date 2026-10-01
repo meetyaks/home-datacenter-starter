@@ -101,16 +101,29 @@ mutate() {  # mutate <label> <file> <perl-expr> <suite-or-script> <expected-subs
 # ── THE SCHEDULER ───────────────────────────────────────────────────────────
 
 # 1. THE MAC CONTROLLER LEFT WITHOUT A SCHEDULER IT CAN START — the original
-#    mistake, re-committed. There is no systemctl here, so a plist that will
+#    mistake, re-committed. There is no systemctl there, so a plist that will
 #    not load means nothing is scheduled at all.
 #
 #    ⚠️ BREAKING THE XML, NOT RENAMING A KEY. A renamed key still lints and
 #    still exists, so the suite would pass; `launchctl bootstrap` is what
 #    would have failed, weeks later. Removing the closing tag is the
 #    realistic regression — a hand edit, invisible in a diff.
-mutate "a launchd plist a Mac cannot load is caught" \
-  "$PLIST" 's{</dict>\n</plist>}{</plist>}' \
-  controller-scheduler 'no valid launchd plist'
+#
+#    ⚠️ AND IT NEEDS A MAC. The guard it exercises is `plutil -lint`, which
+#    tests/controller-scheduler.yml runs only on Darwin — so on Linux the
+#    suite correctly does not catch this, and asserting otherwise would be
+#    asserting that a hosted runner can validate a property it cannot see.
+#    Skipped loudly rather than quietly: an unproven guard that prints
+#    nothing is indistinguishable from a proven one.
+if [ "$(uname -s)" = "Darwin" ]; then
+  mutate "a launchd plist a Mac cannot load is caught" \
+    "$PLIST" 's{</dict>\n</plist>}{</plist>}' \
+    controller-scheduler 'no valid launchd plist'
+else
+  echo "  SKIP  a launchd plist a Mac cannot load — needs plutil(1), and this is $(uname -s)."
+  echo "        ⚠️ THE PLIST'S VALIDITY IS UNPROVEN IN THIS RUN. It is proved on"
+  echo "        the console itself, which is the machine that has to load it."
+fi
 
 # 2. KeepAlive — an uncontrolled retry loop, in launchd's dialect.
 mutate "enabling KeepAlive is caught" \
@@ -234,4 +247,9 @@ if [ "$fail" -ne 0 ]; then
   echo "FAILED: ${fail} of $((fail + pass)) mutation(s) not caught."
   exit 1
 fi
-echo "auth mutations: ${pass} checks, every mutation caught for its own reason."
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "auth mutations: ${pass} checks, every mutation caught for its own reason."
+else
+  echo "auth mutations: ${pass} checks on $(uname -s), every mutation caught for its own reason."
+  echo "                One Mac-only mutation was skipped — see SKIP above."
+fi

@@ -384,7 +384,7 @@ KEEL_SKIP_MUTATIONS=1 tests/run-all.sh  # the quick loop; leaves the guards UNPR
 | `controller-scheduler.yml` | **asks the machine which OS it is** and requires the scheduler that OS can run; every scheduler — live and retained — invokes only the wrapper, never restarts into a loop, and carries no credential |
 | `run-wrapper-behaviour.sh` | the wrapper **executed**: Ansible's exit status survives unchanged (0, 1, 2, 4, 99), a second concurrent run is refused with its own status, the lock is released after success *and* failure, a missing prerequisite is refused before anything runs |
 | `credential-contract.yml` | the deploy-key preflight **exercised** against absent, world-readable, group-readable, mis-owned and unpinned fixtures, plus an HTTPS remote; and the registry token's handling — stdin not argv, `no_log`, `ghcr.io` only, digests only, logout in `always`, nothing in the records, no value committed |
-| `run-auth-mutations.sh` | **breaks all of that seventeen ways** and proves the suites notice, each for its own reason |
+| `run-auth-mutations.sh` | **breaks all of that seventeen ways** and proves the suites notice, each for its own reason. One mutation needs `plutil` and is skipped — loudly — off a Mac |
 | `dev-environment-identity.yml` | the names, read from inventory; no CI VM is a deployment target; DEV declares `allow_unavailable` and **no other inventory file may** |
 | `release-contract.yml` | 28 cases against the role's own reader: schema, digest-only, identity, role coverage, controller version, and every provenance state under both policies |
 | `reconcile-decisions.yml` | 8 decision cases, plus that the shipped defaults are the safe ones |
