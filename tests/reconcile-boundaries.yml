@@ -34,10 +34,21 @@
       register: reconcile_raw
       loop: "{{ reconcile_tasks }}"
 
-    - name: As one body of text
+    - name: As one body of text, and again with the commentary removed
+      # ⚠️ TWO VIEWS, AND THE DISTINCTION IS LOAD-BEARING. `reconcile_text`
+      # is everything; `reconcile_code` has `#` lines stripped. Checks about
+      # what the role DOES read `reconcile_code`, because a check a comment
+      # can satisfy — or trip — is a check on the prose. `keel_hostname`,
+      # for instance, appears only in a comment explaining why include_vars
+      # is namespaced, and counting it would demand an anchor for a variable
+      # the role never reads.
       ansible.builtin.set_fact:
         reconcile_text: >-
           {{ reconcile_raw.results | map(attribute='content') | map('b64decode') | join('\n') }}
+
+    - name: The comment-free view
+      ansible.builtin.set_fact:
+        reconcile_code: "{{ reconcile_text | regex_replace('(?m)^\\s*#.*$', '') }}"
 
     # ── ONE DEPLOYER ────────────────────────────────────────────────────────
 
@@ -58,6 +69,38 @@
           by some other means. There must be exactly one thing that knows how
           to put Keel on a host.
         success_msg: "The reconciler delegates to roles/keel."
+
+    - name: INGRESS IS PROVISIONED BEFORE THE DEPLOYER RUNS
+      # ⚠️ OTHERWISE THE DEPLOYMENT ENDS "HEALTHY AND UNREACHABLE". Keel's
+      # gateway and web bind to 127.0.0.1 and every dependency binds to
+      # nothing, so Caddy is what publishes the site to the LAN. roles/keel
+      # refuses to run without it having been applied in the same play —
+      # and the first real reconcile hit exactly that, because this path was
+      # written without the caddy include that playbooks/keel.yml has always
+      # had.
+      #
+      # ORDER MATTERS, so this checks position and not just presence: caddy
+      # must appear before the keel include, because roles/keel's guard
+      # reads a fact the caddy role sets.
+      ansible.builtin.assert:
+        # ⚠️ QUOTED, AND `name: keel` MATCHED WITH ITS NEWLINE. Two traps in
+        # four lines: an unquoted item containing ": " is read by YAML as a
+        # MAPPING and rejected with "Conditional expressions must be
+        # strings"; and a bare `name: keel` also matches `name: keel_layout`
+        # from the include_vars at the top of the file, which sits BEFORE
+        # caddy and would make the ordering check always fail.
+        that:
+          - 'reconcile_code is search("name: caddy")'
+          - 'reconcile_code is search("name: keel\n")'
+          - '(reconcile_code.split("name: caddy") | first | length)
+             < (reconcile_code.split("name: keel\n") | first | length)'
+        fail_msg: >-
+          roles/keel_reconcile does not include the caddy role before
+          roles/keel. Keel publishes nothing to the LAN by itself, so the
+          deployment would finish healthy and unreachable — which is why
+          roles/keel refuses outright, stopping the run after the lock has
+          been taken.
+        success_msg: "Ingress is provisioned before the deployer runs."
 
     - name: It never runs migrations itself
       # ⚠️ THE CANONICAL MIGRATION OWNER IS THE COMPOSE `migrate` SERVICE,
@@ -195,11 +238,7 @@
       register: deployer_defaults_raw
 
     - name: Work out which of them this role actually interpolates
-      # ⚠️ COMMENTS STRIPPED FIRST. `keel_hostname` appears only in a comment
-      # explaining why include_vars is namespaced; counting that would
-      # demand an anchor for a variable the role never reads.
       ansible.builtin.set_fact:
-        reconcile_code: "{{ reconcile_text | regex_replace('(?m)^\\s*#.*$', '') }}"
         deployer_vars: >-
           {{ (deployer_defaults_raw.content | b64decode)
              | regex_findall('(?m)^(keel_[a-z0-9_]+):')
