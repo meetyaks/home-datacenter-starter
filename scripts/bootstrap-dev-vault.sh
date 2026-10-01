@@ -139,4 +139,4 @@ printf '    owner/mode  %s %s\n' \
   "$(stat -f '%OLp' "$VAULT_FILE" 2>/dev/null || stat -c '%a' "$VAULT_FILE")"
 printf '    git         ignored\n'
 printf '\n  The token is now only in this encrypted file. Nothing printed it.\n'
-printf '  Verify it can actually pull: tests/run-registry-credential-proof.sh\n'
+printf '  Verify it can actually pull: tests/run-credential-proof.sh\n'

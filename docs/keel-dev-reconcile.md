@@ -261,7 +261,7 @@ The handling, in [`roles/keel/tasks/registry.yml`](../roles/keel/tasks/registry.
 
 Everything below is **documented, not created.** No file is written by this repository, and none of these exist yet.
 
-> **Run the bootstrap; do not work down this table by hand.** It exists so you can check what the script did, and so a second console comes out the same as the first.
+> **Run the bootstrap; do not work down this table by hand.** It exists so you can check what the script did, and so a second console comes out the same as the first. Step-by-step: [runbook-provision-dev-controller.md](runbook-provision-dev-controller.md).
 >
 > ```bash
 > # On dc1-arm-1, from the checkout:
