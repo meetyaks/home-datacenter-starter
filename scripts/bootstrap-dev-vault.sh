@@ -37,7 +37,17 @@ VAULT_PASS=${KEEL_VAULT_PASSWORD_FILE:-/etc/keel/vault-pass}
 
 die() { printf 'REFUSING: %s\n' "$*" >&2; exit 1; }
 
-command -v ansible-vault >/dev/null 2>&1 || die "ansible-vault is not on PATH"
+# ⚠️ RESOLVED, NOT ASSUMED ON PATH. Run over ssh this gets the system PATH
+# from /etc/paths, which on a Mac does not include Homebrew — so a bare
+# `ansible-vault` is not found on a console where it works perfectly when
+# you log in.
+ANSIBLE_VAULT=$(command -v ansible-vault 2>/dev/null || true)
+if [ -z "$ANSIBLE_VAULT" ]; then
+  for c in /opt/homebrew/bin/ansible-vault /usr/local/bin/ansible-vault /usr/bin/ansible-vault; do
+    [ -x "$c" ] && ANSIBLE_VAULT="$c" && break
+  done
+fi
+[ -n "$ANSIBLE_VAULT" ] || die "ansible-vault was not found, on PATH or in the usual locations"
 [ -r "$VAULT_PASS" ] || die "no readable vault password file at $VAULT_PASS
           Run scripts/bootstrap-dev-controller.sh first, and — if this
           console already had a vault — write your EXISTING passphrase into
@@ -64,7 +74,7 @@ if [ -e "$VAULT_FILE" ]; then
   head -1 "$VAULT_FILE" | grep -q 'ANSIBLE_VAULT;' \
     || die "$VAULT_FILE exists but is NOT encrypted. Refusing to touch it —
           look at what it is before anything rewrites it."
-  ansible-vault view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" > "$PLAIN" \
+  "$ANSIBLE_VAULT" view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" > "$PLAIN" \
     || die "the vault did not decrypt with $VAULT_PASS.
           If this console used --ask-vault-pass, that file must contain the
           SAME passphrase — not a generated one."
@@ -131,10 +141,10 @@ unset REGISTRY_TOKEN
 # unreadable would destroy a vault that may hold the only copy of the
 # installation's master key.
 STAGED="$WORK/vault.enc"
-ansible-vault encrypt --vault-password-file "$VAULT_PASS" --output "$STAGED" "$PLAIN" >/dev/null
+"$ANSIBLE_VAULT" encrypt --vault-password-file "$VAULT_PASS" --output "$STAGED" "$PLAIN" >/dev/null
 
 head -1 "$STAGED" | grep -q 'ANSIBLE_VAULT;' || die "the replacement is not encrypted — $VAULT_FILE untouched"
-ansible-vault view --vault-password-file "$VAULT_PASS" "$STAGED" | grep -q '^keel_vault_registry_token:' \
+"$ANSIBLE_VAULT" view --vault-password-file "$VAULT_PASS" "$STAGED" | grep -q '^keel_vault_registry_token:' \
   || die "the replacement does not decrypt to the expected variables — $VAULT_FILE untouched"
 
 if [ "$MODE" = update ]; then
@@ -149,14 +159,14 @@ cat "$STAGED" > "$VAULT_FILE"
 chmod 0600 "$VAULT_FILE"
 
 # ── PROVE IT, WITHOUT PRINTING IT ───────────────────────────────────────────
-ansible-vault view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" | grep -q '^keel_vault_registry_token:' \
+"$ANSIBLE_VAULT" view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" | grep -q '^keel_vault_registry_token:' \
   || die "the vault in place does not decrypt as expected — restore from the backup beside it"
 
 printf '\n  %s\n' "$VAULT_FILE"
 printf '    mode        %s\n' "$MODE"
 printf '    encrypted   yes\n'
 printf '    variables   %s, including the two registry ones\n' \
-  "$(ansible-vault view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" | grep -cE '^[a-zA-Z_][a-zA-Z0-9_]*:')"
+  "$("$ANSIBLE_VAULT" view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" | grep -cE '^[a-zA-Z_][a-zA-Z0-9_]*:')"
 printf '    owner/mode  %s %s\n' \
   "$(stat -f '%Su' "$VAULT_FILE" 2>/dev/null || stat -c '%U' "$VAULT_FILE")" \
   "$(stat -f '%OLp' "$VAULT_FILE" 2>/dev/null || stat -c '%a' "$VAULT_FILE")"
