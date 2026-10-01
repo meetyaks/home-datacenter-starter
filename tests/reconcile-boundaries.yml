@@ -189,6 +189,32 @@
     # What stays here is the boundary this role owns: the reconciler itself
     # must not become a second scheduler.
 
+    - name: EVERY DEPLOYER VARIABLE IT USES IS ANCHORED BEFORE USE
+      # ⚠️ THIS CHECK EXISTS BECAUSE A REAL DEPLOYMENT FAILED ON IT. The role
+      # creates its state directories under `keel_root` BEFORE it includes
+      # roles/keel, so any roles/keel variable it touches in that window must
+      # be anchored from the layout file first. `keel_owner` and `keel_group`
+      # were not, and the first real run died at "Make sure the state
+      # directories exist" with `'keel_group' is undefined`.
+      #
+      # ⚠️ AND --check CANNOT FIND THIS. The dry run ends at
+      # `when: ansible_check_mode` before the lock is taken — deliberately,
+      # because taking a lock is not a dry run of anything. That means every
+      # task from the lock onwards is invisible to --check, and a green dry
+      # run is NOT evidence that a real run reaches the end. A structural
+      # check is the only thing that covers that window without a host.
+      ansible.builtin.assert:
+        that:
+          - reconcile_text is search('keel_' ~ item ~ ':\s*"\{\{ keel_' ~ item ~ ' \| default\(keel_layout')
+        fail_msg: >-
+          roles/keel_reconcile uses `keel_{{ item }}` but never anchors it
+          from keel_layout. It is a roles/keel default, and this role touches
+          it BEFORE including that role — so at runtime it is undefined, and
+          the run dies partway with "'keel_{{ item }}' is undefined" after
+          the decision has already been made.
+        success_msg: "keel_{{ item }} is anchored from the deployer's layout."
+      loop: [root, source_repo, owner, group]
+
     - name: The reconcile role does not schedule itself
       # A role that installed its own timer, plist or cron entry would be a
       # second place the schedule is decided — and the one nobody thinks to
