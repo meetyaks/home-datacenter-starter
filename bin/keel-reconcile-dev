@@ -1,0 +1,202 @@
+#!/bin/sh
+# ─────────────────────────────────────────────────────────────────────────────
+# THE ONE WAY A SCHEDULER RUNS A DEV RECONCILIATION.
+#
+#   bin/keel-reconcile-dev [--check]
+#
+# ⚠️ SCHEDULERS INVOKE THIS AND NOTHING ELSE. A launchd plist — or a systemd
+# unit, or a human — that called `ansible-playbook` directly would be a second
+# place where the inventory, the vault path, the timeout and the concurrency
+# rule are decided, and the two copies would drift. The first divergence is
+# the one nobody notices. Everything a scheduler needs to know is here; the
+# scheduler's whole job is WHEN.
+#
+# ⚠️ IT HOLDS NO CREDENTIAL, AND IT NEVER WILL. It reads PATHS from
+# configuration — a vault password file, an SSH key — and passes them to
+# Ansible. The values behind those paths are provisioned by an administrator
+# and are not in this repository. tests/controller-scheduler.yml fails if a
+# token-shaped string appears in this file.
+#
+# ⚠️ /bin/sh, NOT bash. launchd starts this with a minimal environment on a
+# Mac where /bin/bash is 3.2. POSIX sh is what both ends can rely on.
+#
+# Exit status is ANSIBLE'S, unchanged, except for the wrapper's own refusals:
+#
+#   0        whatever ansible-playbook returned as success
+#   1-99     whatever ansible-playbook returned as failure, passed through
+#   100      another reconciliation is already running (not an error)
+#   101      a required path is missing or wrongly owned — misconfiguration
+#   102      the run exceeded its bounded timeout and was terminated
+# ─────────────────────────────────────────────────────────────────────────────
+set -u
+
+# ── CONFIGURATION: PATHS ONLY, NEVER VALUES ─────────────────────────────────
+#
+# Sourced if present so an administrator can move the checkout or the vault
+# file without editing a tracked file. It must contain assignments to the
+# variables below and nothing else — in particular NO TOKENS. A secret belongs
+# in the Ansible vault, which this script never opens.
+KEEL_RECONCILE_CONF="${KEEL_RECONCILE_CONF:-/etc/keel/reconcile.conf}"
+if [ -r "$KEEL_RECONCILE_CONF" ]; then
+  # shellcheck disable=SC1090  # path is operator configuration, not a literal
+  . "$KEEL_RECONCILE_CONF"
+fi
+
+# Absolute, every one of them: launchd gives this process a minimal PATH and
+# no working directory worth having.
+KEEL_CHECKOUT="${KEEL_CHECKOUT:-/opt/home-datacenter-starter}"
+KEEL_INVENTORY="${KEEL_INVENTORY:-$KEEL_CHECKOUT/inventory/hosts.yml}"
+KEEL_PLAYBOOK="${KEEL_PLAYBOOK:-$KEEL_CHECKOUT/playbooks/keel-reconcile.yml}"
+KEEL_VAULT_PASSWORD_FILE="${KEEL_VAULT_PASSWORD_FILE:-/etc/keel/vault-pass}"
+KEEL_ANSIBLE_PLAYBOOK="${KEEL_ANSIBLE_PLAYBOOK:-/usr/local/bin/ansible-playbook}"
+KEEL_RECONCILE_LOG="${KEEL_RECONCILE_LOG:-/var/log/keel/reconcile-dev.log}"
+KEEL_RECONCILE_RUNLOCK="${KEEL_RECONCILE_RUNLOCK:-/var/run/keel-reconcile-dev.lock}"
+
+# ⚠️ BOUNDED, AND SHORTER THAN THE SCHEDULE IS LONG. A run that hangs holds
+# the controller lock; without a ceiling it would hold it until somebody
+# noticed, and every subsequent tick would decline. 50 minutes against a
+# 15-minute interval is deliberately generous: a real deployment pulls two
+# images and runs migrations.
+KEEL_RECONCILE_TIMEOUT="${KEEL_RECONCILE_TIMEOUT:-3000}"
+
+say() { printf '%s  %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+# ── EVERYTHING THIS NEEDS, BEFORE IT STARTS ANYTHING ────────────────────────
+#
+# A scheduler's failure is a line in a log nobody is reading, so the message
+# has to be enough on its own.
+misconfigured() { say "REFUSING: $*"; exit 101; }
+
+[ -d "$KEEL_CHECKOUT" ]    || misconfigured "no deployment checkout at $KEEL_CHECKOUT (set KEEL_CHECKOUT in $KEEL_RECONCILE_CONF)"
+[ -r "$KEEL_INVENTORY" ]   || misconfigured "inventory $KEEL_INVENTORY is missing or unreadable"
+[ -r "$KEEL_PLAYBOOK" ]    || misconfigured "playbook $KEEL_PLAYBOOK is missing or unreadable"
+[ -x "$KEEL_ANSIBLE_PLAYBOOK" ] || misconfigured "no executable ansible-playbook at $KEEL_ANSIBLE_PLAYBOOK (launchd has a minimal PATH, so this must be absolute)"
+
+# ⚠️ THE VAULT FILE IS CHECKED HERE AND NOT ONLY BY ANSIBLE. Ansible's own
+# error for a missing vault password is "Attempting to decrypt but no vault
+# secrets found", which sends the reader looking at the vault rather than at
+# the file this script was told to use.
+[ -r "$KEEL_VAULT_PASSWORD_FILE" ] || misconfigured "vault password file $KEEL_VAULT_PASSWORD_FILE is missing or unreadable by $(id -un)"
+
+# ── NEVER TWO AT ONCE ───────────────────────────────────────────────────────
+#
+# ⚠️ IN ADDITION TO THE DEPLOYMENT LOCK, NOT INSTEAD OF IT. The role's lock
+# lives ON THE HOST and protects the host from two deployers. This one lives
+# on the CONTROLLER and protects against two Ansible runs starting at all —
+# which matters because everything before the host lock (the channel clone,
+# the decision, the registry login) would otherwise happen twice.
+#
+# `mkdir` because it is atomic on every filesystem that matters. `flock` is
+# not on macOS, and a `[ -e ]` test followed by a `touch` is a race with a
+# window exactly as wide as the two commands.
+if ! mkdir "$KEEL_RECONCILE_RUNLOCK" 2>/dev/null; then
+  holder=$(cat "$KEEL_RECONCILE_RUNLOCK/pid" 2>/dev/null || echo "unknown")
+  say "ALREADY RUNNING: $KEEL_RECONCILE_RUNLOCK is held by pid $holder. Not starting a second reconciliation."
+  exit 100
+fi
+echo "$$" > "$KEEL_RECONCILE_RUNLOCK/pid"
+
+watchdog=""
+# shellcheck disable=SC2329  # invoked by the trap below, not by name
+cleanup() {
+  [ -n "$watchdog" ] && kill "$watchdog" 2>/dev/null
+  rm -rf "$KEEL_RECONCILE_RUNLOCK"
+}
+# ⚠️ ON EVERY EXIT PATH, INCLUDING A KILLED ONE. A lock left behind by a run
+# that was interrupted would decline every subsequent tick, silently, until
+# somebody read the log.
+trap cleanup EXIT INT TERM
+
+# ── THE RUN ─────────────────────────────────────────────────────────────────
+#
+# ⚠️ NOTHING INTERACTIVE. No --ask-vault-pass, no --ask-become-pass: a
+# scheduler cannot answer a prompt, and a prompt that nobody answers is a run
+# that hangs until the timeout rather than one that fails.
+ANSIBLE_VAULT_PASSWORD_FILE="$KEEL_VAULT_PASSWORD_FILE"
+ANSIBLE_CONFIG="${ANSIBLE_CONFIG:-$KEEL_CHECKOUT/ansible.cfg}"
+ANSIBLE_FORCE_COLOR=0
+ANSIBLE_NOCOLOR=1
+# ⚠️ HOST KEY CHECKING STAYS ON. An unattended run is exactly the case where
+# an unknown host key must be a failure rather than a question nobody sees.
+ANSIBLE_HOST_KEY_CHECKING=True
+export ANSIBLE_VAULT_PASSWORD_FILE ANSIBLE_CONFIG ANSIBLE_FORCE_COLOR \
+       ANSIBLE_NOCOLOR ANSIBLE_HOST_KEY_CHECKING
+
+mode="deploy"
+extra=""
+case "${1:-}" in
+  --check) mode="check"; extra="--check --diff" ;;
+  "")      ;;
+  *)       say "REFUSING: unknown argument \"$1\" (only --check is accepted)"; exit 101 ;;
+esac
+
+runlog=$(mktemp "/tmp/keel-reconcile-dev.XXXXXX") || misconfigured "cannot create a run log under /tmp"
+timedout="${runlog}.timedout"
+
+say "START mode=$mode checkout=$KEEL_CHECKOUT inventory=$KEEL_INVENTORY timeout=${KEEL_RECONCILE_TIMEOUT}s"
+
+# ⚠️ A HAND-ROLLED WATCHDOG, BECAUSE macOS HAS NO `timeout(1)`. coreutils'
+# `gtimeout` is not on a stock Mac, and depending on Homebrew for the thing
+# that bounds an unattended run is a dependency in the wrong place.
+# shellcheck disable=SC2086  # $extra is an intentional, wrapper-controlled word split
+"$KEEL_ANSIBLE_PLAYBOOK" -i "$KEEL_INVENTORY" "$KEEL_PLAYBOOK" $extra > "$runlog" 2>&1 &
+run_pid=$!
+
+# ⚠️ `>/dev/null 2>&1` ON THE WATCHDOG, AND IT IS NOT COSMETIC. Without it the
+# subshell inherits this script's stdout, so anything capturing the wrapper's
+# output — a test, a `$( )`, a scheduler reading a pipe — blocks until the
+# watchdog's `sleep` ends, EVEN AFTER the watchdog is killed, because killing
+# the subshell does not kill the `sleep` child that is holding the pipe open.
+# A 15-second reconciliation would appear to take the full timeout.
+#
+# ⚠️ IT POLLS RATHER THAN SLEEPING ONCE. A single long `sleep` outlives the
+# run it was watching: killing the subshell does not kill its `sleep` child,
+# so a stray process would sit there for the rest of the timeout after every
+# successful reconciliation.
+(
+  waited=0
+  while [ "$waited" -lt "$KEEL_RECONCILE_TIMEOUT" ]; do
+    kill -0 "$run_pid" 2>/dev/null || exit 0
+    sleep 5
+    waited=$((waited + 5))
+  done
+  if kill -0 "$run_pid" 2>/dev/null; then
+    : > "$timedout"
+    kill -TERM "$run_pid" 2>/dev/null
+    sleep 20
+    kill -KILL "$run_pid" 2>/dev/null
+  fi
+) >/dev/null 2>&1 &
+watchdog=$!
+
+wait "$run_pid"
+rc=$?
+kill "$watchdog" 2>/dev/null
+watchdog=""
+
+# ── WHAT HAPPENED, IN ONE PLACE A PERSON CAN READ ───────────────────────────
+#
+# ⚠️ THE RELEASE ID AND THE DECISION, AND NOTHING ELSE FROM THE RUN. The full
+# Ansible output goes to the scheduler's own log file; this line is the one an
+# operator greps months later. It is derived from the run's own output rather
+# than guessed, and it names no secret — the role prints no secret, and every
+# task that handles one is `no_log: true`.
+release=$(sed -n 's/.*\(keel-[0-9]\{8\}T[0-9]\{6\}Z-[0-9a-f]\{12\}\).*/\1/p' "$runlog" | head -1)
+decision=$(sed -n 's/.*\(DECISION [a-z-]*\).*/\1/p' "$runlog" | head -1)
+
+cat "$runlog"
+
+if [ -e "$timedout" ]; then
+  say "TIMEOUT after ${KEEL_RECONCILE_TIMEOUT}s — terminated. release=${release:-unknown} ${decision:-no decision reached}"
+  rm -f "$runlog" "$timedout"
+  exit 102
+fi
+
+say "END rc=$rc mode=$mode release=${release:-none} ${decision:-no decision reached}"
+rm -f "$runlog" "$timedout"
+
+# ⚠️ ANSIBLE'S STATUS, UNCHANGED. Not normalised to 0 or 1: a scheduler, and
+# whoever reads its log, should see what actually happened. And NO RETRY here
+# — the role's attempt ledger bounds retries with state that survives a reboot,
+# and a loop in a wrapper would defeat that bound without replacing it.
+exit "$rc"

@@ -42,9 +42,10 @@ jobs:
   suites:
     name: Controller-only suites
     runs-on: ubuntu-latest
-    # The mutation suite runs three playbooks twelve times, so this lane is
-    # minutes rather than seconds. Raised from 15 when it was added.
-    timeout-minutes: 30
+    # Two mutation suites, each re-running several playbooks once per
+    # mutation, so this lane is tens of minutes rather than seconds. 15 → 30
+    # when the provenance mutations landed, 30 → 45 with the credential ones.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -74,6 +75,28 @@ jobs:
       - name: Reconcile boundaries
         run: ansible-playbook tests/reconcile-boundaries.yml
 
+      # ⚠️ TWO ASSERTIONS IN THIS SUITE DO NOT RUN HERE, AND IT IS WORTH BEING
+      #    PRECISE ABOUT WHICH. The suite asks the machine which operating
+      #    system it is; this runner is ubuntu-latest and the DEV console is a
+      #    Mac, so `plutil -lint` and "a Mac controller must have a launchd
+      #    plist" are skipped. EVERYTHING ELSE RUNS — including the KeepAlive,
+      #    RunAtLoad, StartInterval and credential-scan checks, which read the
+      #    plist as text and need no Mac. The two skipped assertions are proved
+      #    on the console itself by tests/run-all.sh.
+      - name: Controller scheduler — one entrypoint, no restart loop, no secrets
+        run: ansible-playbook tests/controller-scheduler.yml
+
+      - name: The wrapper, executed — exit status and concurrency
+        run: tests/run-wrapper-behaviour.sh
+
+      # ⚠️ NEITHER CREDENTIAL EXISTS YET, AND THIS LANE CANNOT CREATE ONE. What
+      #    it proves is that the code refuses without a credential, keeps the
+      #    token off the command line and out of the logs, and gives it back on
+      #    every path. Those have to be right BEFORE a real credential is
+      #    created — afterwards a mistake is a disclosed secret, not a red test.
+      - name: Credential contract — deploy key and registry token
+        run: ansible-playbook tests/credential-contract.yml
+
       - name: Reconcile check mode — a real --check run
         run: tests/run-reconcile-check-mode.sh
 
@@ -97,6 +120,10 @@ jobs:
       #    green.
       - name: Provenance mutations — every guard is proved to fail
         run: tests/run-provenance-mutations.sh
+
+      # The same discipline, applied to the guards that protect secrets.
+      - name: Scheduler and credential mutations
+        run: tests/run-auth-mutations.sh
 
       # ── The static guard check from the existing preflight suite. Its runtime
       #    half needs a source tree this runner does not have, so only the

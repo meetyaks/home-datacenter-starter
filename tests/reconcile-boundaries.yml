@@ -176,41 +176,34 @@
           than the one that was gated and attested.
         success_msg: "Release mode pulls; ordinary mode still builds."
 
-    # ── THE SCHEDULING UNITS ────────────────────────────────────────────────
+    # ── THE SCHEDULER ───────────────────────────────────────────────────────
+    #
+    # ⚠️ MOVED TO tests/controller-scheduler.yml, AND NOT LOST. The scheduling
+    # assertions used to live here and read the systemd units directly. They
+    # are now a suite of their own because the question grew: the console runs
+    # macOS, so the live scheduler is a launchd plist, the systemd units are a
+    # retained Linux variant, and both must be held to the same rule — invoke
+    # the wrapper, never restart into a loop, carry no credential. A check
+    # that reads one scheduler's file by name cannot say that.
+    #
+    # What stays here is the boundary this role owns: the reconciler itself
+    # must not become a second scheduler.
 
-    - name: Read the timer and service units
-      ansible.builtin.slurp:
-        src: "{{ item }}"
-      register: units_raw
-      loop:
-        - ../roles/keel_reconcile/files/keel-reconcile-dev.service
-        - ../roles/keel_reconcile/files/keel-reconcile-dev.timer
-
-    - name: The service does not restart itself into a deployment loop
-      # ⚠️ THE ROLE'S ATTEMPT LEDGER BOUNDS RETRIES. A systemd `Restart=` on top
-      # of it would defeat that bound and hammer the site — the role would
-      # refuse after its allowance, systemd would restart it, and the refusal
-      # itself would become the loop.
+    - name: The reconcile role does not schedule itself
+      # A role that installed its own timer, plist or cron entry would be a
+      # second place the schedule is decided — and the one nobody thinks to
+      # look at when the site deploys at an unexpected moment.
       ansible.builtin.assert:
         that:
-          - (units_raw.results[0].content | b64decode) is not search('(?m)^Restart=(always|on-failure)')
+          - reconcile_text is not search('cron')
+          - reconcile_text is not search('launchctl')
+          - reconcile_text is not search('systemd_service')
         fail_msg: >-
-          The service unit restarts on failure, which defeats the role's
-          bounded retry allowance.
-        success_msg: "No systemd restart loop."
-
-    - name: The timer does not catch up on missed runs
-      # A console asleep over a weekend would otherwise wake to a burst of
-      # queued activations — several deployments back to back. Only the
-      # channel's current state matters.
-      ansible.builtin.assert:
-        that:
-          - (units_raw.results[1].content | b64decode) is search('(?m)^Persistent=false')
-        fail_msg: >-
-          The timer is Persistent, so missed runs queue up and fire as a burst
-          of consecutive deployments.
-        success_msg: "Missed ticks are dropped, not queued."
+          roles/keel_reconcile installs or manipulates a scheduler. WHEN to
+          reconcile is the scheduler's decision and the administrator's to
+          install; this role only ever answers WHETHER to deploy right now.
+        success_msg: "The reconciler decides whether, never when."
 
     - name: Done
       ansible.builtin.debug:
-        msg: "boundaries: one deployer, one migration owner, no verification bypass, no retry loop."
+        msg: "boundaries: one deployer, one migration owner, no verification bypass, no self-scheduling."

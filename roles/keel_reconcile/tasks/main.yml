@@ -42,7 +42,18 @@
     keel_root: "{{ keel_root | default(keel_layout.keel_root, true) }}"
     keel_source_repo: "{{ keel_source_repo | default(keel_layout.keel_source_repo, true) }}"
 
-# ── 1. THE CHANNEL ──────────────────────────────────────────────────────────
+# ── 1. CAN THIS CONTROLLER READ THE CHANNEL AT ALL? ─────────────────────────
+#
+# ⚠️ BEFORE THE CLONE, NOT AS PART OF IT. meetyaks/keel is private, and a
+# clone that succeeds through the operator's credential helper proves nothing
+# about the scheduler — which runs as a different account with no keychain
+# and no login session. This asks the question with those credentials
+# deliberately excluded, and refuses if the answer is no.
+
+- name: Confirm the unattended credential can reach the private repository
+  ansible.builtin.include_tasks: credentials.yml
+
+# ── THE CHANNEL ─────────────────────────────────────────────────────────────
 
 - name: Fetch the channel branch on the controller
   # ⚠️ ON THE CONTROLLER, AND READ-ONLY. The managed host is never given
@@ -54,6 +65,15 @@
     version: "{{ keel_reconcile_channel_branch }}"
     depth: 1
     force: true
+    # ⚠️ NOT `accept_hostkey`, EVER. That option is `StrictHostKeyChecking=no`
+    # wearing a friendlier name: it writes whatever answered into known_hosts
+    # and carries on. The host keys are pinned ahead of time instead, and an
+    # unexpected one is a failure — which is the only safe behaviour for a
+    # document that decides what this site runs.
+    accept_hostkey: false
+  environment:
+    GIT_SSH_COMMAND: "{{ keel_reconcile_ssh_command }}"
+    GIT_TERMINAL_PROMPT: "0"
   delegate_to: localhost
   become: false
   run_once: true
@@ -207,8 +227,26 @@
   # `fetch` only, never `pull` or `checkout`: this writes to the object store
   # and leaves the working tree, branch and any local edits exactly as they
   # were. The console is somebody's working copy.
+  #
+  # ⚠️ THE URL, NOT `origin`. The SAME repository and the SAME deploy key as
+  # the channel — one credential covers both reads, because release/dev and
+  # the release's source commit are both in meetyaks/keel. Naming the URL
+  # instead of the symbolic remote removes a dependency on how somebody
+  # happened to configure their working copy: `origin` here is an HTTPS URL
+  # that resolves through a personal credential helper, so fetching it would
+  # work for a person and fail for the scheduler — the same false signal the
+  # credential preflight exists to remove.
   ansible.builtin.command:
-    argv: [git, -C, "{{ keel_source_repo }}", fetch, --quiet, origin]
+    argv:
+      - git
+      - -C
+      - "{{ keel_source_repo }}"
+      - fetch
+      - --quiet
+      - "{{ keel_reconcile_channel_repo if keel_channel_is_remote | bool else 'origin' }}"
+  environment:
+    GIT_SSH_COMMAND: "{{ keel_reconcile_ssh_command }}"
+    GIT_TERMINAL_PROMPT: "0"
   delegate_to: localhost
   become: false
   run_once: true

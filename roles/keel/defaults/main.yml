@@ -59,6 +59,13 @@ keel_release_schema_version: keel.release/v1
 # this must refuse me" and be believed.
 keel_controller_version: "1.0.0"
 
+# ⚠️ THE ONLY REGISTRY THIS SITE WILL AUTHENTICATE TO. Derived-then-checked:
+# release-bundle.yml reads the registry out of the release's own image
+# repositories and refuses if it is not this one. Without the check, a
+# manifest naming an unqualified repository would make `docker login` default
+# to Docker Hub and send a GHCR token to a different company.
+keel_release_expected_registry: ghcr.io
+
 # The image roles compose.lab.yml resolves: `${KEEL_IMAGE}` and
 # `${KEEL_WEB_IMAGE}`. A release that does not name both cannot be deployed
 # here, and saying so early beats compose failing after the stack is down.

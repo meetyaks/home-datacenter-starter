@@ -168,6 +168,30 @@ echo "══ reconcile check mode (13 checks, real channel repository) ═══
 tests/run-reconcile-check-mode.sh
 
 echo
+echo "══ the controller's scheduler (25 checks) ════════════════════════"
+# ⚠️ IT ASKS THE MACHINE WHICH OS IT IS. The repository shipped systemd units
+# for a console that runs macOS and has no systemctl at all; nothing said so
+# until somebody tried. The live scheduler is a launchd plist, the systemd
+# units are a retained Linux variant, and both are held to the same rules:
+# invoke the wrapper, never restart into a loop, carry no credential.
+ansible-playbook tests/controller-scheduler.yml
+
+echo
+echo "══ the wrapper, executed (20 checks) ═════════════════════════════"
+# ⚠️ EXERCISED, NOT GREPPED. That a SECOND concurrent run is refused, and
+# that Ansible's exit status survives unchanged, are exactly the properties a
+# careless rewrite loses and a structural check cannot see.
+tests/run-wrapper-behaviour.sh
+
+echo
+echo "══ the credential contract (99 checks) ═══════════════════════════"
+# ⚠️ NEITHER CREDENTIAL EXISTS YET. Nothing here proves authentication works
+# — only that the code refuses without it, cannot leak it, and gives it back.
+# Those must be right BEFORE a real credential is created, because afterwards
+# a mistake is a disclosed secret rather than a failing test.
+ansible-playbook tests/credential-contract.yml
+
+echo
 echo "══ the published release, read by this reader ════════════════════"
 # ⚠️ THE ONE SUITE WHOSE INPUT THIS REPOSITORY DID NOT WRITE. Every fixture
 # above agrees with the reader because the same hand wrote both. This runs the
@@ -190,6 +214,18 @@ if [ "${KEEL_SKIP_MUTATIONS:-0}" = "1" ]; then
   echo "SKIPPED by KEEL_SKIP_MUTATIONS=1 — the policy guards are UNPROVEN in this run."
 else
   tests/run-provenance-mutations.sh
+fi
+
+echo
+echo "══ scheduler and credential mutations (20 checks) ════════════════"
+# ⚠️ THE SAME DISCIPLINE, APPLIED TO THE GUARDS THAT PROTECT SECRETS. These
+# decide whether a read-only token reaches a process table, whether a failed
+# deployment leaves a credential on the host, and whether an unattended
+# controller accepts a release document from whatever answered on port 22.
+if [ "${KEEL_SKIP_MUTATIONS:-0}" = "1" ]; then
+  echo "SKIPPED by KEEL_SKIP_MUTATIONS=1 — the credential guards are UNPROVEN in this run."
+else
+  tests/run-auth-mutations.sh
 fi
 
 echo

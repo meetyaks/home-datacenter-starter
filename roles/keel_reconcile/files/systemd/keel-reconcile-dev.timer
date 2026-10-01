@@ -1,9 +1,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# When DEV checks its channel. Installed by an administrator alongside the
-# service unit — see docs/keel-dev-reconcile.md.
+# ⚠️ NOT THE DEV SCHEDULER — see keel-reconcile-dev.service beside this file.
+# The DEV administration console runs macOS, so the live scheduler is
+# files/launchd/com.meetyaks.keel-reconcile-dev.plist. This is the variant
+# for a future Linux controller and is installed nowhere.
 # ─────────────────────────────────────────────────────────────────────────────
 [Unit]
-Description=Check the Keel DEV release channel periodically
+Description=Check the Keel DEV release channel periodically (Linux controller variant — UNUSED)
 Documentation=https://github.com/meetyaks/home-datacenter-starter/blob/main/docs/keel-dev-reconcile.md
 
 [Timer]

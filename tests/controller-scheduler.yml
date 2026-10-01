@@ -1,0 +1,355 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE SCHEDULER MATCHES THE CONSOLE IT RUNS ON, AND DECIDES NOTHING ELSE.
+#
+#   ansible-playbook tests/controller-scheduler.yml
+#
+# ⚠️ THIS SUITE EXISTS BECAUSE THE FIRST ANSWER WAS WRONG. The repository
+# shipped systemd units for the administration console. The console is a Mac
+# mini: `/bin/launchctl`, and no `systemctl` anywhere. Those units could never
+# have started — and nothing would have said so until somebody tried, at which
+# point "the timer is installed" would have been believed for as long as it
+# took the first release to not deploy.
+#
+# So the shape of the check is: the LIVE scheduler for this controller is the
+# one its operating system can actually run, and every scheduler in the tree —
+# live or retained — obeys the same three rules:
+#
+#   · it invokes bin/keel-reconcile-dev and nothing else
+#   · it never restarts a failed run into a loop
+#   · it carries no credential
+#
+# ⚠️ THE WRAPPER IS THE ONLY BEHAVIOURAL OWNER. A scheduler that knew the
+# inventory, the vault path, the timeout or the concurrency rule would be a
+# second copy of those decisions, and the copies drift. The scheduler's whole
+# job is WHEN.
+#
+# Controller-only: reads files, runs `uname`.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The controller's scheduler
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    wrapper: ../bin/keel-reconcile-dev
+    plist: ../roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist
+    systemd_dir: ../roles/keel_reconcile/files/systemd
+
+    # ⚠️ TOKEN-SHAPED, DELIBERATELY BROAD. Catching a real GitHub token is the
+    # easy half; the point is to catch anything that LOOKS like somebody put a
+    # value where a path belongs.
+    secret_shapes:
+      - 'gh[pousr]_[A-Za-z0-9]{16,}'
+      - 'github_pat_[A-Za-z0-9_]{20,}'
+      - '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+      - '(?i)(password|passwd|token|secret|api[_-]?key)\s*[=:]\s*\S'
+
+  tasks:
+    # ── WHICH OPERATING SYSTEM IS THIS CONTROLLER? ──────────────────────────
+
+    - name: Ask the machine, rather than assuming
+      ansible.builtin.set_fact:
+        controller_os: "{{ ansible_system }}"
+        controller_is_mac: "{{ ansible_system == 'Darwin' }}"
+
+    - name: Say what it is
+      ansible.builtin.debug:
+        msg: >-
+          Controller: {{ ansible_system }} {{ ansible_distribution | default('') }}
+          {{ ansible_distribution_version | default(ansible_kernel) }}
+          on {{ ansible_architecture }} — scheduler is
+          {{ 'launchd' if controller_is_mac else 'systemd' }}.
+
+    # ── THE LIVE SCHEDULER IS THE ONE THIS OS CAN RUN ───────────────────────
+
+    - name: A macOS controller has a launchd plist
+      ansible.builtin.stat:
+        path: "{{ plist }}"
+      register: plist_stat
+
+    - name: And it is a well-formed property list
+      # ⚠️ PARSED, NOT GREPPED. A plist with a missing </dict> is a file that
+      # looks fine in a diff and makes `launchctl bootstrap` fail with
+      # "Bootstrap failed: 5: Input/output error" — which says nothing about
+      # XML. `plutil -lint` is on every Mac.
+      ansible.builtin.command:
+        argv: [plutil, -lint, "{{ plist }}"]
+      changed_when: false
+      # ⚠️ `failed_when: false`, SO THE ASSERTION BELOW GETS TO SPEAK. Without
+      # it an invalid plist fails HERE, as a bare non-zero `plutil`, and the
+      # operator reads a parser error instead of "this controller has no
+      # scheduler it can start".
+      failed_when: false
+      register: plist_lint
+      when: controller_is_mac | bool
+
+    - name: THE MAC CONTROLLER SELECTS launchd, NOT systemd
+      # The assertion the original mistake would have failed. `systemctl` does
+      # not exist here, so a systemd unit is not a scheduler — it is a file.
+      ansible.builtin.assert:
+        that:
+          - plist_stat.stat.exists
+          - plist_lint.rc == 0
+        fail_msg: >-
+          This controller is {{ controller_os }} and there is no valid launchd
+          plist at {{ plist }}. systemd units cannot run here — there is no
+          systemctl on this machine — so without the plist the DEV path has no
+          scheduler it can actually start.
+        success_msg: "macOS controller, valid launchd plist."
+      when: controller_is_mac | bool
+
+    - name: Read the plist
+      ansible.builtin.slurp:
+        src: "{{ plist }}"
+      register: plist_raw
+
+    - name: Read every retained systemd unit
+      ansible.builtin.find:
+        paths: "{{ systemd_dir }}"
+        patterns: "*"
+      register: systemd_files
+
+    - name: And their contents
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      register: systemd_raw
+      loop: "{{ systemd_files.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    # ── EVERY SCHEDULER INVOKES THE WRAPPER, AND ONLY THE WRAPPER ───────────
+
+    - name: Collect every scheduler file as a name and its text
+      # ⚠️ PAIRED WITH THEIR NAMES, not a bare list of strings. A loop over
+      # raw file contents labels each item with the whole file, which buries
+      # the one failing assertion under several screens of the thing that
+      # passed. A failure message has to be findable.
+      #
+      # Live and retained together: both are held to the same rules. A
+      # retained variant that quietly kept its own copy of the policy is
+      # exactly what somebody installs on the day a Linux console arrives.
+      #
+      # ⚠️ TWO VIEWS OF EACH FILE, AND THE DISTINCTION IS LOAD-BEARING. `text`
+      # is everything; `code` is the file with its commentary removed. The
+      # behavioural checks below read `code`, because a check that trips on a
+      # comment EXPLAINING the rule — this suite's first version failed
+      # exactly that way, on a plist whose comment said "a plist that called
+      # ansible-playbook directly would be…" — teaches people to stop writing
+      # the explanation rather than to keep the rule. The credential scan
+      # reads `text`, because a token pasted into a comment is still a token.
+      ansible.builtin.set_fact:
+        scheduler_files: >-
+          {{ (scheduler_files | default([]))
+             + [{'name': item.0,
+                 'text': item.1,
+                 'code': item.1
+                         | regex_replace('(?s)<!--.*?-->', '')
+                         | regex_replace('(?m)^\s*#.*$', '')}] }}
+      loop: >-
+        {{ ([plist | basename]
+            + (systemd_files.files | default([]) | map(attribute='path') | map('basename') | list))
+           | zip([plist_raw.content | b64decode]
+                 + (systemd_raw.results | default([]) | map(attribute='content') | map('b64decode') | list))
+           | list }}
+      loop_control:
+        label: "{{ item.0 }}"
+
+    - name: EVERY SCHEDULER THAT EXECUTES SOMETHING EXECUTES THE WRAPPER
+      # ⚠️ ONLY THE FILES THAT ACTUALLY RUN SOMETHING. A systemd .timer
+      # activates its .service and executes nothing itself, so demanding that
+      # it name the wrapper would be demanding the wrong thing — and the
+      # assertion would pass only because the file's comment happened to
+      # mention it.
+      ansible.builtin.assert:
+        that:
+          - item.code is search('keel-reconcile-dev')
+        fail_msg: >-
+          {{ item.name }} executes something other than
+          bin/keel-reconcile-dev. The wrapper is the only thing a scheduler
+          may call.
+        success_msg: "{{ item.name }}: executes the wrapper."
+      loop: "{{ scheduler_files }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.code is search('ProgramArguments|ExecStart')
+
+    - name: NO SCHEDULER CALLS ansible-playbook ITSELF
+      # ⚠️ THE DUPLICATION CHECK. A plist or unit with its own
+      # `ansible-playbook -i … --vault-password-file …` would be a second
+      # place the inventory, the vault path and the timeout are decided — and
+      # whichever copy somebody forgets to update is the one that runs
+      # unattended at 3am.
+      ansible.builtin.assert:
+        that:
+          - not (item.code is search('ansible-playbook'))
+          - not (item.code is search('--vault-password-file'))
+          - not (item.code is search('keel-reconcile\.yml'))
+        fail_msg: >-
+          {{ item.name }} runs Ansible directly instead of going through
+          bin/keel-reconcile-dev. That duplicates the inventory, the vault
+          path, the timeout and the concurrency rule into a second place.
+        success_msg: "{{ item.name }}: no reconciliation logic."
+      loop: "{{ scheduler_files }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: The timer activates its service rather than doing the work itself
+      ansible.builtin.assert:
+        that:
+          - item.code is search('(?m)^\[Timer\]')
+          - item.code is search('(?m)^OnUnitActiveSec=')
+        fail_msg: >-
+          {{ item.name }} is named a timer but does not schedule anything.
+        success_msg: "{{ item.name }}: schedules its service."
+      loop: "{{ scheduler_files }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.name is search('\.timer$')
+
+    # ── NO RESTART LOOP, IN EITHER DIALECT ──────────────────────────────────
+
+    - name: The launchd job does not KeepAlive itself into a deployment loop
+      # ⚠️ KeepAlive RESTARTS A JOB THE MOMENT IT EXITS. A reconciliation that
+      # failed would be restarted immediately and forever, at whatever rate
+      # launchd's throttle allows — defeating the role's two-attempt ledger
+      # and burying the one informative failure under a thousand identical
+      # ones. This is the launchd spelling of the systemd `Restart=` rule.
+      ansible.builtin.assert:
+        that:
+          - not ((plist_raw.content | b64decode) is search('(?s)<key>\s*KeepAlive\s*</key>'))
+        fail_msg: >-
+          The launchd plist sets KeepAlive. A failed reconciliation would be
+          restarted immediately and indefinitely, which defeats the role's
+          bounded retry allowance.
+        success_msg: "No KeepAlive: a failure stops, as it must."
+
+    - name: It does not deploy the moment it is bootstrapped either
+      # Installing a scheduler should not itself start a deployment. The first
+      # reconciliation of a release is watched by a person, by design.
+      ansible.builtin.assert:
+        that:
+          - (plist_raw.content | b64decode) is search('(?s)<key>\s*RunAtLoad\s*</key>\s*<false\s*/>')
+        fail_msg: >-
+          The launchd plist does not set RunAtLoad to false, so
+          `launchctl bootstrap` would start a deployment immediately.
+        success_msg: "Bootstrapping installs the schedule; it does not deploy."
+
+    - name: And it has a bounded interval rather than an unbounded respawn
+      ansible.builtin.assert:
+        that:
+          - (plist_raw.content | b64decode) is search('(?s)<key>\s*StartInterval\s*</key>')
+        fail_msg: >-
+          The launchd plist has no StartInterval, so nothing periodic happens
+          — or it is relying on KeepAlive, which is worse.
+        success_msg: "Scheduled by interval."
+
+    - name: The retained systemd service still refuses to restart
+      ansible.builtin.assert:
+        that:
+          - not ((item.content | b64decode) is search('(?m)^Restart=(always|on-failure)'))
+        fail_msg: >-
+          {{ item.item.path | basename }} restarts on failure, which defeats
+          the role's bounded retry allowance. The rule applies to the retained
+          Linux variant too — it is what somebody would install on the day a
+          Linux console arrives.
+        success_msg: "{{ item.item.path | basename }}: no restart loop."
+      loop: "{{ systemd_raw.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path | basename }}"
+
+    - name: And the retained timer still drops missed ticks
+      # A console asleep over a weekend would otherwise wake to a burst of
+      # queued activations — several deployments back to back.
+      ansible.builtin.assert:
+        that:
+          - (item.content | b64decode) is search('(?m)^Persistent=false')
+        fail_msg: >-
+          {{ item.item.path | basename }} is Persistent, so missed runs queue
+          up and fire as a burst of consecutive deployments.
+        success_msg: "{{ item.item.path | basename }}: missed ticks dropped."
+      loop: "{{ systemd_raw.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path | basename }}"
+      when: item.item.path is search('\.timer$')
+
+    # ── NOTHING SECRET IN A SCHEDULER, OR IN THE WRAPPER ────────────────────
+
+    - name: Read the wrapper
+      ansible.builtin.slurp:
+        src: "{{ wrapper }}"
+      register: wrapper_raw
+
+    - name: And strip its commentary, for the same reason as above
+      # The wrapper's own comments say "No --ask-vault-pass, no
+      # --ask-become-pass". Scanning the raw text would make the file fail
+      # for explaining the rule it obeys.
+      ansible.builtin.set_fact:
+        wrapper_text: "{{ wrapper_raw.content | b64decode }}"
+        wrapper_code: >-
+          {{ wrapper_raw.content | b64decode | regex_replace('(?m)^\s*#.*$', '') }}
+
+    - name: NO SCHEDULER OR WRAPPER CARRIES A CREDENTIAL
+      # ⚠️ A PLIST IN /Library/LaunchDaemons IS WORLD-READABLE, and
+      # `launchctl print` shows its environment to anyone who asks. A unit
+      # file is the same. Every secret reaches Ansible through the vault,
+      # named by the path of its password file; nothing here holds a value.
+      ansible.builtin.assert:
+        that:
+          - not (item.0.text is search(item.1))
+        fail_msg: >-
+          {{ item.0.name }} contains something matching /{{ item.1 }}/ — a
+          credential, or something shaped like one. These files are
+          world-readable and their environments are printable. Secrets belong
+          in the vault, referenced by the PATH of its password file.
+        success_msg: "{{ item.0.name }}: clean of /{{ item.1 }}/"
+      loop: >-
+        {{ (scheduler_files + [{'name': wrapper | basename, 'text': wrapper_text}])
+           | product(secret_shapes) | list }}
+      loop_control:
+        label: "{{ item.0.name }} ~ {{ item.1 }}"
+
+    - name: The wrapper names paths it was configured with, not values
+      # The positive half: it must READ a vault password file path, because a
+      # noninteractive run cannot be prompted — and it must not contain the
+      # passphrase itself.
+      ansible.builtin.assert:
+        that:
+          - wrapper_code is search('KEEL_VAULT_PASSWORD_FILE')
+          - wrapper_code is not search('--ask-vault-pass')
+          - wrapper_code is not search('--ask-become-pass')
+        fail_msg: >-
+          bin/keel-reconcile-dev either does not take a vault password FILE,
+          or still uses an interactive prompt. A scheduler cannot answer a
+          prompt; a run that waits for one hangs until its timeout.
+        success_msg: "Noninteractive, with the vault password supplied by path."
+
+    - name: It bounds its own execution and does not retry
+      ansible.builtin.assert:
+        that:
+          - wrapper_code is search('KEEL_RECONCILE_TIMEOUT')
+          - wrapper_code is not search('(?m)^\s*(for|while)\b.*retry')
+        fail_msg: >-
+          bin/keel-reconcile-dev has no execution ceiling, or retries
+          internally. A hung run holds the controller lock until somebody
+          notices; a wrapper-level retry defeats the role's attempt ledger
+          without replacing it.
+        success_msg: "Bounded, and it never retries by itself."
+
+    - name: It never reaches a CI runner
+      ansible.builtin.assert:
+        that:
+          - not (wrapper_code is search('dc1-ci-1|dc1-ci-tw-1|actions/runner'))
+        fail_msg: >-
+          bin/keel-reconcile-dev references a CI runner. CI decides what is
+          eligible; a site decides when to deploy, and the two must not be the
+          same authority.
+        success_msg: "No CI runner in the deployment path."
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          {{ controller_os }} controller → launchd; {{ systemd_files.files | length }}
+          retained systemd file(s); every scheduler invokes the wrapper, none
+          restarts into a loop, none carries a credential.

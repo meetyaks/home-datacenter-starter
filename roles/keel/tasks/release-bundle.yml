@@ -36,48 +36,98 @@
     success_msg: >-
       Bundle matches the release: sha256:{{ keel_release.bundle.sha256 }}.
 
-- name: Pull the exact image digests the release names
-  # ⚠️ PULL BY DIGEST, AND LET IT FAIL HERE. Compose would pull these anyway
-  # when the stack starts — but that happens after `docker compose up` has
-  # already stopped the running containers, so an unreachable registry or a
-  # withdrawn image would take the site DOWN and then fail. Pulling first means
-  # an unavailable artifact costs nothing.
-  ansible.builtin.command:
-    argv:
-      - docker
-      - pull
-      - "{{ item.repository }}@{{ item.digest }}"
-  register: keel_release_pull
-  changed_when: "'Downloaded newer image' in keel_release_pull.stdout"
-  loop: "{{ keel_release.images }}"
-  loop_control:
-    label: "{{ item.role }} {{ item.digest[:19] }}…"
+# ── THE PRIVATE REGISTRY ────────────────────────────────────────────────────
+#
+# ⚠️ ONE REGISTRY, DERIVED FROM THE RELEASE AND THEN CHECKED. The release's
+# image repositories decide where to authenticate, so a release naming images
+# somewhere else cannot silently cause a login — and a release naming two
+# different registries is refused rather than guessed at.
 
-- name: Confirm each digest resolved locally to the image it claims
-  # `docker pull` succeeding is not quite the same statement: this asks the
-  # local daemon what it now holds under that digest.
-  ansible.builtin.command:
-    argv:
-      - docker
-      - image
-      - inspect
-      - --format
-      - '{{ "{{index .RepoDigests 0}}" }}'
-      - "{{ item.repository }}@{{ item.digest }}"
-  register: keel_release_resolved
-  changed_when: false
-  loop: "{{ keel_release.images }}"
-  loop_control:
-    label: "{{ item.role }}"
+- name: Work out which registry the release's images live in
+  ansible.builtin.set_fact:
+    keel_release_registries: >-
+      {{ keel_release.images | map(attribute='repository')
+         | map('regex_replace', '/.*$', '') | unique | list }}
 
-- name: Every pulled image carries the digest the release named
+- name: The release's images all come from one registry, and it is the expected one
+  # ⚠️ `docker login` WITH NO REGISTRY ARGUMENT AUTHENTICATES TO DOCKER HUB.
+  # That is the accident this prevents: sending a GHCR token to an entirely
+  # different company because a manifest named an unqualified repository.
   ansible.builtin.assert:
     that:
-      - item.item.digest in item.stdout
+      - keel_release_registries | length == 1
+      - keel_release_registries[0] == keel_release_expected_registry
     fail_msg: >-
-      {{ item.item.role }} resolved to "{{ item.stdout }}", which does not carry
-      {{ item.item.digest }}.
-    success_msg: "{{ item.item.role }} is {{ item.item.digest }}."
-  loop: "{{ keel_release_resolved.results }}"
-  loop_control:
-    label: "{{ item.item.role }}"
+      The release's images resolve to registries
+      {{ keel_release_registries }}, and this deployment authenticates to
+      exactly one: {{ keel_release_expected_registry }}. REFUSING rather than
+      logging in somewhere a manifest asked for.
+    success_msg: "All images come from {{ keel_release_registries[0] }}."
+
+- name: Name it
+  ansible.builtin.set_fact:
+    keel_release_registry: "{{ keel_release_registries[0] }}"
+
+# ⚠️ login → pull → verify, AND THE LOGOUT HAPPENS WHATEVER ELSE DOES. The
+# block is here rather than around the whole deployment deliberately: the
+# credential is needed to pull, and nothing after the pull needs it, so it is
+# held for the shortest window that works.
+- name: Pull the release's images, authenticated
+  block:
+    - name: Authenticate to the private registry
+      ansible.builtin.include_tasks: registry.yml
+
+    - name: Pull the exact image digests the release names
+      # ⚠️ PULL BY DIGEST, AND LET IT FAIL HERE. Compose would pull these anyway
+      # when the stack starts — but that happens after `docker compose up` has
+      # already stopped the running containers, so an unreachable registry or a
+      # withdrawn image would take the site DOWN and then fail. Pulling first means
+      # an unavailable artifact costs nothing.
+      #
+      # ⚠️ ONLY WHAT THE ACCEPTED MANIFEST NAMES. The loop is over
+      # `keel_release.images`, which tasks/release.yml has already proved to be
+      # digest-only — no tag ever reaches this command, so there is no pull
+      # whose result could change between the gate and the deployment.
+      ansible.builtin.command:
+        argv:
+          - docker
+          - pull
+          - "{{ item.repository }}@{{ item.digest }}"
+      register: keel_release_pull
+      changed_when: "'Downloaded newer image' in keel_release_pull.stdout"
+      loop: "{{ keel_release.images }}"
+      loop_control:
+        label: "{{ item.role }} {{ item.digest[:19] }}…"
+
+    - name: Confirm each digest resolved locally to the image it claims
+      # `docker pull` succeeding is not quite the same statement: this asks the
+      # local daemon what it now holds under that digest.
+      ansible.builtin.command:
+        argv:
+          - docker
+          - image
+          - inspect
+          - --format
+          - '{{ "{{index .RepoDigests 0}}" }}'
+          - "{{ item.repository }}@{{ item.digest }}"
+      register: keel_release_resolved
+      changed_when: false
+      loop: "{{ keel_release.images }}"
+      loop_control:
+        label: "{{ item.role }}"
+
+    - name: Every pulled image carries the digest the release named
+      ansible.builtin.assert:
+        that:
+          - item.item.digest in item.stdout
+        fail_msg: >-
+          {{ item.item.role }} resolved to "{{ item.stdout }}", which does not carry
+          {{ item.item.digest }}.
+        success_msg: "{{ item.item.role }} is {{ item.item.digest }}."
+      loop: "{{ keel_release_resolved.results }}"
+      loop_control:
+        label: "{{ item.item.role }}"
+
+  always:
+    - name: Give the registry credential back, whatever happened
+      ansible.builtin.include_tasks: registry-logout.yml

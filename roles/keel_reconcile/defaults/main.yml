@@ -19,7 +19,19 @@
 
 # ── WHICH CHANNEL, AND WHERE IT LIVES ───────────────────────────────────────
 keel_reconcile_channel: dev
-keel_reconcile_channel_repo: https://github.com/meetyaks/keel
+
+# ⚠️ SSH, NOT HTTPS, AND THAT IS THE WHOLE POINT. meetyaks/keel is PRIVATE, so
+# the channel branch is private too. Over HTTPS this resolves through git's
+# credential helper — which on a developer's Mac means their keychain and
+# their personal token. That works when a person runs the playbook and fails
+# the moment a scheduler does, as a different account with no keychain, and
+# the failure arrives at 3am as "Authentication failed".
+#
+# An interactive developer credential is not proof that an unattended
+# controller can read this. So the controller uses a DEDICATED, READ-ONLY
+# DEPLOY KEY, named by path below and never by value, and the preflight in
+# tasks/credentials.yml refuses to run without it.
+keel_reconcile_channel_repo: git@github.com:meetyaks/keel.git
 keel_reconcile_channel_branch: release/dev
 keel_reconcile_channel_path: channels/dev.json
 keel_reconcile_channel_schema_version: keel.channel/v1
@@ -27,6 +39,48 @@ keel_reconcile_channel_schema_version: keel.channel/v1
 # Where the channel is fetched to on the CONTROLLER. Under the controller's own
 # temp area: it is a cache of a published document, never state.
 keel_reconcile_workdir: "/tmp/keel-reconcile-{{ keel_reconcile_channel }}"
+
+# ── THE DEPLOY KEY: A PATH, NEVER A VALUE ───────────────────────────────────
+#
+# ⚠️ ONE KEY SERVES BOTH READS, BECAUSE THEY ARE THE SAME REPOSITORY. The
+# channel branch (release/dev) and the release's source commit both live in
+# meetyaks/keel, so a single repository-scoped read-only deploy key covers
+# the channel clone AND the `git fetch` that makes the release's commit
+# present on the controller. Nothing here needs a second credential, and
+# nothing here needs write access.
+#
+# ⚠️ PROVISIONED BY AN ADMINISTRATOR, NOT BY THIS REPOSITORY. The private key
+# exists only on the controller, owned by the service account, mode 0400.
+# tasks/credentials.yml refuses to continue if it is absent, unreadable,
+# group- or world-readable, or owned by somebody else — because a deploy key
+# a second account can read is not a dedicated credential.
+keel_reconcile_deploy_key: /etc/keel/keel-deploy-key
+
+# ⚠️ STRICT, AND NOT NEGOTIABLE. An unattended run is exactly the case where
+# an unrecognised host key must be a hard failure: there is nobody to read
+# "The authenticity of host 'github.com' can't be established", so the
+# alternative to refusing is accepting whatever answered. `BatchMode=yes`
+# turns every would-be prompt into an error instead of a hang.
+#
+# The known_hosts file is provisioned alongside the key and pinned to
+# GitHub's published host keys. It is NOT ~/.ssh/known_hosts: the service
+# account's home directory is not where a reviewed pin belongs.
+keel_reconcile_known_hosts: /etc/keel/known_hosts
+
+# Who this reconciliation is running as on the controller. The deploy key must
+# belong to this account — a 0400 key owned by somebody else is one this
+# process cannot read, and "Permission denied (publickey)" names the wrong
+# cause. Derived rather than hard-coded so a manual run by an operator and a
+# scheduled run as `keeladmin` are both checked against whoever is actually
+# running, which is the invariant that matters.
+keel_reconcile_controller_user: "{{ lookup('env', 'USER') }}"
+keel_reconcile_ssh_command: >-
+  ssh -i {{ keel_reconcile_deploy_key }}
+  -o IdentitiesOnly=yes
+  -o IdentityAgent=none
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=yes
+  -o UserKnownHostsFile={{ keel_reconcile_known_hosts }}
 
 # ── AUTOMATIC DEPLOYMENT ────────────────────────────────────────────────────
 #

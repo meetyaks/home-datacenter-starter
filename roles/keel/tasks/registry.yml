@@ -1,0 +1,97 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTHENTICATE TO THE PRIVATE REGISTRY, PULL TWO DIGESTS, LOG OUT AGAIN.
+#
+# ⚠️ WHY THIS EXISTS AT ALL. ghcr.io/meetyaks/keel and …/keel-web are PRIVATE
+# packages. An anonymous `docker pull` of a digest in them is refused with
+# `denied`, and release mode has no fallback — it does not build. Without a
+# credential the DEV deployment cannot happen; with the wrong handling of one,
+# a read-only token ends up in a process list, a log, or current.json.
+#
+# ═══ WHY `ansible.builtin.command` AND NOT `community.docker.docker_login` ═══
+#
+# The module exists and is better-shaped on paper. Two reasons it is not used:
+#
+#   1. IT NEEDS THE DOCKER SDK ON THE MANAGED HOST. community.docker talks to
+#      the daemon through the `docker` Python library, which dc1-x86 does not
+#      have. Every other docker interaction in this role is the CLI through
+#      `ansible.builtin.command`, needing nothing on the host but docker
+#      itself — adding a Python dependency to the host for one task is a new
+#      prerequisite in exchange for nothing.
+#   2. THIS REPOSITORY DECLARES ONLY community.general. Adding
+#      community.docker to requirements.yml makes every CI lane and every
+#      operator install a collection for a single login.
+#
+# `docker login --password-stdin` is the mechanism Docker documents precisely
+# because it keeps the secret off the command line, which is the property that
+# actually matters here. Ansible's `stdin:` feeds it without a shell, so the
+# token never becomes a word in any argv.
+#
+# ⚠️ EVERY TASK THAT TOUCHES THE TOKEN IS `no_log: true`. Not for tidiness:
+# without it, a failure prints the task's arguments, and `-vvv` prints them on
+# success too.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: The registry credential exists before anything is changed
+  # ⚠️ BEFORE ANY MUTATION, AND THAT IS THE POINT OF THE PLACEMENT. Discovering
+  # a missing token after `compose up` has stopped the running stack means the
+  # site is down and cannot come back up. Here, nothing has been touched.
+  #
+  # `| trim | length > 0` and not merely `is defined`: a vault key present with
+  # an empty value is the ordinary mistake, and `docker login` with an empty
+  # password fails with an authentication error that reads like a wrong token.
+  ansible.builtin.assert:
+    that:
+      - keel_vault_registry_username is defined
+      - (keel_vault_registry_username | trim) | length > 0
+      - keel_vault_registry_token is defined
+      - (keel_vault_registry_token | trim) | length > 0
+    fail_msg: >-
+      keel_vault_registry_username and keel_vault_registry_token must both be
+      set in inventory/group_vars/linux_servers/vault.yml. The release names
+      digests in PRIVATE packages, and release mode does not build, so without
+      a read-only registry credential this deployment cannot proceed. REFUSING
+      now, before the running stack is touched.
+    # ⚠️ NAMES NEITHER VALUE, not even a length. success_msg is templated even
+    # when the assertion fails, and a message that said "token: 40 characters"
+    # would be a fact about the secret in a log that is not `no_log`.
+    success_msg: "A registry credential is configured."
+
+- name: Log in to the private registry
+  # ⚠️ ghcr.io EXPLICITLY, NOT A DEFAULT. `docker login` with no registry
+  # argument authenticates to Docker Hub, which would send this token to an
+  # entirely different company. The registry is derived from the release's own
+  # image repositories and asserted below to be the one expected.
+  #
+  # ⚠️ THE TOKEN GOES OVER STDIN. `--password <token>` would put it in the
+  # process table, where any user on the host can read it for as long as the
+  # command runs, and in the shell history of anyone who reproduces the step.
+  ansible.builtin.command:
+    argv:
+      - docker
+      - login
+      - "{{ keel_release_registry }}"
+      - --username
+      - "{{ keel_vault_registry_username }}"
+      - --password-stdin
+    stdin: "{{ keel_vault_registry_token }}"
+    stdin_add_newline: false
+  no_log: true
+  changed_when: false
+  register: keel_registry_login
+  failed_when: false
+
+- name: It worked, and say so without saying what
+  # ⚠️ A SEPARATE, LOGGED TASK. The login itself is `no_log: true`, which also
+  # hides its failure — so the outcome is re-stated here from the return code
+  # alone. Without this, a bad token produces a silent `no_log` failure and an
+  # operator sees only "a task failed".
+  ansible.builtin.assert:
+    that:
+      - (keel_registry_login.rc | default(1)) == 0
+    fail_msg: >-
+      `docker login {{ keel_release_registry }}` failed. The credential in
+      keel_vault_registry_username/_token was rejected, or the account has no
+      read access to the release's packages. The token's value is not shown
+      and is not in this log.
+    success_msg: "Authenticated to {{ keel_release_registry }} (read-only)."

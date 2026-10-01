@@ -4,7 +4,7 @@ DEV is the Keel environment on `dc1-x86`. It runs **immutable, digest-pinned art
 
 > ⚠️ **Not "attested artifacts".** An earlier draft of this document said that, and today it would be false. GitHub cannot persist artifact attestations for `meetyaks/keel` — see [Provenance, and what DEV actually gets](#provenance-and-what-dev-actually-gets). DEV deploys releases that declare `attestation.status: unavailable`, under an explicit policy that says so. Every other environment refuses them.
 
-> **Nothing in this document deploys anything by being read.** The identity change and the scheduling units are applied deliberately, in the order given under [Turning it on](#turning-it-on).
+> **Nothing in this document deploys anything by being read.** The identity change and the launchd daemon are applied deliberately, in the order given under [Turning it on](#turning-it-on). **Neither credential the controller needs exists yet** — see [Authentication](#authentication-what-the-controller-needs-and-does-not-have).
 
 ## The two halves, and why they are separate
 
@@ -163,7 +163,126 @@ The reconciler **records** the policy and can never **set** it: choosing this si
 
 A lock is **never broken automatically**, however old it is — "probably stale" is doing too much work when being wrong means two deployers at once. The refusal prints the `rmdir` to clear it once you have confirmed no deployment is running.
 
+## The controller, and what it runs on
+
+> **The administration console is a Mac mini running macOS 26.6 on Apple Silicon.** `uname -s` is `Darwin`, `/bin/launchctl` is present, and **there is no `systemctl` on the machine at all.**
+
+This matters because an earlier version of this document, and of this repository, shipped **systemd units** for the console and told you to `systemctl enable --now keel-reconcile-dev.timer`. That command cannot run here. Nothing would have said so until somebody tried — and in the meantime "the timer is installed" would have been believed for as long as it took the first release not to deploy.
+
+So the DEV path uses **launchd**, and `tests/controller-scheduler.yml` asks the machine rather than assuming.
+
+| | |
+|---|---|
+| live scheduler | [`roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist`](../roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist) → `/Library/LaunchDaemons/` |
+| retained, **unused** | [`roles/keel_reconcile/files/systemd/`](../roles/keel_reconcile/files/systemd/) — the variant for a future Linux controller. Installed nowhere. Kept because a Linux console is a plausible next step and the hardening is worth not re-deriving |
+
+### One entrypoint, and the scheduler's whole job is *when*
+
+Both schedulers invoke [`bin/keel-reconcile-dev`](../bin/keel-reconcile-dev) and nothing else. The inventory, the vault password path, the execution ceiling and the concurrency rule live in that one script. A plist that called `ansible-playbook` directly would be a second place those decisions live, and the copies drift — so `tests/controller-scheduler.yml` fails if any scheduler file mentions `ansible-playbook`.
+
+| the wrapper | |
+|---|---|
+| configuration | `/etc/keel/reconcile.conf` — **paths only, never values** |
+| noninteractive | no `--ask-vault-pass`, no `--ask-become-pass`; a scheduler cannot answer a prompt, and a run that waits for one hangs until its timeout |
+| bounded | 3000s, below the 15-minute schedule's own patience and well under launchd's 3600s backstop |
+| concurrency | an atomic `mkdir` lock on the controller, **in addition to** the deployment lock on the host — everything before the host lock (the clone, the decision, the registry login) would otherwise happen twice |
+| exit status | Ansible's, unchanged. Plus `100` already running, `101` misconfigured, `102` timed out — each distinct, because "the vault file is missing" and "the deployment failed" need different responses from whoever reads the log |
+| retries | none. The role's attempt ledger bounds them with state that survives a reboot; a loop here would defeat that bound without replacing it |
+
+```bash
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.meetyaks.keel-reconcile-dev.plist
+sudo launchctl print     system/com.meetyaks.keel-reconcile-dev
+sudo launchctl kickstart -p system/com.meetyaks.keel-reconcile-dev   # run one tick now
+sudo launchctl bootout   system/com.meetyaks.keel-reconcile-dev
+```
+
+**No `KeepAlive`.** It restarts a job the moment it exits, so a failed reconciliation would be restarted immediately and forever — defeating the role's two-attempt ledger and burying the one informative failure under a thousand identical ones. **No `RunAtLoad`** either: bootstrapping the daemon must not itself start a deployment.
+
+## Authentication: what the controller needs, and does not have
+
+Two private things stand between a correct controller and a working one. **Both are modelled in code and neither credential exists.** Nothing in this repository creates them.
+
+### 1. The release channel and source — one SSH deploy key
+
+`meetyaks/keel` is private, so `release/dev` is private too. Over HTTPS, git resolves that through the **credential helper** — a keychain, a personal token, a login session. That works when a person runs the playbook and fails the moment the scheduler does, as a different account, unattended.
+
+> **An interactive developer credential is not proof that an unattended controller can read anything.** A green manual run proves a person was logged in.
+
+So the channel remote is the SSH form and the controller authenticates with a **dedicated, repository-scoped, read-only deploy key**:
+
+| | |
+|---|---|
+| key | `/etc/keel/keel-deploy-key`, mode **`0400`**, owned by the service account |
+| host keys | `/etc/keel/known_hosts`, built from GitHub's **published** keys (`https://api.github.com/meta`, `ssh_keys`) — not from `ssh-keyscan`, which pins whatever answers |
+| ssh | `-o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes` |
+
+**One key covers both reads**, because `release/dev` and the release's source commit are in the *same* repository. The channel clone and the `git fetch` that makes the commit present on the controller use the same key and the same URL.
+
+`roles/keel_reconcile/tasks/credentials.yml` refuses to go further if the key is absent, group- or world-readable, or owned by somebody else — and then **asks GitHub directly**, with `GIT_TERMINAL_PROMPT=0`, the `GIT_CONFIG_*` trio neutralised and `IdentityAgent=none`, so the operator's own credentials cannot answer on the service account's behalf. `IdentityAgent=none` is the one people leave out: on a developer's Mac an agent is usually loaded with a key that *can* read the repository, and without it this check would pass and prove nothing.
+
+**`StrictHostKeyChecking` is not negotiable.** With `BatchMode=yes` there is nobody to answer the authenticity prompt, so the alternative to pinning is not *ask* — it is *accept whatever answered on port 22*, which is the path by which a site deploys a manifest handed to it by the wrong server. `accept_hostkey` on the git clone is the same thing wearing a friendlier name, and is explicitly `false`.
+
+**Operator steps, when you are ready** (this repository does not do them):
+
+1. `ssh-keygen -t ed25519 -N '' -f /etc/keel/keel-deploy-key -C keel-dev-controller` on the console, as the service account.
+2. Add the **public** half to `meetyaks/keel` → Settings → Deploy keys. **Leave "Allow write access" unchecked.**
+3. `chmod 0400 /etc/keel/keel-deploy-key && chown keeladmin /etc/keel/keel-deploy-key`.
+4. Write `/etc/keel/known_hosts` from `https://api.github.com/meta`.
+5. `ansible-playbook playbooks/keel-reconcile.yml --check` — the preflight will say whether it worked.
+
+### 2. The images — one read-only GHCR token, from the vault
+
+`ghcr.io/meetyaks/keel` and `…/keel-web` are **private packages**, and `docker pull` runs **on `dc1-x86`**, which has no `docker login`. An anonymous pull of a digest in a private package is refused with `denied`, and release mode does not build, so there is no fallback.
+
+| | |
+|---|---|
+| vault keys | `keel_vault_registry_username`, `keel_vault_registry_token` in `inventory/group_vars/linux_servers/vault.yml` |
+| scope | a classic PAT with **`read:packages` and nothing else**, or a fine-grained token scoped to those two packages. Not a personal token, not one that can write, not the one CI publishes with |
+| where | the encrypted vault only. Never a command line, never a `.env`, never this document |
+
+The handling, in [`roles/keel/tasks/registry.yml`](../roles/keel/tasks/registry.yml) and [`registry-logout.yml`](../roles/keel/tasks/registry-logout.yml):
+
+- **Both halves are required before any mutation** — and emptiness counts as missing, because a vault key present with an empty value is the ordinary mistake. Discovering this after `compose up` has stopped the stack means the site is down and cannot come back.
+- **The token goes over `--password-stdin`**, never `--password <token>`, which would put it in the host's process table for the life of the command and in the shell history of anyone reproducing the step.
+- **Every task that touches it is `no_log: true`.** Not tidiness: a failed task prints its own arguments, and `-vvv` prints them on success too.
+- **The registry is derived from the release and then checked** against `keel_release_expected_registry` (`ghcr.io`). `docker login` with no registry argument authenticates to *Docker Hub* — that is the accident this prevents.
+- **Only the accepted manifest's digests are pulled**, and the host is asked afterwards what it actually holds under each one.
+- **Logout runs in an `always` block**, so it happens whether the deployment succeeded or failed — and the host is then asked whether anything was left behind. `docker login` writes a base64 of `username:token` into `~/.docker/config.json`; not encrypted, just encoded. A logout that only ran on success would leave it there in exactly the case where somebody is about to go poking around.
+
+> **Authenticating to a registry is not provenance.** It proves who you are to the registry and says nothing about who built the image. The digest and the [provenance policy](#provenance-and-what-dev-actually-gets) do that.
+
+**Why `ansible.builtin.command` and not `community.docker.docker_login`:** the module talks to the daemon through the `docker` Python library, which `dc1-x86` does not have, and this repository declares only `community.general`. Every other docker interaction in `roles/keel` is the CLI through `command`, needing nothing on the host but docker itself. `--password-stdin` is the mechanism Docker documents precisely because it keeps the secret off the command line, which is the property that actually matters.
+
+### 3. SSH, sudo and the vault password — prerequisites, not yet provisioned
+
+Everything below is **documented, not created.** No file is written by this repository, and none of these exist yet.
+
+| what | path | owner | mode | why |
+|---|---|---|---|---|
+| service account | `keeladmin` on the console | — | — | not root and not a person: a deployment must not depend on somebody's login session, keychain or shell |
+| deployment checkout | `/opt/home-datacenter-starter` | `keeladmin` | `0755` | what the plist's `WorkingDirectory` names |
+| wrapper config | `/etc/keel/reconcile.conf` | `root` | `0644` | **paths only**; no value belongs here |
+| vault password | `/etc/keel/vault-pass` | `keeladmin` | **`0400`** | readable by the service account and nobody else |
+| GitHub deploy key | `/etc/keel/keel-deploy-key` | `keeladmin` | **`0400`** | §1 above |
+| pinned GitHub host keys | `/etc/keel/known_hosts` | `root` | `0444` | §1 above |
+| SSH key for dc1-x86 | `~keeladmin/.ssh/home_datacenter_admin` | `keeladmin` | **`0400`** | the inventory's `ansible_ssh_private_key_file`; dedicated to this host |
+| pinned dc1-x86 host key | `~keeladmin/.ssh/known_hosts` | `keeladmin` | `0600` | `host_key_checking = True` is already set in `ansible.cfg` and stays on |
+| log directory | `/var/log/keel/` | `keeladmin` | `0750` | where the plist sends stdout and stderr |
+
+**The sudo rule on `dc1-x86`** is scoped to what the playbook actually needs, not blanket `NOPASSWD`. An unattended run cannot answer `--ask-become-pass`, and the fix for that is a narrow rule rather than a wide one:
+
+```sudoers
+# /etc/sudoers.d/keel-reconcile on dc1-x86 — NOT created by this repository.
+# Scope it to the commands the playbook runs, then tighten it against a real
+# run's output rather than guessing wider than necessary.
+labadmin ALL=(root) NOPASSWD: /usr/bin/docker, /usr/bin/systemctl, /bin/mkdir, /bin/chown, /bin/chmod
+```
+
+**And none of it goes in the plist.** A file in `/Library/LaunchDaemons` is world-readable and `launchctl print` shows its environment to anyone who asks. `tests/controller-scheduler.yml` fails if anything credential-shaped appears in a scheduler file, a unit file or the wrapper.
+
 ## Operating it
+
+**By hand**, as a person at a terminal — this is how the first deployment is done:
 
 ```bash
 # What would it do right now? Changes nothing.
@@ -180,6 +299,21 @@ ansible-playbook playbooks/keel-reconcile.yml -e keel_reconcile_auto_deploy=fals
 ssh dc1-x86 'sudo rm /srv/data/services/keel/releases/attempts/<releaseId>.json'
 ```
 
+**Unattended**, through the wrapper — this is what launchd runs, and what you run to reproduce what launchd did:
+
+```bash
+# One tick, exactly as the daemon would do it. No prompts.
+sudo -u keeladmin /opt/home-datacenter-starter/bin/keel-reconcile-dev
+sudo -u keeladmin /opt/home-datacenter-starter/bin/keel-reconcile-dev --check
+
+# Or ask launchd to run one now.
+sudo launchctl kickstart -p system/com.meetyaks.keel-reconcile-dev
+
+tail -f /var/log/keel/reconcile-dev.log
+```
+
+> ⚠️ **`--ask-vault-pass` is not a smaller version of the unattended path; it is a different one.** A manual run succeeds with the operator's git credentials, their ssh-agent and their keychain — none of which the service account has. Use the wrapper, as `keeladmin`, to find out what the scheduler will actually do.
+
 A **rollback** is published by CI, not decided here: re-run `dev-release.yml` with `rollback: true` against the older commit. The channel entry then records `advanced.rollback: true`, which is what makes the site accept a backwards move — and what distinguishes it from the straggler the guard exists to stop.
 
 ## Delivery sequence
@@ -193,53 +327,64 @@ Both halves must land, in order, and the order matters: a site that can consume 
 | 3 | keel | read `channels/dev.json` on `release/dev` by hand and check it names two digest-pinned images, a bundle hash, and a `platformVersion` | anything is tagged rather than digested |
 | 4 | keel | read `provenance.attestation.status` and **check it against what you expect of this repository**. `persisted` → verify it: `gh attestation verify oci://…@<digest> --repo meetyaks/keel`, for both images and the manifest file. `unavailable` → read the `reason` and decide whether it is one you accept | the status and the `mechanism` disagree, or an `unavailable` reason is missing or is not a real limitation |
 | 5 | infra | merge `deploy/keel-lab` (PR #1), then this PR | — |
-| 6 | infra | **resolve the registry and channel credentials** — see [Blockers](#blockers-before-this-can-run-unattended). Nothing below works without them | they do not exist yet; this is where the sequence currently stops |
-| 7 | dns | create `keel-dev.dc1.lan` → dc1-x86 | — |
-| 8 | infra | apply the identity. **This invalidates live sessions** — the JWT issuer appears in already-issued tokens | outside an acceptable window |
-| 9 | infra | `ansible-playbook playbooks/keel-reconcile.yml --check --diff` and read the decision | it does not name the release you read at step 3 |
-| 10 | infra | run it for real, watching, and confirm `/srv/data/services/keel/releases/current.json` names that release **and the assurance you expected** | health verification fails — evidence is kept, and recovery is manual |
-| 11 | console | provision `/etc/keel/vault-pass` (`0400`) and the scoped sudo rule | — |
-| 12 | console | install the units and `systemctl enable --now keel-reconcile-dev.timer` | steps 9 and 10 have not both been done by hand at least once |
+| 6 | console | create the service account, the checkout at `/opt/home-datacenter-starter`, `/etc/keel/` and `/var/log/keel/` with the ownership and modes in [§3](#3-ssh-sudo-and-the-vault-password--prerequisites-not-yet-provisioned) | — |
+| 7 | github | create the **read-only deploy key** ([§1](#1-the-release-channel-and-source--one-ssh-deploy-key)) and the **read-only GHCR token** ([§2](#2-the-images--one-read-only-ghcr-token-from-the-vault)); put the token in the vault | either can write. **This is where the sequence currently stops** |
+| 8 | dc1-x86 | add the scoped sudo rule | it is blanket `NOPASSWD` |
+| 9 | dns | create `keel-dev.dc1.lan` → dc1-x86 | — |
+| 10 | infra | apply the identity. **This invalidates live sessions** — the JWT issuer appears in already-issued tokens | outside an acceptable window |
+| 11 | infra | `ansible-playbook playbooks/keel-reconcile.yml --check --diff` and read the decision | the credential preflight refuses, or it does not name the release you read at step 3 |
+| 12 | infra | run it for real, **watching**, and confirm `/srv/data/services/keel/releases/current.json` names that release **and the assurance you expected** | health verification fails — evidence is kept, and recovery is manual |
+| 13 | console | `sudo launchctl bootstrap system /Library/LaunchDaemons/com.meetyaks.keel-reconcile-dev.plist` | steps 11 and 12 have not both been done by hand at least once |
 
-Steps 1–4 are the producing side and change nothing on any host. **Steps 1–4 are done**: `release/dev` exists and carries `keel-20261001T010103Z-5bb120c97b56`, whose attestation status is `unavailable` for the reason above. Steps 5–10 are one deliberate, watched deployment. Steps 11–12 are what makes it unattended, and are deliberately last: a mechanism nobody has watched work should not first run at 3am.
+Steps 1–4 are the producing side and change nothing on any host. **Steps 1–4 are done**: `release/dev` exists and carries `keel-20261001T010103Z-5bb120c97b56`, whose attestation status is `unavailable` for the reason above. Steps 6–8 are the prerequisites, and nothing in this repository creates them. Steps 9–12 are one deliberate, watched deployment.
 
-## Blockers, before this can run unattended
+**Step 13 is last on purpose, and the ordering is not a formality.** Automatic scheduling is enabled only after the manual deployment has succeeded and been watched by a person. A mechanism nobody has seen work should not first run unattended at 3am — and the first run is the one that will discover whether the two credentials actually work, because nothing before it can.
 
-Found while tracing the consumer against the real release. **Neither is fixed here** — both need a credential, and creating one is not something this repository does on its own initiative.
+## Blockers, before the first deployment
 
-| # | blocker | why it stops the run |
+| # | blocker | status |
 |---|---|---|
-| 1 | **Private GHCR.** `ghcr.io/meetyaks/keel` and `…/keel-web` are private packages. `roles/keel/tasks/release-bundle.yml` runs `docker pull` **on `dc1-x86`**, which has no `docker login` for GHCR — and no `keel_vault_*` variable holds a registry credential | the pull fails with `denied`. Release mode does not build, so there is no fallback. It fails *before* `compose up`, which is deliberate — the running site stays up — but the release cannot be deployed at all |
-| 2 | **Private release channel.** `meetyaks/keel` is private, so `release/dev` is too. The controller clones it with `ansible.builtin.git` (`delegate_to: localhost`) and this repository supplies no credential for it | an operator's own console may happen to have a working git credential, which is exactly the trap: the **unattended timer** runs as a service account that does not, and would fail at the first task on every tick |
+| 1 | **No GitHub deploy key.** The controller cannot read the private channel or fetch the release's commit without one | **modelled, not provisioned.** The contract, the preflight and the refusals are in code and tested; §1 above has the operator steps |
+| 2 | **No GHCR read-only token.** `dc1-x86` cannot pull the two private digests | **modelled, not provisioned.** The vault keys are named and the handling is in code and tested; §2 above has the scope |
+| 3 | **No service account, vault-pass file, SSH key, known_hosts, log directory or sudo rule on the console or the host** | **documented, not created.** §3 above |
 
-Both are **least-privilege, read-only** needs: a token that can pull those two packages, and one that can read that one branch. They belong in the existing vault (`inventory/group_vars/linux_servers/`) — not in this document, not on a command line, and not in a `.env`. Until they exist the sequence above stops at step 6: the controller is correct and cannot run.
+> **Private channel access and GHCR pull have never been exercised with real credentials, and cannot be until they exist.** Every test in this repository proves the code refuses correctly, handles the secret safely, and gives it back — none of them proves authentication succeeds. That is the one thing the first manual deployment will establish.
 
-A third item is **not** a blocker, and is recorded so it is not rediscovered: `release/dev` carries **6,031 files** in its tree, where the channel needs two JSON documents. That costs a slower clone on every tick and nothing else. It is producer-side shape and belongs in the Keel repository, not here.
+**Not a blocker**, recorded so it is not rediscovered: `release/dev` carries **6,031 files** in its tree, where the channel needs two JSON documents. That costs a slower clone on every tick and nothing else. It is producer-side shape and belongs in the Keel repository, not here.
 
 ## Turning it on
 
-Steps 6 onwards, in detail. Not yet done:
+Steps 6 onwards, in detail. **None of this is done, and none of it is done by this repository.**
 
-1. **Resolve the two credentials** in [Blockers](#blockers-before-this-can-run-unattended), through the vault. Everything below assumes the host can pull the images and the controller can read the channel.
-2. **Create the DNS record** `keel-dev.dc1.lan` → `dc1-x86`. Nothing in this repository creates DNS.
-3. **Apply the identity.** `keel_hostname` changes the Caddy route, the CORS origin, and the JWT and OIDC issuers. **The issuer appears in already-issued tokens, so applying it invalidates live sessions** — do it when that is acceptable, and expect to sign in again.
-4. **Verify by hand** once: `ansible-playbook playbooks/keel-reconcile.yml --check` then a real run, watching it through. Read `current.json` afterwards and confirm the `assurance` line says what you expect — on DEV today that is `NOT ATTESTED — explicitly permitted by DEV policy`.
-5. **Provision the two files the timer needs**, neither of which is in git:
-   - `/etc/keel/vault-pass`, mode `0400`, owned by the operator account
-   - a sudo rule for that account scoped to this playbook's needs on `dc1-x86` — an unattended run cannot answer a `--ask-become-pass` prompt, and blanket `NOPASSWD` is not the way to fix that
-6. **Install the units** from [`roles/keel_reconcile/files/`](../roles/keel_reconcile/files/) and `systemctl enable --now keel-reconcile-dev.timer`.
+1. **Create the service account and its files** — [§3](#3-ssh-sudo-and-the-vault-password--prerequisites-not-yet-provisioned) has every path, owner and mode: `keeladmin`, the checkout at `/opt/home-datacenter-starter`, `/etc/keel/vault-pass` (`0400`), `/etc/keel/reconcile.conf`, `/var/log/keel/`.
+2. **Create the deploy key** ([§1](#1-the-release-channel-and-source--one-ssh-deploy-key)) and pin GitHub's host keys. Read-only; leave "Allow write access" unchecked.
+3. **Create the GHCR token** ([§2](#2-the-images--one-read-only-ghcr-token-from-the-vault)) with `read:packages` and nothing else, and put it in the vault.
+4. **Add the scoped sudo rule** on `dc1-x86`. An unattended run cannot answer `--ask-become-pass`, and blanket `NOPASSWD` is not the way to fix that.
+5. **Create the DNS record** `keel-dev.dc1.lan` → `dc1-x86`. Nothing in this repository creates DNS.
+6. **Apply the identity.** `keel_hostname` changes the Caddy route, the CORS origin, and the JWT and OIDC issuers. **The issuer appears in already-issued tokens, so applying it invalidates live sessions** — do it when that is acceptable, and expect to sign in again.
+7. **Deploy by hand, watching.** `ansible-playbook playbooks/keel-reconcile.yml --check` first, then a real run. Then **run it once through the wrapper as `keeladmin`**, because that is the only thing that proves the service account's own credentials work. Read `current.json` afterwards and confirm the `assurance` line says what you expect — on DEV today that is `NOT ATTESTED — explicitly permitted by DEV policy`.
+8. **Only then** install the daemon:
+   ```bash
+   sudo cp roles/keel_reconcile/files/launchd/com.meetyaks.keel-reconcile-dev.plist /Library/LaunchDaemons/
+   sudo launchctl bootstrap system /Library/LaunchDaemons/com.meetyaks.keel-reconcile-dev.plist
+   sudo launchctl print system/com.meetyaks.keel-reconcile-dev
+   ```
 
-Until step 6, DEV reconciles when somebody runs the playbook — which is a reasonable place to stop and watch it for a while.
+Until step 8, DEV reconciles when somebody runs the playbook — which is a reasonable place to stop and watch it for a while. **Step 8 is deliberately after step 7**: scheduling is enabled only once a manual deployment has succeeded and been watched.
 
 ## Tests
 
 ```bash
-tests/run-all.sh                        # everything, including the eight suites below
+tests/run-all.sh                        # everything, including the twelve suites below
 KEEL_SKIP_MUTATIONS=1 tests/run-all.sh  # the quick loop; leaves the guards UNPROVEN
 ```
 
 | suite | what it establishes |
 |---|---|
+| `controller-scheduler.yml` | **asks the machine which OS it is** and requires the scheduler that OS can run; every scheduler — live and retained — invokes only the wrapper, never restarts into a loop, and carries no credential |
+| `run-wrapper-behaviour.sh` | the wrapper **executed**: Ansible's exit status survives unchanged (0, 1, 2, 4, 99), a second concurrent run is refused with its own status, the lock is released after success *and* failure, a missing prerequisite is refused before anything runs |
+| `credential-contract.yml` | the deploy-key preflight **exercised** against absent, world-readable, group-readable, mis-owned and unpinned fixtures, plus an HTTPS remote; and the registry token's handling — stdin not argv, `no_log`, `ghcr.io` only, digests only, logout in `always`, nothing in the records, no value committed |
+| `run-auth-mutations.sh` | **breaks all of that seventeen ways** and proves the suites notice, each for its own reason |
 | `dev-environment-identity.yml` | the names, read from inventory; no CI VM is a deployment target; DEV declares `allow_unavailable` and **no other inventory file may** |
 | `release-contract.yml` | 28 cases against the role's own reader: schema, digest-only, identity, role coverage, controller version, and every provenance state under both policies |
 | `reconcile-decisions.yml` | 8 decision cases, plus that the shipped defaults are the safe ones |
