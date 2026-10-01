@@ -102,6 +102,11 @@ jobs:
       # ⚠️ OFFLINE AND PORTABLE. Every case is a locally generated fixture, so
       #    this proves the host-key verifier rejects a tampered document
       #    without needing GitHub to be reachable or a particular OS.
+      # Guards the narrowing of the anonymous-pull gate: cached-but-refused
+      # must not block, genuinely-absent must.
+      - name: Unpullable vs unobtainable
+        run: ansible-playbook tests/anon-pull-classify.yml
+
       - name: GitHub host-key pin — verified, not merely fetched
         run: tests/run-known-hosts-pin.sh
 

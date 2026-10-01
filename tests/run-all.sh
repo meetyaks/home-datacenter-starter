@@ -184,6 +184,15 @@ echo "══ the wrapper, executed (20 checks) ═══════════
 tests/run-wrapper-behaviour.sh
 
 echo
+echo "══ unpullable vs unobtainable (15 checks) ════════════════════════"
+# ⚠️ IT GUARDS A NARROWING OF A DEPLOYMENT GATE. The preflight used to refuse
+# whenever an image could not be pulled anonymously; it now refuses only when
+# the host can obtain it NEITHER anonymously NOR from its own store. These
+# cases keep the second half honest — an image that is genuinely gone must
+# still stop the deployment, and an entry nobody could check counts as gone.
+ansible-playbook tests/anon-pull-classify.yml
+
+echo
 echo "══ the github host-key pin (9 checks) ════════════════════════════"
 # ⚠️ THE GUARD THAT MATTERS MOST ON THIS PATH. The controller decides what DEV
 # runs, from a document it fetches over SSH. `ssh-keyscan` — the usual way to

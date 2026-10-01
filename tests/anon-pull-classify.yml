@@ -1,0 +1,87 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# AN IMAGE THAT IS MERELY RATE-LIMITED DOES NOT BLOCK; ONE THAT IS GONE DOES.
+#
+#   ansible-playbook tests/anon-pull-classify.yml
+#
+# ⚠️ THIS GUARDS A NARROWING OF A DEPLOYMENT GATE, which is the kind of change
+# that deserves more suspicion than the thing it replaced.
+#
+# roles/keel's preflight used to refuse whenever an external image could not
+# be pulled anonymously. On 2026-10-01 Docker Hub rate-limited dc1-x86 (HTTP
+# 429) for nats, pgvector and temporal — all three already present at exactly
+# the pinned digests and running for a week. The deploy would have succeeded:
+# the stack starts with `docker compose up`, with no `--pull always` and no
+# `docker compose pull` anywhere, so Compose never asks for an image it
+# already has. The gate refused a deployment that worked, citing a step the
+# role does not run.
+#
+# So the question narrowed from "is this pullable?" to "can this host obtain
+# it AT ALL?" — pullable OR present. The risk of narrowing is that the gate
+# stops catching the case it exists for: an image that is genuinely gone.
+# These cases exist to keep that half honest.
+#
+# ⚠️ IT RUNS roles/keel/tasks/anon-pull-classify.yml ITSELF. Nothing here
+# restates the filter expressions; a harness carrying its own copy would pass
+# against a partition the role does not have.
+#
+# Controller-only: no docker, no host, no registry.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Which unpullable images actually block a deployment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Run every case
+      ansible.builtin.include_tasks: anon-pull-classify-case.yml
+      loop:
+        - name: an image the registry refuses but the host already holds is NOT blocking
+          # The dc1-x86 case, exactly.
+          results:
+            - {rc: 0, item: {image: "nats:2-alpine@sha256:aaa", reason: "HTTP 429 — rate limited"}}
+          expect_blocking: []
+          expect_cached: ["nats:2-alpine@sha256:aaa"]
+
+        - name: AN IMAGE THAT IS NEITHER PULLABLE NOR PRESENT IS BLOCKING
+          # The case the gate exists for: a rebuilt host, an evicted layer, a
+          # withdrawn tag. Narrowing must not lose this.
+          results:
+            - {rc: 1, item: {image: "gone:1@sha256:bbb", reason: "HTTP 404 — not found"}}
+          expect_blocking: ["gone:1@sha256:bbb"]
+          expect_cached: []
+
+        - name: a mixture is split, not rounded either way
+          results:
+            - {rc: 0, item: {image: "cached@sha256:ccc", reason: "HTTP 429"}}
+            - {rc: 1, item: {image: "absent@sha256:ddd", reason: "HTTP 404"}}
+            - {rc: 0, item: {image: "cached2@sha256:eee", reason: "HTTP 429"}}
+          expect_blocking: ["absent@sha256:ddd"]
+          expect_cached: ["cached@sha256:ccc", "cached2@sha256:eee"]
+
+        - name: AN ENTRY WITH NO rc COUNTS AS BLOCKING, NOT AS CACHED
+          # ⚠️ THE FAILURE MODE A NAIVE PARTITION HAS. `selectattr('rc','ne',0)`
+          # silently DROPS an entry that has no `rc` at all — which is what a
+          # skipped loop item looks like, or one whose docker call never ran.
+          # Dropped from the blocking list, it would be read as "fine", and
+          # the deployment would proceed on an image nobody established was
+          # there. "We could not tell" must mean stop.
+          results:
+            - {item: {image: "unchecked@sha256:fff", reason: "HTTP 429"}}
+          expect_blocking: ["unchecked@sha256:fff"]
+          expect_cached: []
+
+        - name: nothing refused means nothing to classify
+          results: []
+          expect_blocking: []
+          expect_cached: []
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Classification holds: cached-only never blocks, absent always
+          blocks, and an entry we could not check counts as absent.

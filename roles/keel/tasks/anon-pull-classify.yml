@@ -1,0 +1,46 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# WHICH UNPULLABLE IMAGES ACTUALLY BLOCK A DEPLOYMENT?
+#
+# Takes `keel_cached_check` — the result of asking the daemon about every
+# image the registry refused — and splits it in two:
+#
+#   keel_anon_unobtainable   neither pullable nor present. BLOCKING.
+#   keel_anon_cached_only    refused by the registry, but already on the host.
+#                            Not blocking, because `docker compose up` does
+#                            not ask for an image it already has. Warned about
+#                            loudly, because the next rebuilt host will fail.
+#
+# ⚠️ ITS OWN FILE SO IT CAN BE TESTED WITHOUT DOCKER, A HOST, OR A REGISTRY.
+# The partition is three filter expressions, and filter expressions are
+# exactly the kind of thing that looks right and selects the wrong set —
+# `selectattr('rc', 'ne', 0)` silently drops entries with no `rc` at all,
+# which is what a skipped loop item looks like. tests/anon-pull-classify.yml
+# feeds it synthetic results and checks both halves, including that one.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Separate "cannot be obtained" from "rate-limited but cached"
+  ansible.builtin.set_fact:
+    # ⚠️ `rc is defined` FIRST, AND IT IS NOT DEFENSIVE PADDING. A loop item
+    # that was skipped — or that failed before docker ran — has no `rc`. Such
+    # an entry must count as UNOBTAINABLE: "we could not establish that this
+    # image is here" is not the same as "it is here", and only one of those
+    # is safe to deploy on.
+    # ⚠️ THE OUTER PARENTHESES AROUND THE UNION ARE LOAD-BEARING. Filters bind
+    # tighter than `+`, so writing
+    #
+    #     a | rejectattr(...) | list + (b | ... | list) | map('item') | list
+    #
+    # applies `map('item')` to the SECOND operand only, and the result is a
+    # list of two different shapes — raw task results beside the items they
+    # wrap. It fails later and elsewhere, as "object of type 'dict' has no
+    # attribute 'image'". tests/anon-pull-classify.yml caught exactly that.
+    keel_anon_unobtainable: >-
+      {{ ((keel_cached_check.results | default([]) | rejectattr('rc', 'defined') | list)
+          + (keel_cached_check.results | default([])
+             | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list))
+         | map(attribute='item') | list }}
+    keel_anon_cached_only: >-
+      {{ keel_cached_check.results | default([])
+         | selectattr('rc', 'defined') | selectattr('rc', 'eq', 0)
+         | map(attribute='item') | list }}

@@ -414,6 +414,62 @@
           ~ (keel_anon_pull.execution_host | default('(unknown host)'))] +
          (keel_anon_pull.results | default([]) | map(attribute='image') | list) }}
 
+# ── IS A FAILURE ACTUALLY BLOCKING, OR ONLY A WARNING? ──────────────────────
+#
+# ⚠️ THE CHECK ABOVE ASKS THE REGISTRY; THE DEPLOY ASKS THE DAEMON. Those are
+# different questions, and conflating them blocked a real deployment for the
+# wrong reason.
+#
+# The stack starts with `docker compose up -d --remove-orphans --wait`. There
+# is no `--pull always` and no `docker compose pull` anywhere in deploy.yml,
+# so Compose fetches only images that are ABSENT. A digest-pinned image
+# already in the local store is never requested from the registry at all.
+#
+# On 2026-10-01 Docker Hub rate-limited dc1-x86 (HTTP 429) for nats, pgvector
+# and temporal. All three were already present at exactly the pinned digests
+# and had been running for a week. The deploy would have succeeded; the gate
+# refused it, citing a `docker compose pull` that this role does not run.
+#
+# So the question becomes: can the host obtain this image AT ALL? Anonymous
+# pull OR already in the store. If neither, it is still a hard failure — a
+# rebuilt host, an evicted layer or a withdrawn tag must still stop the
+# deployment here rather than at `compose up` with the stack already down.
+#
+# ⚠️ THIS IS A NARROWING OF THE GATE AND IT HAS A COST, STATED PLAINLY. A site
+# that passes only because of its cache is one `docker system prune` away
+# from being unable to deploy, and nothing here will have warned it twice.
+# That is why the downgrade is LOUD rather than silent, and why the real fix
+# — mirroring these images somewhere that serves them anonymously — stays on
+# the table.
+- name: Ask the daemon whether the unpullable images are already here
+  ansible.builtin.command:
+    argv: [docker, image, inspect, "{{ item.image | regex_search('sha256:[0-9a-f]{64}') }}"]
+  loop: "{{ keel_anon_pull.results | default([]) | rejectattr('ok') | list }}"
+  loop_control:
+    label: "{{ item.image }}"
+  register: keel_cached_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Separate "cannot be obtained" from "rate-limited but cached"
+  # Its own file so the partition can be tested without docker, a host or a
+  # registry — see tests/anon-pull-classify.yml.
+  ansible.builtin.include_tasks: anon-pull-classify.yml
+
+- name: ⚠️ WARN when an image is deployable only because it is already cached
+  # Not a failure — but not silent either. An operator should see this before
+  # it becomes the reason a rebuilt host cannot be brought up.
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['⚠️ ' ~ (keel_anon_cached_only | length) ~ ' image(s) could NOT be '
+          ~ 'pulled anonymously and are deployable ONLY because this host '
+          ~ 'already holds them. A rebuilt host would fail. Mirror them '
+          ~ 'somewhere that serves them anonymously.']
+         + (keel_anon_cached_only | map(attribute='image') | list)
+         + (keel_anon_cached_only | map(attribute='reason') | list) }}
+  when: (keel_anon_cached_only | length) > 0
+
 - name: Fail when an external image cannot be pulled without credentials
   # THREE conditions, and all three are load-bearing:
   #
@@ -427,28 +483,34 @@
   #                   cannot quietly widen what PASS means.
   ansible.builtin.assert:
     that:
+      # ⚠️ host_matches AND input_count ARE UNCHANGED. A green result from the
+      # controller instead of the deployment host, or from an empty image
+      # list, must still be impossible — those were never about availability.
       - keel_anon_pull.host_matches | default(false)
       - (keel_anon_pull.input_count | default(0)) > 0
-      - (keel_anon_pull.verified_count | default(-1)) == (keel_anon_pull.input_count | default(0))
-      - (keel_anon_pull.results | default([]) | rejectattr('ok') | list | length) == 0
+      # ⚠️ "UNOBTAINABLE", NOT "UNPULLABLE". An image the registry refuses but
+      # the daemon already holds is not a reason to stop: `compose up` will
+      # not ask for it. An image that is neither pullable nor present is.
+      - (keel_anon_unobtainable | length) == 0
     fail_msg: >-
-      Anonymous image verification failed. Ran on
+      {{ keel_anon_unobtainable | length }} image(s) can be obtained NEITHER
+      anonymously NOR from this host's local store, so the deployment cannot
+      proceed. Ran on
       {{ keel_anon_pull.execution_host | default('(unknown)') }}, expected
-      {{ inventory_hostname }} (host_matches={{ keel_anon_pull.host_matches | default(false) }});
-      verified {{ keel_anon_pull.verified_count | default(0) }} of
-      {{ keel_anon_pull.input_count | default(0) }}.
-      {% for r in (keel_anon_pull.results | default([]) | rejectattr('ok') | list) %}
-      FAILED {{ r.image }} — {{ r.reason }}
+      {{ inventory_hostname }} (host_matches={{ keel_anon_pull.host_matches | default(false) }}).
+      {% for r in keel_anon_unobtainable %}
+      UNOBTAINABLE {{ r.image }} — {{ r.reason }}
       {% endfor %}
-      This is a property of the REGISTRY AND THIS HOST'S PATH TO IT, not of any
-      local image cache: the module speaks HTTP directly and sends no
-      credentials. Do not add registry credentials to this host; find a source
-      that serves the image anonymously, or mirror it somewhere that does. A
-      deploy started now would stop at `docker compose pull`.
+      Find a source that serves these anonymously, or mirror them somewhere
+      that does. Do NOT add registry credentials to this host: the images
+      above are third-party dependencies, and a credential here would make
+      every future deployment depend on it.
     success_msg: >-
-      verified {{ keel_anon_pull.verified_count | default(0) }} of
-      {{ keel_anon_pull.input_count | default(0) }} from
-      {{ keel_anon_pull.execution_host | default('?') }} —
+      {{ keel_anon_pull.verified_count | default(0) }} of
+      {{ keel_anon_pull.input_count | default(0) }} pullable anonymously from
+      {{ keel_anon_pull.execution_host | default('?') }}{{
+        (', ' ~ (keel_anon_cached_only | length) ~ ' deployable from cache only')
+        if (keel_anon_cached_only | length) > 0 else '' }} —
       {{ keel_anon_pull.results | default([]) | map(attribute='image') | join(', ') }}
     quiet: true
 
