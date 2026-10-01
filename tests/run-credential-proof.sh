@@ -35,6 +35,38 @@ VAULT_FILE=inventory/group_vars/linux_servers/vault.yml
 VAULT_PASS=${KEEL_VAULT_PASSWORD_FILE:-/etc/keel/vault-pass}
 REGISTRY=ghcr.io
 
+# ⚠️ RESOLVED, BECAUSE THIS IS USUALLY RUN OVER ssh. A non-interactive ssh
+# session gets the system PATH from /etc/paths — NOT the login shell's. On a
+# Mac where Ansible and Docker came from Homebrew or Docker Desktop, that
+# means `ansible-playbook` and `docker` are simply not found, on a console
+# where both work perfectly when you log in. Observed on dc1-arm-1: `docker
+# --version` over ssh said "command not found" while `command -v docker` in
+# a login shell said /usr/local/bin/docker.
+#
+# Resolving beats telling people to `ssh -t` or source a profile: the script
+# should work however it is invoked.
+resolve_tool() { # resolve_tool <name> <candidate>...
+  name=$1; shift
+  found=$(command -v "$name" 2>/dev/null || true)
+  if [ -z "$found" ]; then
+    for c in "$@"; do
+      [ -x "$c" ] && found="$c" && break
+    done
+  fi
+  printf '%s' "$found"
+}
+
+ANSIBLE_PLAYBOOK=$(resolve_tool ansible-playbook \
+  /opt/homebrew/bin/ansible-playbook /usr/local/bin/ansible-playbook /usr/bin/ansible-playbook)
+ANSIBLE_VAULT=$(resolve_tool ansible-vault \
+  /opt/homebrew/bin/ansible-vault /usr/local/bin/ansible-vault /usr/bin/ansible-vault)
+DOCKER=$(resolve_tool docker \
+  /usr/local/bin/docker /opt/homebrew/bin/docker \
+  /Applications/Docker.app/Contents/Resources/bin/docker)
+
+[ -n "$ANSIBLE_PLAYBOOK" ] || { echo "REFUSING: no ansible-playbook found"; exit 1; }
+[ -n "$ANSIBLE_VAULT" ]    || { echo "REFUSING: no ansible-vault found"; exit 1; }
+
 # The digests currently published to release/dev. Restated here on purpose:
 # an assertion that read its expectation out of the same document it is
 # checking would pass against any document at all.
@@ -52,7 +84,7 @@ bad() { echo "  FAIL  $1"; [ -n "${2:-}" ] && echo "        $2"; fail=$((fail + 
 DOCKER_CONFIG_DIR=$(mktemp -d /tmp/keel-credential-proof.XXXXXX)
 cleanup() {
   if [ -f "$DOCKER_CONFIG_DIR/config.json" ]; then
-    docker --config "$DOCKER_CONFIG_DIR" logout "$REGISTRY" >/dev/null 2>&1
+    "$DOCKER" --config "$DOCKER_CONFIG_DIR" logout "$REGISTRY" >/dev/null 2>&1
   fi
   rm -rf "$DOCKER_CONFIG_DIR"
 }
@@ -62,7 +94,7 @@ echo "── 1. the deploy key, through the role's own preflight ─────
 # ⚠️ THE ROLE'S TASKS. tests/credential-preflight-real.yml includes
 # roles/keel_reconcile/tasks/credentials.yml with the shipped paths, so this
 # exercises the code the unattended run uses rather than a restatement of it.
-if ansible-playbook tests/credential-preflight-real.yml > /tmp/keel-deploy-key-proof.log 2>&1; then
+if "$ANSIBLE_PLAYBOOK" tests/credential-preflight-real.yml > /tmp/keel-deploy-key-proof.log 2>&1; then
   ok "mode, owner, pinned host keys, agent-free read, write refused"
 else
   bad "the deploy-key preflight failed" "$(grep -m3 '"msg"' /tmp/keel-deploy-key-proof.log | cut -c1-200)"
@@ -87,13 +119,13 @@ else
   # view` writes the decrypted file to stdout; capturing it would put the
   # token in the shell's memory and, on any `set -x` or error trace, in the
   # log.
-  if ansible-vault view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" 2>/dev/null \
+  if "$ANSIBLE_VAULT" view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" 2>/dev/null \
        | grep -q '^keel_vault_registry_username:'; then
     ok "it decrypts, and carries keel_vault_registry_username"
   else
     bad "the vault does not decrypt to the expected variables"
   fi
-  if ansible-vault view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" 2>/dev/null \
+  if "$ANSIBLE_VAULT" view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" 2>/dev/null \
        | grep -q '^keel_vault_registry_token:'; then
     ok "and keel_vault_registry_token"
   else
@@ -104,11 +136,11 @@ fi
 echo
 echo "── 3. the GHCR token, against the published digests ────────────────"
 vault_value() { # vault_value <variable> — prints one value, used only in a pipe
-  ansible-vault view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" 2>/dev/null \
+  "$ANSIBLE_VAULT" view --vault-password-file "$VAULT_PASS" "$VAULT_FILE" 2>/dev/null \
     | sed -n "s/^$1: *\"\\(.*\\)\"$/\\1/p" | head -1
 }
 
-if ! command -v docker >/dev/null 2>&1; then
+if [ -z "$DOCKER" ]; then
   bad "docker is not installed on this console" "the registry proof cannot run here"
 elif [ ! -f "$VAULT_FILE" ]; then
   bad "no vault to read the token from" "skipped"
@@ -121,15 +153,26 @@ else
     # the decrypted stream into docker's stdin. `--password <token>` would
     # put it in the process table for every local user to read.
     if vault_value keel_vault_registry_token \
-         | docker --config "$DOCKER_CONFIG_DIR" login "$REGISTRY" \
+         | "$DOCKER" --config "$DOCKER_CONFIG_DIR" login "$REGISTRY" \
              --username "$REGISTRY_USER" --password-stdin >/dev/null 2>&1; then
       ok "authenticated to $REGISTRY as $REGISTRY_USER"
 
       # ⚠️ `manifest inspect`, NOT `pull`. Resolving the manifest proves the
       # credential can READ the digest; pulling would drag hundreds of
       # megabytes of layers onto the console for no extra information.
+      # ⚠️ TWO WAYS TO ASK, BECAUSE `docker manifest` IS STILL EXPERIMENTAL
+      # ON SOME INSTALLS and refuses with a message about enabling it —
+      # which has nothing to do with the credential being tested. `buildx
+      # imagetools inspect` asks the same question through a path that is
+      # not gated, so a missing feature flag cannot be mistaken for a
+      # credential that cannot read.
+      resolve_digest() { # resolve_digest <ref>
+        "$DOCKER" --config "$DOCKER_CONFIG_DIR" manifest inspect "$1" >/dev/null 2>&1 && return 0
+        "$DOCKER" --config "$DOCKER_CONFIG_DIR" buildx imagetools inspect "$1" >/dev/null 2>&1
+      }
+
       for ref in "$GATEWAY_DIGEST" "$WEB_DIGEST"; do
-        if docker --config "$DOCKER_CONFIG_DIR" manifest inspect "$ref" >/dev/null 2>&1; then
+        if resolve_digest "$ref"; then
           ok "resolved ${ref##*/}"
         else
           bad "could NOT resolve ${ref##*/}" \
@@ -149,7 +192,7 @@ echo "── 4. a missing credential still fails closed ────────
 # about what happens when it is absent — and absence is the ordinary case on
 # a rebuilt machine. Pointing the preflight at a path that does not exist
 # must be a refusal, not a silent skip.
-if ansible-playbook tests/credential-preflight-real.yml \
+if "$ANSIBLE_PLAYBOOK" tests/credential-preflight-real.yml \
      -e keel_reconcile_deploy_key=/etc/keel/definitely-not-here \
      > /tmp/keel-failclosed-proof.log 2>&1; then
   bad "the preflight ACCEPTED a missing deploy key"
