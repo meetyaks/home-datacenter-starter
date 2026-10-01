@@ -144,6 +144,19 @@
 # `failed_when: false` would turn a broken deploy into a green one; the rescue
 # ends with an explicit `fail`, so the play still stops exactly as it would
 # have. The only difference is what is on the screen when it does.
+- name: Record that the point of no return has been reached
+  # ⚠️ THE ONE FACT THAT TELLS A FAILURE REPORT WHETHER TO ALARM. Everything
+  # before this is read-only or reversible: preflight, secrets, the source
+  # transfer, pulling images. `up -d` runs the `bootstrap` service to
+  # completion, and bootstrap applies migrations — which are forward-only.
+  #
+  # `set_fact` and not a role default, deliberately: a fact survives the
+  # include returning, so roles/keel_reconcile's rescue can still read it
+  # after this role has failed and gone out of scope. A default could not.
+  ansible.builtin.set_fact:
+    keel_deploy_stack_started: true
+  when: not ansible_check_mode
+
 - name: Start the stack, reporting the state of everything if it fails
   when: not ansible_check_mode
   block:
