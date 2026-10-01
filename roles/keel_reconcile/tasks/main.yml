@@ -444,20 +444,40 @@
       # redeploying the previous image does NOT restore the previous schema. A
       # site that rolled back here would report success while leaving the
       # database ahead of the code — the one failure mode nobody checks for.
+      #
+      # ⚠️ BUT IT MUST ONLY SAY SO WHEN IT IS TRUE. This message used to fire
+      # on the release's `requiresManualRecoveryOnFailure` flag alone, which
+      # every release sets — so a preflight failure that touched nothing
+      # produced the identical "MANUAL RECOVERY IS REQUIRED" as a migration
+      # that died halfway. On 2026-10-01 it shouted that twice at runs that
+      # had changed nothing: once for a missing variable, once for a compose
+      # interpolation error.
+      #
+      # That is how an operator learns to discount the message, and then
+      # discounts it on the day it is real. `keel_deploy_stack_started` is
+      # set by roles/keel immediately before `up -d` — the point past which
+      # bootstrap may have applied migrations — so the two cases can finally
+      # be told apart.
       ansible.builtin.fail:
         msg: >-
           DEPLOYMENT FAILED: {{ keel_reconcile_channel_doc.release.releaseId }}
           on {{ inventory_hostname }}, attempt
           {{ (keel_reconcile_attempts | int) + 1 }} of
           {{ keel_reconcile_max_attempts }}.
-          {{ 'This release declares requiresManualRecoveryOnFailure — migrations
-             are forward-only and there is no down-migration runner, so
+          {{ 'The stack was never started: this failed before `up -d`, so no
+             migration ran and nothing on this host was changed by the
+             deployment. The site is still serving whatever it was serving
+             before. Fix the cause and run again — no recovery is needed.'
+             if not (keel_deploy_stack_started | default(false) | bool)
+             else ('This release declares requiresManualRecoveryOnFailure, and
+             the stack HAD been started — migrations may have run. They are
+             forward-only and there is no down-migration runner, so
              redeploying the previous image would NOT restore the previous
-             schema. MANUAL RECOVERY IS REQUIRED; this controller will not roll
-             back.'
+             schema. MANUAL RECOVERY IS REQUIRED; this controller will not
+             roll back.'
              if keel_reconcile_channel_doc.release.migrations.requiresManualRecoveryOnFailure | bool
-             else 'Automatic rollback is disabled by policy
-             (keel_reconcile_auto_rollback).' }}
+             else 'The stack had been started. Automatic rollback is disabled
+             by policy (keel_reconcile_auto_rollback).') }}
           Evidence: {{ keel_reconcile_evidence_run_dir | default(keel_reconcile_evidence_dir) }}.
           {{ 'No further automatic attempts will be made.'
              if ((keel_reconcile_attempts | int) + 1) >= (keel_reconcile_max_attempts | int)
