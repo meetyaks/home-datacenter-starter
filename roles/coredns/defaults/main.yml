@@ -1,0 +1,137 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# CoreDNS — the authoritative resolver for dc1.lan.
+#
+# ⚠️ WHY THIS EXISTS AT ALL. `dc1.lan` was never DNS. `keel.dc1.lan` resolved
+# from a single line in ONE workstation's /etc/hosts, whose own comment said
+# "temporary until dc1.lan DNS exists". The router at 10.0.0.1 served no
+# dc1.lan record, and no host on the LAN ran a resolver — so a name every
+# runbook referred to was reachable from exactly one machine, and only because
+# somebody had edited a file there by hand.
+#
+# That is the same class of defect as the hand-placed compose override this
+# repository just finished replacing: real state, outside Git, that nothing
+# re-creates and nothing notices the loss of.
+#
+# ⚠️ TWO NODES, NOT ONE, AND THE SECOND IS NOT OPTIONAL. Once the router
+# advertises these resolvers to every DHCP client, a single resolver makes LAN
+# name resolution a single point of failure — including for the machines that
+# would be used to repair it. The primary runs on the management node and the
+# secondary on the runtime host, both rendered from the variables below, so
+# neither is a hand-maintained copy of the other
+# (enforced: tests/dns-zone.yml "both nodes render byte-identical zones").
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── THE PINNED RELEASE ──────────────────────────────────────────────────────
+#
+# ⚠️ A DIGEST-EQUIVALENT PIN, FOR THE SAME REASON THE KEEL IMAGES ARE PINNED
+# BY DIGEST. A version alone names a mutable download; these checksums name
+# the bytes. Both are the values GitHub publishes beside the assets, and both
+# were verified against the real downloads before being written here.
+#
+# To move the version: fetch the new `.sha256` assets for BOTH platforms,
+# record them here, and verify them against the downloads. A version bumped
+# without its checksums is refused
+# (enforced: tests/dns-zone.yml "every platform is pinned and checksummed").
+coredns_version: "1.14.7"
+
+# Keyed by `<os>_<arch>` as the release names them. Both platforms are listed
+# because both are deployed: one Mac on ARM, one Linux on x86.
+coredns_checksums:
+  darwin_arm64: "0005d154d49c73a88b2c56f429f35106e46c4ca37ee6de4e4d482d7de5c4b8ba"
+  linux_amd64: "9a09356438c6d9591cb80011a2a7a52f87fc3a113f6690e41f243f98b98faac9"
+
+coredns_release_base: "https://github.com/coredns/coredns/releases/download"
+
+# ── THE ZONE, AND IT IS THE ONLY COPY ───────────────────────────────────────
+#
+# ⚠️ ONE LIST, RENDERED TWICE. Both resolvers template their zone file from
+# this, so "the secondary is out of date" is not a state this configuration
+# can reach. There is no zone transfer and no secondary-of-a-primary
+# relationship: both nodes are authoritative from the same Git content, which
+# is simpler than AXFR and has no master to lose.
+coredns_zone: dc1.lan
+
+# ⚠️ `keel.dc1.lan` IS DELIBERATELY ABSENT AND MUST STAY ABSENT. It is the
+# reserved FUTURE PRODUCTION identity, on separate hardware. Creating it here
+# — even pointing at dc1-x86 "for now" — would mean the eventual production
+# cutover has to take a live name away from DEV, and would give this DEV
+# installation two issuers. DEV's canonical name is keel-dev.dc1.lan and
+# nothing else
+# (enforced: tests/dns-zone.yml "keel.dc1.lan is absent from the zone").
+coredns_zone_records:
+  - name: dc1-arm-1
+    ip: 10.0.0.22
+  - name: dc1-x86
+    ip: 10.0.0.3
+  - name: keel-dev
+    ip: 10.0.0.3
+
+# SOA values. A low refresh/retry is pointless with no zone transfer, so these
+# are conventional rather than load-bearing; the serial is derived from the
+# content so a changed zone changes the serial.
+coredns_soa_ns: "dc1-arm-1.{{ coredns_zone }}."
+coredns_soa_contact: "hostmaster.{{ coredns_zone }}."
+coredns_soa_refresh: 7200
+coredns_soa_retry: 3600
+coredns_soa_expire: 1209600
+coredns_soa_minimum: 300
+coredns_record_ttl: 300
+
+# ── WHO MAY ASK, AND WHERE QUERIES GO ───────────────────────────────────────
+#
+# LAN and loopback only. The `acl` plugin blocks everything else, so a
+# resolver that somehow became reachable from outside answers nothing rather
+# than becoming an open resolver
+# (enforced: tests/dns-zone.yml "only the LAN and loopback may query").
+coredns_allowed_networks:
+  - 10.0.0.0/24
+  - 127.0.0.0/8
+
+# ⚠️ EXPLICIT PUBLIC UPSTREAMS, AND 10.0.0.1 IS NOT ONE OF THEM. The router is
+# the thing that will FORWARD TO US; if we forwarded external queries back to
+# it, every cache miss would be a loop between the two. CoreDNS does the
+# external forwarding itself, which is also why the router's own DNS fields
+# must name these resolvers and not a public address
+# (enforced: tests/dns-zone.yml "external forwarding cannot loop via Orbi").
+coredns_upstreams:
+  - 1.1.1.1
+  - 9.9.9.9
+
+coredns_cache_ttl: 30
+
+# ── BIND ADDRESSES ──────────────────────────────────────────────────────────
+#
+# ⚠️ EXPLICIT, NEVER THE WILDCARD. Bound to this node's own LAN address and
+# loopback, so the service is not listening on anything it was not meant to —
+# including a VPN or tunnel interface that happens to exist on a workstation.
+# Set per host; there is no sane default for "my address", and guessing one is
+# how a resolver ends up on 0.0.0.0.
+coredns_bind_addresses: []
+
+# ⚠️ HEALTH AND READINESS ON LOOPBACK. They are for the node itself and for
+# the deployment's own verification, not for the LAN — an HTTP endpoint
+# reachable from every client is surface this service does not need.
+coredns_health_address: "127.0.0.1:8080"
+coredns_ready_address: "127.0.0.1:8181"
+
+# ── WHERE THINGS LIVE ───────────────────────────────────────────────────────
+#
+# Per-platform, because a Mac and a Linux box do not agree about where a
+# service binary or its configuration belongs.
+coredns_bin_dir_darwin: /usr/local/sbin
+coredns_bin_dir_linux: /usr/local/sbin
+coredns_conf_dir_darwin: /usr/local/etc/coredns
+coredns_conf_dir_linux: /etc/coredns
+coredns_log_dir_darwin: /var/log/coredns
+coredns_log_dir_linux: /var/log/coredns
+
+coredns_service_name: coredns
+coredns_launchd_label: org.coredns.coredns
+coredns_launchd_plist: /Library/LaunchDaemons/org.coredns.coredns.plist
+coredns_systemd_unit: /etc/systemd/system/coredns.service
+
+# The Linux service account. On macOS the daemon runs as root under launchd,
+# which is how a launchd system daemon binding a privileged port works.
+coredns_linux_user: coredns
+coredns_linux_group: coredns

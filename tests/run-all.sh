@@ -9,6 +9,67 @@ echo "══ secret verification (7 cases, both modes) ════════�
 tests/run-secret-verification.sh
 
 echo
+echo "══ LAN DNS — zone, pins, forwarding, ACL (32 checks) ══════════════"
+# ⚠️ dc1.lan WAS NEVER DNS. `keel.dc1.lan` resolved from ONE line in ONE
+# workstation's /etc/hosts — the router served no dc1.lan record and no host
+# ran a resolver — so a name in runbooks, JWT issuers and CORS origins was
+# reachable from exactly one machine, by hand-edited state nothing re-created.
+# These renders the role's own templates and holds the replacement honest:
+# three records and no `keel`, both platforms checksum-pinned, LAN-only
+# access, and no forwarding path back to the router.
+ansible-playbook tests/dns-zone.yml
+
+echo
+echo "══ LAN DNS — the two service definitions (24 checks) ══════════════"
+# The interesting assertion is that CoreDNS's plist KEEPS KeepAlive, which is
+# the opposite of the reconciler's. A bounded deployment retry and an
+# always-on resolver are different problems; both directions are tested so
+# "tidying up the inconsistency" fails.
+ansible-playbook tests/dns-services.yml
+
+echo
+echo "══ LAN DNS — inventory reaches dc1-x86 by address (10 checks) ═════"
+# The circular dependency: DNS is deployed BY Ansible, and the inventory
+# reached the host by a name only DNS could resolve.
+ansible-playbook tests/dns-inventory.yml
+
+echo
+echo "══ LAN DNS — the management-node guard, executed (5 checks) ═══════"
+# ⚠️ EXECUTED, NOT GREPPED. The primary is configured over a LOCAL
+# connection, so running playbooks/dns.yml on a workstation would install a
+# LAN resolver and a launchd daemon THERE. On dc1-arm-1 this proves the guard
+# ACCEPTS the node; anywhere else it proves the refusal, and that nothing was
+# installed by the attempt.
+tests/run-dns-controller-guard.sh
+
+echo
+echo "══ LAN DNS — the real binary loads the rendered config (14 checks) ══"
+# ⚠️ THE CHECK THE REGEXES COULD NOT BE, AND IT ALREADY EARNED ITS PLACE.
+# The template wrote the forwarding block as `. :53 {`; a header is
+# `ZONE...[:PORT]`, so that is TWO zones and CoreDNS refuses to start with
+# "zone is not a valid domain name". Every structural assertion above passed
+# on a file the daemon would not load. This starts the pinned binary on
+# loopback and asks it questions.
+#
+# Network-dependent in part: it fetches the pinned release (verifying the same
+# checksum the role uses) unless KEEL_COREDNS_BIN names an existing binary.
+# That is why it is not in the hosted CI lane.
+tests/run-dns-corefile-parse.sh
+
+echo
+echo "══ LAN DNS mutations (24 checks) ══════════════════════════════════"
+# ⚠️ A GUARD THAT HAS NEVER FAILED IS NOT A GUARD. Deletes and repoints every
+# essential record, plants the reserved keel.dc1.lan, breaks both checksums,
+# points the forwarder back at the router, opens the bind and the ACL, and
+# breaks both service definitions — requiring the suites to go red for the
+# matching reason each time. Restores every file, including on an interrupt.
+if [ "${KEEL_SKIP_MUTATIONS:-0}" = "1" ]; then
+  echo "SKIPPED by KEEL_SKIP_MUTATIONS=1 — the DNS guards are UNPROVEN in this run."
+else
+  tests/run-dns-mutations.sh
+fi
+
+echo
 echo "══ controller delegation ═══════════════════════════════════════════"
 ansible-playbook -i tests/inventory-fixture.yml tests/controller-delegation.yml
 

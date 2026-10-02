@@ -1,0 +1,141 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE INVENTORY CHANGE THAT BREAKS THE CIRCULAR DEPENDENCY.
+#
+#   ansible-playbook tests/dns-inventory.yml
+#
+# ⚠️ WHAT WAS BROKEN. `inventory/hosts.yml` said `ansible_host: dc1-x86` — a
+# NAME. There was no DNS for dc1.lan, no `dc1-x86` line in any hosts file and
+# no mDNS answer, so the controller could not resolve its own managed host; it
+# had worked once only because some stale resolver state happened to answer.
+#
+# And it could not be fixed from inside: DNS is deployed BY Ansible, and
+# Ansible needed DNS to reach the host it would deploy DNS to. An address
+# breaks the cycle.
+#
+# ⚠️ THE HOST'S IDENTITY IS STILL ITS NAME. Only the transport is an address.
+# `inventory_hostname` stays `dc1-x86`, because that string appears in group
+# membership, evidence paths and release records — changing it would rewrite
+# history that is supposed to be append-only.
+#
+# Controller-only: parses inventory/hosts.yml, connects to nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The inventory's connection and group facts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Read the real inventory
+      ansible.builtin.include_vars:
+        file: ../inventory/hosts.yml
+        name: inv
+
+    - name: Name the three groups this repository defines
+      ansible.builtin.set_fact:
+        g: "{{ inv.all.children }}"
+
+    - name: Ansible reaches dc1-x86 by ADDRESS, not by a name DNS must resolve first
+      # ⚠️ AN IPv4 LITERAL, CHECKED AS ONE. `ansible_host: dc1-x86` passed
+      # every structural check that merely asserted the key was present — it
+      # was there, it was just unresolvable. So this asserts the SHAPE of the
+      # value, which is the part that was wrong.
+      ansible.builtin.assert:
+        that:
+          - g.linux_servers.hosts['dc1-x86'].ansible_host is match('^(\d{1,3}\.){3}\d{1,3}$')
+          - g.linux_servers.hosts['dc1-x86'].ansible_host == '10.0.0.3'
+        fail_msg: >-
+          dc1-x86's ansible_host is
+          "{{ g.linux_servers.hosts['dc1-x86'].ansible_host | default('(unset)') }}".
+          It must be the literal address 10.0.0.3. A hostname here recreates
+          the circular dependency: Ansible installs DNS, so it cannot require
+          DNS to connect.
+        success_msg: "dc1-x86 is reached at 10.0.0.3, no name resolution needed."
+
+    - name: Its identity is still dc1-x86, in every group that names it
+      ansible.builtin.assert:
+        that:
+          - "'dc1-x86' in g.linux_servers.hosts"
+          - "'dc1-x86' in g.keel_dev.hosts"
+          - "'dc1-x86' in g.dns_servers.hosts"
+        fail_msg: >-
+          dc1-x86 must keep its inventory_hostname in linux_servers, keel_dev
+          and dns_servers — that string is what evidence paths and release
+          records refer to.
+        success_msg: "dc1-x86 keeps its name in all three groups."
+
+    - name: BOTH resolvers are defined, and only those two
+      ansible.builtin.assert:
+        that:
+          - (g.dns_servers.hosts.keys() | list | sort) == ['dc1-arm-1', 'dc1-x86']
+        fail_msg: >-
+          dns_servers is
+          {{ g.dns_servers.hosts.keys() | list | sort | join(', ') }}. It must
+          be exactly dc1-arm-1 and dc1-x86 — one resolver is a single point of
+          failure for every DHCP client once the router forwards here, and a
+          third would need its own reserved address.
+        success_msg: "Two resolvers: dc1-arm-1 and dc1-x86."
+
+    - name: dc1-arm-1 IS NOT A linux_server AND NOT A keel_dev HOST
+      # ⚠️ THE MANAGEMENT NODE IS NOT A MANAGED LINUX BOX. `linux_servers`
+      # carries the vault and the base roles; applying those to a Mac would at
+      # best fail and at worst half-apply. And it is not in `keel_dev` because
+      # it DRIVES the DEV deployment rather than hosting it — every playbook
+      # in this repository targets `linux_servers`, so this membership is the
+      # only thing keeping the controller out of them.
+      ansible.builtin.assert:
+        that:
+          - "'dc1-arm-1' not in g.linux_servers.hosts"
+          - "'dc1-arm-1' not in g.keel_dev.hosts"
+        fail_msg: >-
+          dc1-arm-1 appears in
+          {{ ['linux_servers'] if 'dc1-arm-1' in g.linux_servers.hosts else [] }}{{
+             ['keel_dev'] if 'dc1-arm-1' in g.keel_dev.hosts else [] }}.
+          The management node must be in dns_servers and nowhere else: every
+          playbook here targets linux_servers, so joining it would make the
+          controller a Keel deployment target.
+        success_msg: "dc1-arm-1 is a resolver only, not a deployment target."
+
+    - name: Each resolver binds its own address and loopback, never the wildcard
+      ansible.builtin.assert:
+        that:
+          - g.dns_servers.hosts['dc1-arm-1'].coredns_bind_addresses == ['10.0.0.22', '127.0.0.1']
+          - g.dns_servers.hosts['dc1-x86'].coredns_bind_addresses == ['10.0.0.3', '127.0.0.1']
+        fail_msg: >-
+          The bind addresses are wrong. dc1-arm-1 must bind 10.0.0.22 and
+          loopback; dc1-x86 must bind 10.0.0.3 and loopback. The wildcard
+          would put a resolver on every interface the host happens to have.
+        success_msg: "Each resolver binds its own LAN address and loopback."
+
+    - name: The primary is configured locally, and that is why dns.yml checks the machine
+      # ⚠️ `local` IS A FOOTGUN AND THE GUARD IS NOT OPTIONAL. Run on a
+      # workstation, a local connection would install a LAN DNS server and a
+      # launchd daemon THERE — permanent services on a laptop that leaves the
+      # house. tests/run-dns-controller-guard.sh executes that refusal.
+      ansible.builtin.assert:
+        that:
+          - g.dns_servers.hosts['dc1-arm-1'].ansible_connection == 'local'
+          - g.dns_servers.hosts['dc1-arm-1'].ansible_host == '10.0.0.22'
+        fail_msg: >-
+          dc1-arm-1 must be reached with ansible_connection=local (the
+          playbook runs on it) and record its address 10.0.0.22.
+        success_msg: "dc1-arm-1 is configured locally, address recorded."
+
+    - name: NEITHER CI RUNNER IS A RESOLVER
+      # Same boundary the keel_dev group keeps: a CI runner that serves LAN
+      # DNS is a runner the whole house depends on staying up.
+      ansible.builtin.assert:
+        that:
+          - (g.dns_servers.hosts.keys() | select('search', 'ci') | list | length) == 0
+        fail_msg: >-
+          A CI runner appears in dns_servers:
+          {{ g.dns_servers.hosts.keys() | select('search', 'ci') | join(', ') }}.
+        success_msg: "No CI runner serves LAN DNS."
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          dc1-x86 is reached at 10.0.0.3 and keeps its name; both resolvers are
+          defined with explicit binds; the management node resolves DNS and
+          deploys nothing.

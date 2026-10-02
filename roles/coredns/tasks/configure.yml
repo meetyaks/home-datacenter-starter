@@ -1,0 +1,49 @@
+---
+# The Corefile and the zone, rendered from Git.
+#
+# ⚠️ BOTH ARE `validate`-FREE ON PURPOSE AND VERIFIED AFTERWARDS INSTEAD.
+# `coredns -conf` validates by starting, so there is no offline syntax check
+# to hang a `validate:` on. tasks/verify.yml therefore queries the running
+# resolver for a record it must know — a configuration that parsed but served
+# nothing would otherwise look like a success.
+
+- name: Refuse a zone that does not say what this repository requires
+  # ⚠️ CHECKED ON THE HOST TOO, NOT ONLY IN CI. tests/dns-zone.yml holds the
+  # shipped defaults honest, but a deployment can be run with `-e` overrides
+  # or an inventory variable, and those never pass through CI. The reserved
+  # production name must not reach a zone file by any route.
+  ansible.builtin.assert:
+    that:
+      - coredns_zone_records | length > 0
+      - (coredns_zone_records | map(attribute='name') | select('equalto', 'keel') | list | length) == 0
+      - (coredns_zone_records | map(attribute='name') | list | unique | length) == (coredns_zone_records | length)
+    fail_msg: >-
+      The zone for {{ coredns_zone }} is not acceptable:
+      {{ coredns_zone_records | default([]) | map(attribute='name') | join(', ') }}.
+      `keel` is the RESERVED PRODUCTION identity and must not appear — DEV is
+      keel-dev. Duplicate names are refused too, because the last one silently
+      wins in a zone file.
+    success_msg: >-
+      {{ coredns_zone }} will serve
+      {{ coredns_zone_records | map(attribute='name') | sort | join(', ') }};
+      keel is absent, as it must be.
+
+- name: Render the zone
+  ansible.builtin.template:
+    src: db.zone.j2
+    dest: "{{ coredns_zone_file }}"
+    owner: root
+    group: "{{ 'wheel' if coredns_is_darwin else 'root' }}"
+    mode: "0644"
+  become: true
+  notify: Restart CoreDNS
+
+- name: Render the Corefile
+  ansible.builtin.template:
+    src: Corefile.j2
+    dest: "{{ coredns_corefile }}"
+    owner: root
+    group: "{{ 'wheel' if coredns_is_darwin else 'root' }}"
+    mode: "0644"
+  become: true
+  notify: Restart CoreDNS

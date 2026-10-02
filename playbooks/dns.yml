@@ -1,0 +1,32 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# LAN DNS for dc1.lan, on both resolvers.
+#
+#   ansible-playbook playbooks/dns.yml --ask-become-pass
+#
+# ⚠️ RUN THIS FROM dc1-arm-1, AND IT CHECKS. The primary is configured over a
+# LOCAL connection, so running this anywhere else would install a LAN resolver
+# and a launchd daemon on whatever machine you happened to be sitting at. The
+# imported guard refuses that before anything is touched.
+#
+# ⚠️ SERIAL, PRIMARY FIRST. Both resolvers are about to be advertised to every
+# DHCP client on the LAN. Configuring them in parallel means a mistake lands on
+# both at once and takes LAN name resolution with it; one at a time leaves the
+# second node still answering while the first is verified.
+#
+# ⚠️ DEPLOY THIS BEFORE TOUCHING THE ROUTER. Until the router forwards to these
+# addresses, nothing depends on them and a failure costs nothing. Afterwards, a
+# broken resolver is a LAN-wide outage. The ordering is in docs/dc1-lan-dns.md
+# and it is not a formality.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Guard — this must be the management node
+  ansible.builtin.import_playbook: dns-controller-guard.yml
+
+- name: CoreDNS on the LAN resolvers
+  hosts: dns_servers
+  gather_facts: true
+  become: false
+  serial: 1
+
+  roles:
+    - coredns

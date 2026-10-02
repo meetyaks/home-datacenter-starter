@@ -1,0 +1,121 @@
+---
+# The pinned binary, verified before it is installed.
+
+- name: Create the configuration and log directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: "{{ 'wheel' if coredns_is_darwin else 'root' }}"
+    mode: "0755"
+  loop:
+    - "{{ coredns_conf_dir }}"
+    - "{{ coredns_log_dir }}"
+  become: true
+
+- name: Create the service account
+  # Linux only: the systemd unit runs as a dedicated unprivileged user. On
+  # macOS the launchd daemon runs as root, which is how a system daemon binds
+  # a privileged port there.
+  ansible.builtin.group:
+    name: "{{ coredns_linux_group }}"
+    system: true
+    state: present
+  become: true
+  when: not coredns_is_darwin
+
+- name: Create the service user
+  ansible.builtin.user:
+    name: "{{ coredns_linux_user }}"
+    group: "{{ coredns_linux_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    state: present
+  become: true
+  when: not coredns_is_darwin
+
+- name: Check which version is already installed
+  # So a converged node does nothing. `coredns --version` prints
+  # "CoreDNS-<version>", and a missing binary is not a failure here.
+  ansible.builtin.command:
+    cmd: "{{ coredns_bin_dir }}/coredns --version"
+  register: coredns_installed
+  changed_when: false
+  failed_when: false
+
+- name: Decide whether the pinned version needs installing
+  ansible.builtin.set_fact:
+    coredns_needs_install: >-
+      {{ (coredns_installed.rc | default(1)) != 0
+         or ('CoreDNS-' ~ coredns_version) not in (coredns_installed.stdout | default('')) }}
+
+- name: Make a staging directory for the download
+  # Outside the configuration directory on purpose: a half-unpacked archive
+  # must never sit next to the Corefile, where a daemon restart might find it.
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: coredns
+  register: coredns_download_tmp
+  when: coredns_needs_install | bool
+
+- name: Download the pinned release, refusing any other bytes
+  # ⚠️ THE CHECKSUM IS THE POINT, NOT A FORMALITY. `get_url` compares it
+  # before the file is used, so a tampered mirror, a truncated transfer or a
+  # re-cut release tag all fail here rather than being installed and run as
+  # root with CAP_NET_BIND_SERVICE. This is the same reasoning the Keel
+  # release path applies to image digests.
+  ansible.builtin.get_url:
+    url: >-
+      {{ coredns_release_base }}/v{{ coredns_version }}/coredns_{{ coredns_version }}_{{ coredns_platform }}.tgz
+    dest: "{{ coredns_download_tmp.path }}/coredns.tgz"
+    checksum: "sha256:{{ coredns_checksums[coredns_platform] }}"
+    mode: "0644"
+    force: true
+  when: coredns_needs_install | bool
+
+- name: Unpack it
+  ansible.builtin.unarchive:
+    src: "{{ coredns_download_tmp.path }}/coredns.tgz"
+    dest: "{{ coredns_download_tmp.path }}"
+    remote_src: true
+  when: coredns_needs_install | bool
+
+- name: Install it
+  ansible.builtin.copy:
+    src: "{{ coredns_download_tmp.path }}/coredns"
+    dest: "{{ coredns_bin_dir }}/coredns"
+    remote_src: true
+    owner: root
+    group: "{{ 'wheel' if coredns_is_darwin else 'root' }}"
+    mode: "0755"
+  become: true
+  notify: Restart CoreDNS
+  when: coredns_needs_install | bool
+
+- name: Remove the staging directory
+  ansible.builtin.file:
+    path: "{{ coredns_download_tmp.path }}"
+    state: absent
+  when:
+    - coredns_needs_install | bool
+    - coredns_download_tmp.path is defined
+
+- name: Confirm the installed binary reports the pinned version
+  # ⚠️ ASKED OF THE INSTALLED FILE, NOT INFERRED FROM THE DOWNLOAD SUCCEEDING.
+  # A verified tarball that unpacked to the wrong place leaves an older binary
+  # in service, and every later check would pass against it.
+  ansible.builtin.command:
+    cmd: "{{ coredns_bin_dir }}/coredns --version"
+  register: coredns_verified
+  changed_when: false
+
+- name: And that it is the one we pinned
+  ansible.builtin.assert:
+    that:
+      - ('CoreDNS-' ~ coredns_version) in coredns_verified.stdout
+    fail_msg: >-
+      {{ coredns_bin_dir }}/coredns reports
+      "{{ coredns_verified.stdout_lines | first | default('(nothing)') }}" but
+      this role pinned CoreDNS-{{ coredns_version }}.
+    success_msg: "CoreDNS-{{ coredns_version }} is installed."

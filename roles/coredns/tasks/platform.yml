@@ -1,0 +1,57 @@
+---
+# Which platform this node is, and where things go on it.
+#
+# ⚠️ ASKED OF THE MACHINE, NOT ASSUMED FROM THE INVENTORY NAME. This role
+# deploys to one Mac and one Linux box; a role that decided from the hostname
+# would install a launchd plist on whichever host somebody renamed. The same
+# mistake already happened once in this repository, when systemd units were
+# shipped for a console that runs macOS and has no systemctl at all.
+
+- name: Name this node for the generated headers
+  # ⚠️ A VARIABLE RATHER THAN `inventory_hostname` DIRECTLY, SO THE TEMPLATES
+  # ARE RENDERABLE OUTSIDE A PLAY AGAINST A REAL HOST. tests/dns-zone.yml
+  # renders both nodes' files from localhost; with `inventory_hostname` baked
+  # in, every rendered artifact would claim to belong to "localhost" and the
+  # suite could not tell the two nodes apart.
+  ansible.builtin.set_fact:
+    coredns_node_name: "{{ coredns_node_name | default(inventory_hostname) }}"
+
+- name: Classify this node
+  ansible.builtin.set_fact:
+    coredns_is_darwin: "{{ ansible_facts['system'] | lower == 'darwin' }}"
+    coredns_platform: >-
+      {{ (ansible_facts['system'] | lower)
+         ~ '_' ~
+         ({'x86_64': 'amd64', 'amd64': 'amd64', 'arm64': 'arm64',
+           'aarch64': 'arm64'}[ansible_facts['architecture'] | lower]
+          | default(ansible_facts['architecture'] | lower)) }}
+
+- name: Anchor the per-platform paths
+  ansible.builtin.set_fact:
+    coredns_bin_dir: "{{ coredns_bin_dir_darwin if coredns_is_darwin else coredns_bin_dir_linux }}"
+    coredns_conf_dir: "{{ coredns_conf_dir_darwin if coredns_is_darwin else coredns_conf_dir_linux }}"
+    coredns_log_dir: "{{ coredns_log_dir_darwin if coredns_is_darwin else coredns_log_dir_linux }}"
+
+- name: Name the two generated files
+  ansible.builtin.set_fact:
+    coredns_corefile: "{{ coredns_conf_dir }}/Corefile"
+    coredns_zone_file: "{{ coredns_conf_dir }}/db.{{ coredns_zone }}"
+
+- name: Require explicit bind addresses
+  # ⚠️ NO DEFAULT, AND NO WILDCARD. A resolver that binds 0.0.0.0 listens on
+  # every interface the host happens to have — a VPN, a tunnel, a second NIC —
+  # and becomes reachable from places the ACL was never meant to be the only
+  # thing standing in the way. There is no sane guess for "my LAN address", so
+  # this refuses rather than guessing.
+  ansible.builtin.assert:
+    that:
+      - coredns_bind_addresses | length > 0
+      - "'0.0.0.0' not in coredns_bind_addresses"
+      - "'::' not in coredns_bind_addresses"
+    fail_msg: >-
+      {{ inventory_hostname }} has coredns_bind_addresses =
+      {{ coredns_bind_addresses | default([]) }}. Set it in inventory to this
+      node's own LAN address plus loopback. The wildcard is refused: bind the
+      addresses you mean.
+    success_msg: >-
+      {{ inventory_hostname }} binds {{ coredns_bind_addresses | join(', ') }}.
