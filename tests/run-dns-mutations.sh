@@ -42,6 +42,22 @@ fail=0
 ok()  { printf '  \033[32mok\033[0m    %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n         %s\n' "$1" "$2"; fail=$((fail + 1)); }
 
+# ⚠️ NOT `sed -i ''`, AND THIS COST A RED CI RUN. `-i ''` is BSD syntax: GNU
+# sed takes the suffix ATTACHED (`-i.bak`), so on Linux it read the empty
+# string as the script and the real script as a filename —
+#
+#   sed: can't read s/^coredns_version: …/: No such file or directory
+#
+# — and left the file UNTOUCHED. Eight mutations silently did nothing, the
+# suites passed because there was nothing wrong with them, and this runner
+# reported "the mutation went unnoticed". That verdict was CORRECT: the guard
+# genuinely had not been proved. It passed on macOS and failed on the hosted
+# runner, which is the only reason it was found.
+#
+# `perl -pi` behaves identically on both. Note perl regex, not sed BRE:
+# `{64}` rather than `\{64\}`, and braces in Jinja markers are escaped.
+edit() { perl -pi -e "$1" "$2"; }
+
 # Run one suite and require it to FAIL, with a message matching $2.
 #   expect_red <suite> <regex> <label>
 expect_red() {
@@ -57,6 +73,35 @@ expect_red() {
   restore
 }
 
+echo "── no test script edits files with BSD-only sed ──"
+# ⚠️ THE BUG THAT COST A RED CI RUN, MADE UNREPEATABLE. `sed -i ''` works on
+# macOS and silently does NOTHING on Linux — GNU sed reads the empty string as
+# the script and the real script as a filename. Eight mutations here landed
+# nowhere on the hosted runner. Searching for the empty-suffix form only: a
+# plain `sed -i 'script'` is valid GNU usage and appears legitimately in
+# tests/run-caddy-handler-order.sh, which runs inside a Linux container.
+#
+# ⚠️ AND IT SKIPS COMMENT LINES, because the first version flagged THIS FILE:
+# the explanation above contains the offending string, so a guard about
+# portability failed on its own documentation. That is the third time in this
+# repository that a text search matched prose instead of code — the same
+# reason tests/dns-zone.yml scans a comment-stripped view for secrets.
+#
+# ⚠️ THE PATTERN USES `+` QUANTIFIERS SO IT CANNOT MATCH ITSELF, and the
+# labels avoid the literal for the same reason. Written the obvious way, the
+# detector line and its own failure message are the three remaining matches,
+# and the check fails on a file whose only offence is describing the problem.
+offenders=$(grep -rnE "sed +-i +''" tests/ roles/ playbooks/ scripts/ bin/ 2>/dev/null \
+            | grep -vE ':[0-9]+:[[:space:]]*#' \
+            | cut -d: -f1 | sort -u || true)
+if [ -z "$offenders" ]; then
+  ok "no script uses the BSD-only empty-suffix in-place sed form"
+else
+  bad "no script uses the BSD-only empty-suffix in-place sed form" \
+      "these edit nothing on Linux: $(printf '%s' "$offenders" | tr '\n' ' ')"
+fi
+
+echo
 echo "── the suites are green before anything is broken ──"
 for s in dns-zone dns-services dns-inventory; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
@@ -104,15 +149,15 @@ expect_red dns-zone.yml 'reserved for (future )?production|appears in the zone|m
 
 echo
 echo "── the pinned binaries ──"
-sed -i '' 's/^  darwin_arm64: "[0-9a-f]*"/  darwin_arm64: "deadbeef"/' "$DEFAULTS"
+edit 's{^  darwin_arm64: "[0-9a-f]*"}{  darwin_arm64: "deadbeef"}' "$DEFAULTS"
 expect_red dns-zone.yml 'not pinned for both platforms|64-character' \
            "a malformed darwin checksum is caught"
 
-sed -i '' 's/^  linux_amd64: "[0-9a-f]\{64\}"/  linux_amd64: "0000000000000000000000000000000000000000000000000000000000000000"/' "$DEFAULTS"
+edit 's{^  linux_amd64: "[0-9a-f]{64}"}{  linux_amd64: "0000000000000000000000000000000000000000000000000000000000000000"}' "$DEFAULTS"
 expect_red dns-zone.yml 'does not match the verified values' \
            "a plausible-but-wrong linux checksum is caught"
 
-sed -i '' 's/^coredns_version: "1\.14\.7"/coredns_version: "1.14.8"/' "$DEFAULTS"
+edit 's{^coredns_version: "1\.14\.7"}{coredns_version: "1.14.8"}' "$DEFAULTS"
 expect_red dns-zone.yml 'does not match the verified values' \
            "bumping the version without its checksums is caught"
 
@@ -120,13 +165,13 @@ echo
 echo "── the forwarding loop ──"
 # ⚠️ THE FAILURE THAT ONLY APPEARS AFTER THE ROUTER CHANGE. 10.0.0.1 will
 # forward TO these resolvers; forwarding back to it loops every cache miss.
-sed -i '' 's/^  - 1\.1\.1\.1/  - 10.0.0.1/' "$DEFAULTS"
+edit 's{^  - 1\.1\.1\.1}{  - 10.0.0.1}' "$DEFAULTS"
 expect_red dns-zone.yml 'no path back to the router|loop|Upstreams are' \
            "forwarding back to Orbi is caught"
 
 echo
 echo "── LAN-only access ──"
-sed -i '' 's/^    bind {{ addr }}/    bind 0.0.0.0/' "$COREFILE"
+edit 's{^    bind \{\{ addr \}\}}{    bind 0.0.0.0}' "$COREFILE"
 expect_red dns-zone.yml 'does not bind only|bind 0\.0\.0\.0' \
            "binding the wildcard is caught"
 
@@ -148,12 +193,9 @@ expect_red dns-zone.yml 'rendered zone does not say|byte-identical|three names' 
 echo
 echo "── the inventory connection ──"
 restore
-sed -i '' 's/          ansible_host: 10\.0\.0\.3/          ansible_host: dc1-x86/' "$HOSTS"
+edit 's{          ansible_host: 10\.0\.0\.3}{          ansible_host: dc1-x86}' "$HOSTS"
 expect_red dns-inventory.yml 'must be the literal address|circular dependency' \
            "reverting dc1-x86 to an unresolvable name is caught"
-
-sed -i '' 's/^        dc1-arm-1:/        dc1-arm-1: \&arm\n          ansible_host: 10.0.0.22/' "$HOSTS" 2>/dev/null || true
-restore
 
 echo
 echo "── the service definitions ──"
@@ -173,7 +215,7 @@ restore_plist
 
 UNIT=roles/coredns/templates/systemd.service.j2
 cp "$UNIT" "$WORK/unit"
-sed -i '' 's/^Type=simple$/Type=notify/' "$UNIT"
+edit 's{^Type=simple$}{Type=notify}' "$UNIT"
 if ansible-playbook tests/dns-services.yml >"$WORK/out" 2>&1; then
   bad "Type=notify, which CoreDNS cannot satisfy, is caught" "tests/dns-services.yml still PASSED"
 elif grep -qE 'sd_notify' "$WORK/out"; then
@@ -183,7 +225,7 @@ else
 fi
 cp "$WORK/unit" "$UNIT"
 
-sed -i '' 's/^User={{ coredns_linux_user }}$/User=root/' "$UNIT"
+edit 's{^User=\{\{ coredns_linux_user \}\}$}{User=root}' "$UNIT"
 if ansible-playbook tests/dns-services.yml >"$WORK/out" 2>&1; then
   bad "running the resolver as root is caught" "tests/dns-services.yml still PASSED"
 elif grep -qE 'dedicated .coredns. user|must run as' "$WORK/out"; then
