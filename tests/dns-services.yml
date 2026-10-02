@@ -1,0 +1,201 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE TWO SERVICE DEFINITIONS, AND WHY THEY DISAGREE WITH THE RECONCILER'S.
+#
+#   ansible-playbook tests/dns-services.yml
+#
+# ⚠️ THE INTERESTING ASSERTION HERE IS THAT KeepAlive IS **TRUE**. The
+# reconciler's plist (tests/controller-scheduler.yml) asserts it must NEVER
+# have KeepAlive, because a failed DEPLOYMENT must not retry forever — its
+# attempt ledger bounds retries at two, and a KeepAlive loop would defeat that
+# bound and bury the one informative failure.
+#
+# Neither reason applies to a resolver. This is a long-running service with no
+# ledger: if it dies, start it again, and if the node reboots, LAN name
+# resolution must return without anybody logging in.
+#
+# So the two plists are deliberately inconsistent, and BOTH directions are
+# tested — here that CoreDNS keeps KeepAlive, there that the reconciler never
+# gains it. Somebody "tidying up the inconsistency" breaks a test either way,
+# which is the point.
+#
+# ⚠️ ONE ASSERTION IS MAC-ONLY AND SAYS SO. `plutil -lint` needs macOS; on
+# Linux it SKIPS loudly rather than passing silently, and is proved on the
+# management node by tests/run-all.sh.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The CoreDNS service definitions
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    render_dir: /tmp/keel-dns-render
+
+    nodes:
+      - name: dc1-arm-1
+        darwin: true
+        bind: [10.0.0.22, 127.0.0.1]
+      - name: dc1-x86
+        darwin: false
+        bind: [10.0.0.3, 127.0.0.1]
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/coredns/defaults/main.yml
+
+    - name: Make somewhere to render
+      ansible.builtin.file:
+        path: "{{ render_dir }}/{{ item.name }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Render both nodes with the role's own templates
+      ansible.builtin.include_tasks: dns-render-node.yml
+      loop: "{{ nodes }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"
+
+    # ── THE launchd DAEMON (dc1-arm-1, the primary) ─────────────────────────
+
+    - name: The launchd daemon runs the pinned binary against the rendered Corefile
+      ansible.builtin.assert:
+        that:
+          - plist is search('<string>org\.coredns\.coredns</string>')
+          - plist is search('<string>/usr/local/sbin/coredns</string>')
+          - plist is search('<string>/usr/local/etc/coredns/Corefile</string>')
+          - plist is search('(?s)<key>UserName</key>\s*<string>root</string>')
+        fail_msg: >-
+          The launchd daemon does not invoke the installed binary with the
+          rendered Corefile as root. Rendered:
+          {{ plist }}
+        success_msg: "launchd runs /usr/local/sbin/coredns -conf …/Corefile as root."
+      vars:
+        plist: "{{ lookup('file', render_dir ~ '/dc1-arm-1/org.coredns.coredns.plist') }}"
+
+    - name: A RESOLVER KEEPS ITSELF ALIVE AND STARTS AT BOOT
+      # ⚠️ THE OPPOSITE OF THE RECONCILER, ON PURPOSE. See this file's header.
+      # A resolver that waits for a human after a crash, or after a reboot, is
+      # a resolver that is down — and it takes LAN name resolution with it,
+      # including for the machine you would use to fix it.
+      ansible.builtin.assert:
+        that:
+          - plist is search('(?s)<key>KeepAlive</key>\s*<true/>')
+          - plist is search('(?s)<key>RunAtLoad</key>\s*<true/>')
+        fail_msg: >-
+          The CoreDNS daemon must set BOTH KeepAlive and RunAtLoad true. This
+          is deliberately unlike roles/keel_reconcile's plist, which forbids
+          both: a bounded deployment retry and an always-on resolver are
+          different problems. Do not "make them consistent".
+        success_msg: "KeepAlive and RunAtLoad are both true, as a resolver needs."
+      vars:
+        plist: "{{ lookup('file', render_dir ~ '/dc1-arm-1/org.coredns.coredns.plist') }}"
+
+    - name: Its output goes to explicit, non-shared files
+      ansible.builtin.assert:
+        that:
+          - plist is search('<string>/var/log/coredns/coredns\.log</string>')
+          - plist is search('<string>/var/log/coredns/coredns\.err</string>')
+        fail_msg: >-
+          The daemon must name its own stdout and stderr paths; without them
+          output lands in the unified log mixed with everything else.
+        success_msg: "stdout and stderr go to /var/log/coredns/."
+      vars:
+        plist: "{{ lookup('file', render_dir ~ '/dc1-arm-1/org.coredns.coredns.plist') }}"
+
+    - name: It carries no credential
+      ansible.builtin.assert:
+        that:
+          - not (plist is search('(?i)(password|token|api[_-]?key|PRIVATE KEY)'))
+        fail_msg: "The plist contains something credential-shaped. CoreDNS needs none."
+        success_msg: "No credential in the plist."
+      vars:
+        plist: >-
+          {{ lookup('file', render_dir ~ '/dc1-arm-1/org.coredns.coredns.plist')
+             | regex_replace('(?s)<!--.*?-->', '') }}
+
+    - name: macOS parses the plist it would be asked to load
+      # ⚠️ THE GUARD A STRUCTURAL CHECK CANNOT BE. launchd's error for a
+      # malformed plist is nearly silent — the daemon simply never runs. Every
+      # assertion above would still pass on a file with one unclosed tag.
+      ansible.builtin.command:
+        cmd: "plutil -lint {{ render_dir }}/dc1-arm-1/org.coredns.coredns.plist"
+      changed_when: false
+      when: ansible_facts['system'] == 'Darwin'
+
+    - name: SKIP — plutil needs macOS, and this is not macOS
+      ansible.builtin.debug:
+        msg: >-
+          SKIP  the rendered plist was not parsed — plutil(1) is macOS-only and
+          this is {{ ansible_facts['system'] }}. Every other assertion above
+          ran. This one is proved on dc1-arm-1 by tests/run-all.sh, which is
+          the machine that has to load the file.
+      when: ansible_facts['system'] != 'Darwin'
+
+    # ── THE systemd UNIT (dc1-x86, the secondary) ──────────────────────────
+
+    - name: The systemd unit runs the pinned binary unprivileged
+      ansible.builtin.assert:
+        that:
+          - unit is search('(?m)^ExecStart=/usr/local/sbin/coredns -conf /etc/coredns/Corefile$')
+          - unit is search('(?m)^User=coredns$')
+          - unit is search('(?m)^Group=coredns$')
+          - unit is search('(?m)^AmbientCapabilities=CAP_NET_BIND_SERVICE$')
+          - unit is search('(?m)^CapabilityBoundingSet=CAP_NET_BIND_SERVICE$')
+          - not (unit is search('(?m)^User=root$'))
+        fail_msg: >-
+          The unit must run as the dedicated `coredns` user with exactly
+          CAP_NET_BIND_SERVICE — binding port 53 is the only privileged thing
+          it does. Rendered:
+          {{ unit }}
+        success_msg: "systemd runs CoreDNS as coredns with one capability."
+      vars:
+        unit: "{{ lookup('file', render_dir ~ '/dc1-x86/coredns.service') }}"
+
+    - name: It does NOT claim sd_notify readiness
+      # ⚠️ A REAL BOOT FAILURE, NOT A STYLE POINT. CoreDNS does not implement
+      # sd_notify. With `Type=notify` systemd waits for a readiness message
+      # that never comes, the unit times out, and the LAN's secondary resolver
+      # is simply absent after a reboot — with the service "starting" for
+      # 90 seconds and then failing.
+      ansible.builtin.assert:
+        that:
+          - not (unit is search('(?m)^Type=notify$'))
+          - unit is search('(?m)^Type=simple$')
+        fail_msg: >-
+          The unit must not use Type=notify: CoreDNS has no sd_notify support,
+          so systemd would wait for a readiness message that never arrives and
+          time the unit out at boot. Readiness is observable through the
+          `ready` plugin instead.
+        success_msg: "Type=simple — no sd_notify that CoreDNS cannot send."
+      vars:
+        unit: "{{ lookup('file', render_dir ~ '/dc1-x86/coredns.service') }}"
+
+    - name: It restarts on failure and waits for the network to be up
+      ansible.builtin.assert:
+        that:
+          - unit is search('(?m)^Restart=on-failure$')
+          - unit is search('(?m)^RestartSec=')
+          - unit is search('(?m)^After=network-online\.target$')
+          - unit is search('(?m)^Wants=network-online\.target$')
+          - unit is search('(?m)^WantedBy=multi-user\.target$')
+        fail_msg: >-
+          The unit must restart on failure, rate-limit the restart, wait for
+          network-online (it binds an explicit address, so network.target is
+          too early) and be enabled at boot. Rendered:
+          {{ unit }}
+        success_msg: "Restarts on failure, after network-online, enabled at boot."
+      vars:
+        unit: "{{ lookup('file', render_dir ~ '/dc1-x86/coredns.service') }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          launchd keeps the primary alive and starts it at boot; systemd runs
+          the secondary unprivileged with one capability, restarts it on
+          failure, and does not wait for an sd_notify CoreDNS cannot send.

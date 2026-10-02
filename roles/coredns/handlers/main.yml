@@ -1,0 +1,25 @@
+---
+# ⚠️ ONE HANDLER, TWO MECHANISMS, AND NEITHER IS A RELOAD. CoreDNS re-reads a
+# zone file on its own, but a changed Corefile — new bind address, new ACL,
+# new upstream — takes a restart. Distinguishing the two would mean deciding
+# per file which kind of change happened, and getting that wrong leaves a
+# resolver serving the previous configuration while every file on disk says
+# otherwise. A restart of a resolver that holds no state costs a few hundred
+# milliseconds.
+
+- name: Restart CoreDNS
+  ansible.builtin.command:
+    cmd: "launchctl kickstart -k system/{{ coredns_launchd_label }}"
+  become: true
+  when: coredns_is_darwin | bool
+  listen: Restart CoreDNS
+  changed_when: true
+
+- name: Restart CoreDNS (systemd)
+  ansible.builtin.systemd_service:
+    name: "{{ coredns_service_name }}"
+    state: restarted
+    daemon_reload: true
+  become: true
+  when: not (coredns_is_darwin | bool)
+  listen: Restart CoreDNS

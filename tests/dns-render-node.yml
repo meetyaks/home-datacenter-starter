@@ -1,0 +1,44 @@
+---
+# Render one node's Corefile and zone with the ROLE'S OWN templates.
+#
+# ⚠️ `set_fact`, NOT A TASK `vars:` BLOCK. This suite loads the role's
+# defaults with `include_vars`, and include_vars OUTRANKS task vars in
+# Ansible's precedence order — so a `vars:` override would be silently
+# ignored and both nodes would render with whatever the defaults said,
+# making the "identical zones" check pass against one node rendered twice.
+#
+# That is not hypothetical: the same trap produced a passing-but-meaningless
+# overlay check in tests/deployment-mode.yml, and it is documented in
+# roles/keel_reconcile/tasks/main.yml about namespacing an include_vars.
+
+- name: "{{ node.name }} — adopt this node's platform and addresses"
+  ansible.builtin.set_fact:
+    coredns_node_name: "{{ node.name }}"
+    coredns_is_darwin: "{{ node.darwin }}"
+    coredns_bind_addresses: "{{ node.bind }}"
+    coredns_conf_dir: "{{ coredns_conf_dir_darwin if node.darwin else coredns_conf_dir_linux }}"
+    coredns_bin_dir: "{{ coredns_bin_dir_darwin if node.darwin else coredns_bin_dir_linux }}"
+    coredns_log_dir: "{{ coredns_log_dir_darwin if node.darwin else coredns_log_dir_linux }}"
+
+- name: "{{ node.name }} — name the generated files as the role does"
+  ansible.builtin.set_fact:
+    coredns_corefile: "{{ coredns_conf_dir }}/Corefile"
+    coredns_zone_file: "{{ coredns_conf_dir }}/db.{{ coredns_zone }}"
+
+- name: "{{ node.name }} — render the zone"
+  ansible.builtin.template:
+    src: ../roles/coredns/templates/db.zone.j2
+    dest: "{{ render_dir }}/{{ node.name }}/db.dc1.lan"
+    mode: "0644"
+
+- name: "{{ node.name }} — render the Corefile"
+  ansible.builtin.template:
+    src: ../roles/coredns/templates/Corefile.j2
+    dest: "{{ render_dir }}/{{ node.name }}/Corefile"
+    mode: "0644"
+
+- name: "{{ node.name }} — render its service definition"
+  ansible.builtin.template:
+    src: "../roles/coredns/templates/{{ 'launchd.plist.j2' if node.darwin else 'systemd.service.j2' }}"
+    dest: "{{ render_dir }}/{{ node.name }}/{{ 'org.coredns.coredns.plist' if node.darwin else 'coredns.service' }}"
+    mode: "0644"

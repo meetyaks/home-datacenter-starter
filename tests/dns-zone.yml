@@ -1,0 +1,451 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE dc1.lan ZONE, AND THE TWO RESOLVERS THAT SERVE IT.
+#
+#   ansible-playbook tests/dns-zone.yml
+#
+# ⚠️ WHAT THIS IS GUARDING. `dc1.lan` was never DNS. `keel.dc1.lan` resolved
+# from ONE line in ONE workstation's /etc/hosts — the router served no dc1.lan
+# record and no host ran a resolver — so a name every runbook referred to was
+# reachable from exactly one machine, by hand-edited state nothing re-created.
+#
+# Replacing that with a resolver is only an improvement if the zone it serves
+# is the zone this repository says it serves, on BOTH nodes, from one source.
+# A second hand-maintained copy would be the same defect wearing a daemon.
+#
+# ⚠️ IT RENDERS THE ROLE'S OWN TEMPLATES WITH THE ROLE'S OWN DEFAULTS.
+# Nothing here restates a record, a checksum or a bind address — a harness
+# carrying its own copy would pass against a configuration the role does not
+# produce.
+#
+# Controller-only: no host, no network, no port 53, nothing installed.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The dc1.lan zone and both resolvers
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    render_dir: /tmp/keel-dns-render
+
+    # The two nodes, exactly as inventory defines them. Declared here only so
+    # the suite can render both without an inventory connection; the addresses
+    # are asserted against inventory/hosts.yml further down, so a divergence
+    # between this list and the real inventory is a failure rather than a
+    # silently different test.
+    nodes:
+      - name: dc1-arm-1
+        darwin: true
+        bind: [10.0.0.22, 127.0.0.1]
+      - name: dc1-x86
+        darwin: false
+        bind: [10.0.0.3, 127.0.0.1]
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/coredns/defaults/main.yml
+
+    # ── THE ZONE CONTENT ────────────────────────────────────────────────────
+
+    - name: The zone serves EXACTLY the three records this LAN needs
+      # ⚠️ EXACTLY, NOT "AT LEAST". An extra record is how a name nobody
+      # decided on becomes load-bearing — and the one extra record that would
+      # matter most here is the reserved production name.
+      ansible.builtin.assert:
+        that:
+          - (coredns_zone_records | length) == 3
+          - (coredns_zone_records | selectattr('name', 'equalto', 'dc1-arm-1')
+             | map(attribute='ip') | list) == ['10.0.0.22']
+          - (coredns_zone_records | selectattr('name', 'equalto', 'dc1-x86')
+             | map(attribute='ip') | list) == ['10.0.0.3']
+          - (coredns_zone_records | selectattr('name', 'equalto', 'keel-dev')
+             | map(attribute='ip') | list) == ['10.0.0.3']
+        fail_msg: >-
+          The zone is
+          {{ coredns_zone_records
+             | map('to_json') | join(' ') }}.
+          It must be exactly dc1-arm-1→10.0.0.22, dc1-x86→10.0.0.3 and
+          keel-dev→10.0.0.3.
+        success_msg: "Three records, exactly as specified."
+
+    - name: keel.dc1.lan IS ABSENT, AND THAT IS THE RESERVATION
+      # ⚠️ THE ONE RECORD THAT MUST NEVER EXIST HERE. `keel.dc1.lan` is the
+      # FUTURE PRODUCTION identity on separate hardware. Pointing it at
+      # dc1-x86 "for now" would give this DEV installation two issuers, and
+      # would mean the eventual production cutover has to take a live name
+      # away from a running environment — the kind of change that gets done at
+      # 2am under pressure.
+      ansible.builtin.assert:
+        that:
+          - (coredns_zone_records | selectattr('name', 'equalto', 'keel') | list | length) == 0
+          - (coredns_zone_records | selectattr('name', 'search', '^keel$') | list | length) == 0
+        fail_msg: >-
+          `keel` appears in the zone. It is reserved for future production and
+          must not resolve on this LAN. DEV's canonical name is keel-dev.
+        success_msg: "keel.dc1.lan is absent — reserved for production."
+
+    - name: No record claims an address this repository does not own
+      # dc1-arm-1 and dc1-x86 are the two reserved addresses. A record for
+      # anything else would be this repository asserting authority over a
+      # machine it does not manage — including whatever the router later hands
+      # that address to.
+      ansible.builtin.assert:
+        that:
+          - (coredns_zone_records | map(attribute='ip') | unique | sort) == ['10.0.0.22', '10.0.0.3'] | sort
+        fail_msg: >-
+          The zone points at
+          {{ coredns_zone_records | map(attribute='ip') | unique | sort | join(', ') }}.
+          Only the two reserved addresses may appear.
+        success_msg: "Only the two reserved addresses are claimed."
+
+    - name: THERE IS NO REVERSE ZONE, AND THAT IS DELIBERATE
+      # ⚠️ RECORDED SO IT IS NOT "FIXED" LATER. Serving PTR for dc1.lan would
+      # mean claiming 0.0.10.in-addr.arpa — the WHOLE of 10.0.0.0/24 — when
+      # this repository owns exactly two addresses in it and the router hands
+      # out the rest. An authoritative reverse zone would answer NXDOMAIN for
+      # every other host on the LAN instead of letting the query go where it
+      # should.
+      ansible.builtin.assert:
+        that:
+          - coredns_reverse_zone is not defined
+        fail_msg: >-
+          A reverse zone has been configured. Forward records are owned by this
+          repository; the reverse space is not — 0.0.10.in-addr.arpa covers
+          every address the router manages, not just our two. If reverse
+          lookups are genuinely needed, delegate only the two addresses rather
+          than claiming the /24.
+        success_msg: "No reverse zone claimed — the /24 is not ours."
+
+    # ── THE PINNED BINARIES ─────────────────────────────────────────────────
+
+    - name: BOTH platforms are pinned, with a well-formed SHA-256
+      # ⚠️ BOTH, BECAUSE BOTH ARE DEPLOYED. One Mac on ARM, one Linux on x86.
+      # A version bumped with only one checksum refreshed installs verified
+      # bytes on one node and fails closed on the other — which is the good
+      # outcome, and this makes it a test failure instead of a deployment
+      # failure.
+      ansible.builtin.assert:
+        that:
+          - coredns_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+          - "'darwin_arm64' in coredns_checksums"
+          - "'linux_amd64' in coredns_checksums"
+          - coredns_checksums['darwin_arm64'] is match('^[0-9a-f]{64}$')
+          - coredns_checksums['linux_amd64'] is match('^[0-9a-f]{64}$')
+          - coredns_checksums['darwin_arm64'] != coredns_checksums['linux_amd64']
+        fail_msg: >-
+          CoreDNS {{ coredns_version | default('(unset)') }} is not pinned for
+          both platforms. Recorded:
+          {{ coredns_checksums | default({}) | dict2items
+             | map(attribute='key') | join(', ') }}.
+          Both darwin_arm64 and linux_amd64 need a 64-character SHA-256, and
+          they cannot be the same value.
+        success_msg: >-
+          CoreDNS {{ coredns_version }} pinned for darwin_arm64 and
+          linux_amd64.
+
+    - name: The checksums are the ones published for this exact version
+      # ⚠️ THE VALUES, NOT JUST THE SHAPE. A 64-hex string that is not the
+      # published digest fails every download forever, or — far worse if
+      # somebody "fixes" it by pasting whatever they computed locally —
+      # verifies bytes nobody vouched for. These two were downloaded from the
+      # release and checked against the real tarballs before being recorded.
+      #
+      # On a version bump this test must be updated TOGETHER WITH the
+      # defaults, from the release's own .sha256 assets.
+      ansible.builtin.assert:
+        that:
+          - coredns_version == '1.14.7'
+          - coredns_checksums['darwin_arm64'] ==
+            '0005d154d49c73a88b2c56f429f35106e46c4ca37ee6de4e4d482d7de5c4b8ba'
+          - coredns_checksums['linux_amd64'] ==
+            '9a09356438c6d9591cb80011a2a7a52f87fc3a113f6690e41f243f98b98faac9'
+        fail_msg: >-
+          The pin does not match the verified values for CoreDNS 1.14.7. If
+          this is a deliberate version change, fetch
+          coredns_<version>_<platform>.tgz.sha256 for BOTH platforms from
+          https://github.com/coredns/coredns/releases, verify them against the
+          real downloads, and update this assertion in the same change.
+        success_msg: "Both checksums match the verified 1.14.7 release."
+
+    - name: The download is fetched over HTTPS from the official project
+      ansible.builtin.assert:
+        that:
+          - coredns_release_base is match('^https://github\.com/coredns/coredns/releases/download$')
+        fail_msg: >-
+          coredns_release_base is "{{ coredns_release_base }}". The binary must
+          come from the official release URL over HTTPS.
+        success_msg: "Binaries come from the official CoreDNS releases."
+
+    # ── FORWARDING, AND THE LOOP THAT MUST NOT EXIST ───────────────────────
+
+    - name: External queries CANNOT be forwarded back to the router
+      # ⚠️ THE FAILURE THIS PREVENTS ONLY APPEARS AFTER THE ROUTER CHANGE.
+      # 10.0.0.1 is about to be configured to forward TO these resolvers. If
+      # they forwarded external names back to it, every cache miss would
+      # bounce between the two — and it would look completely fine right up
+      # until the router setting lands, i.e. after this had been signed off.
+      ansible.builtin.assert:
+        that:
+          - (coredns_upstreams | length) >= 2
+          - "'10.0.0.1' not in coredns_upstreams"
+          - (coredns_upstreams | select('match', '^10\.0\.0\.') | list | length) == 0
+          - (coredns_upstreams | select('match', '^127\.') | list | length) == 0
+        fail_msg: >-
+          Upstreams are {{ coredns_upstreams | default([]) | join(', ') }}.
+          They must be at least two explicit resolvers OFF this LAN. The
+          router (10.0.0.1) forwards to us; forwarding back to it is a loop,
+          and pointing at a LAN address or loopback is either a loop or a
+          resolver that does not exist.
+        success_msg: >-
+          Forwarding to {{ coredns_upstreams | join(', ') }} — no path back to
+          the router.
+
+    # ── RENDER BOTH NODES ───────────────────────────────────────────────────
+
+    - name: Make somewhere to render
+      ansible.builtin.file:
+        path: "{{ render_dir }}/{{ item.name }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Render each node's zone and Corefile with the ROLE'S templates
+      ansible.builtin.include_tasks: dns-render-node.yml
+      loop: "{{ nodes }}"
+      loop_control:
+        loop_var: node
+        label: "{{ node.name }}"
+
+    - name: BOTH NODES RENDER A BYTE-IDENTICAL ZONE
+      # ⚠️ THE PROPERTY THE WHOLE TWO-NODE DESIGN RESTS ON. There is no zone
+      # transfer between these resolvers: they are both authoritative from the
+      # same Git content. So "identical" is not a nicety — it is the only
+      # mechanism keeping them consistent, and the only thing standing between
+      # a LAN where half the clients get one answer and half get another,
+      # depending on which resolver DHCP handed them.
+      #
+      # This is also why the SOA serial is derived from the record content
+      # rather than from the clock: a timestamp would differ purely because
+      # the two nodes were deployed a minute apart, and this check would fail
+      # for a reason that was not a real divergence.
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', render_dir ~ '/dc1-arm-1/db.dc1.lan')) ==
+            (lookup('file', render_dir ~ '/dc1-x86/db.dc1.lan'))
+        fail_msg: >-
+          The two nodes rendered different zone files. With no transfer between
+          them, that means clients get different answers depending on which
+          resolver they were given. Diff
+          {{ render_dir }}/dc1-arm-1/db.dc1.lan against
+          {{ render_dir }}/dc1-x86/db.dc1.lan.
+        success_msg: "Both nodes render the same zone, byte for byte."
+
+    - name: The rendered zone contains the three names and NOT the reserved one
+      # Reading the rendered file, not the variable — the variable being right
+      # and the template dropping a record is a real failure mode, and only
+      # the output can tell the difference.
+      ansible.builtin.assert:
+        that:
+          - zone_text is search('(?m)^dc1-arm-1\s+IN\s+A\s+10\.0\.0\.22\s*$')
+          - zone_text is search('(?m)^dc1-x86\s+IN\s+A\s+10\.0\.0\.3\s*$')
+          - zone_text is search('(?m)^keel-dev\s+IN\s+A\s+10\.0\.0\.3\s*$')
+          - not (zone_text is search('(?m)^keel\s+IN\s+A'))
+          - zone_text is search('\$ORIGIN dc1\.lan\.')
+        fail_msg: >-
+          The rendered zone does not say what it must. Rendered content:
+          {{ zone_text }}
+        success_msg: "The rendered zone serves the three names, and not `keel`."
+      vars:
+        zone_text: "{{ lookup('file', render_dir ~ '/dc1-arm-1/db.dc1.lan') }}"
+
+    # ── THE RENDERED Corefile ───────────────────────────────────────────────
+
+    - name: Each node binds ONLY its own address and loopback
+      # ⚠️ NEVER THE WILDCARD. A resolver on 0.0.0.0 listens on every
+      # interface the host has — a VPN, a tunnel, a second NIC — and then the
+      # ACL is the only thing between it and the world. Binding the addresses
+      # we mean makes that a configuration property rather than a filter.
+      ansible.builtin.assert:
+        that:
+          - core_text is search('bind ' ~ (item.bind | first | regex_escape))
+          - core_text is search('bind 127\.0\.0\.1')
+          - not (core_text is search('bind 0\.0\.0\.0'))
+          - not (core_text is search('bind ::'))
+        fail_msg: >-
+          {{ item.name }}'s Corefile does not bind only
+          {{ item.bind | join(' and ') }}. Rendered:
+          {{ core_text }}
+        success_msg: "{{ item.name }} binds {{ item.bind | join(', ') }}."
+      vars:
+        core_text: "{{ lookup('file', render_dir ~ '/' ~ item.name ~ '/Corefile') }}"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Only the LAN and loopback may query, and everything else is blocked
+      ansible.builtin.assert:
+        that:
+          - core_text is search('allow net 10\.0\.0\.0/24')
+          - core_text is search('allow net 127\.0\.0\.0/8')
+          - core_text is search('(?m)^\s*block\s*$')
+          # Both server blocks — the authoritative one and the forwarder —
+          # carry an acl. A forwarder without one is an open resolver for
+          # anyone who can reach the port.
+          - (core_text | regex_findall('allow net 10\.0\.0\.0/24') | length) == 2
+          - (core_text | regex_findall('(?m)^\s*block\s*$') | length) == 2
+        fail_msg: >-
+          {{ item.name }}'s ACL is wrong. BOTH the dc1.lan block and the
+          forwarding block must allow only 10.0.0.0/24 and loopback and then
+          block — a forwarder without an ACL is an open resolver. Rendered:
+          {{ core_text }}
+        success_msg: "{{ item.name }}: LAN and loopback only, in both blocks."
+      vars:
+        core_text: "{{ lookup('file', render_dir ~ '/' ~ item.name ~ '/Corefile') }}"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: The zone is served from a file and never forwarded
+      ansible.builtin.assert:
+        that:
+          - core_text is search('(?m)^dc1\.lan:53 \{')
+          # ⚠️ `.:53` WITH NO SPACE, AND THIS CHECK IS HERE BECAUSE THE
+          # TEMPLATE GOT IT WRONG. A block header is `ZONE...[:PORT]`, so
+          # `. :53` is two zones — `.` and `:53` — and CoreDNS refuses to
+          # start with "zone is not a valid domain name". Every other
+          # assertion in this suite passed on that file. It was caught by
+          # starting the real binary (tests/run-dns-corefile-parse.sh); this
+          # line is the cheap guard that stops it returning.
+          - core_text is search('(?m)^\.:53 \{')
+          - not (core_text is search('(?m)^\. :53'))
+          - core_text is search('file .*db\.dc1\.lan')
+          # The forward directive must appear exactly once, in the `.` block —
+          # a `forward` inside the dc1.lan block would send internal names to
+          # a public resolver.
+          - (core_text | regex_findall('(?m)^\s*forward \.') | length) == 1
+          - core_text is search('forward \. 1\.1\.1\.1 9\.9\.9\.9')
+        fail_msg: >-
+          {{ item.name }}'s Corefile does not serve dc1.lan authoritatively
+          from its zone file with exactly one forwarder for everything else.
+          Rendered:
+          {{ core_text }}
+        success_msg: "{{ item.name }}: dc1.lan from file, one external forwarder."
+      vars:
+        core_text: "{{ lookup('file', render_dir ~ '/' ~ item.name ~ '/Corefile') }}"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Cache, health and readiness are enabled, on loopback only
+      ansible.builtin.assert:
+        that:
+          - core_text is search('(?m)^\s*cache ')
+          - core_text is search('health 127\.0\.0\.1:8080')
+          - core_text is search('ready 127\.0\.0\.1:8181')
+        fail_msg: >-
+          {{ item.name }} must enable cache, health and readiness, with the
+          HTTP endpoints on loopback — they are for the node and the
+          deployment's own verification, not surface for every LAN client.
+          Rendered:
+          {{ core_text }}
+        success_msg: "{{ item.name }}: cache on, health/ready on loopback."
+      vars:
+        core_text: "{{ lookup('file', render_dir ~ '/' ~ item.name ~ '/Corefile') }}"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: No rendered file carries anything resembling a secret
+      # This role genuinely has no credential, and that is the point: the
+      # check exists so adding one does not pass unnoticed into a file that is
+      # world-readable and logged.
+      #
+      # ⚠️ SCANNED WITH THE COMMENTS STRIPPED, AND THAT IS NOT A WEAKENING.
+      # The first version scanned the whole file and failed on its own
+      # documentation — the Corefile's comment explains that "no secret from
+      # this role can reach" the logs, and the word `secret` in that sentence
+      # tripped the check. A guard that fires on prose gets relaxed by
+      # whoever hits it next; one that reads only the directives keeps
+      # meaning something. Same discipline as the comment-stripped views used
+      # elsewhere in tests/.
+      ansible.builtin.assert:
+        that:
+          - not (code is search('(?i)(password|secret|token|api[_-]?key|BEGIN [A-Z ]*PRIVATE KEY)'))
+        fail_msg: >-
+          {{ item.1 }} on {{ item.0.name }} contains something that looks like
+          a credential in its DIRECTIVES (comments are excluded). CoreDNS
+          needs none, and these files are 0644 and logged. Stripped content:
+          {{ code }}
+        success_msg: "{{ item.0.name }}/{{ item.1 }}: no secret in the directives."
+      vars:
+        text: "{{ lookup('file', render_dir ~ '/' ~ item.0.name ~ '/' ~ item.1) }}"
+        # Corefile comments begin with #, zone-file comments with ; — drop
+        # whole comment lines and any trailing comment on a directive line.
+        code: >-
+          {{ text | regex_replace('(?m)^[ \t]*[#;].*$', '')
+                  | regex_replace('(?m)[ \t]*;.*$', '') }}
+      loop: "{{ nodes | product(['Corefile', 'db.dc1.lan']) | list }}"
+      loop_control:
+        label: "{{ item.0.name }}/{{ item.1 }}"
+
+    # ── THE PROHIBITION THAT ONLY DOCUMENTATION CAN CARRY ───────────────────
+
+    - name: A PUBLIC SECONDARY FOR dc1.lan IS PROHIBITED, IN WRITING
+      # ⚠️ A TEST ABOUT PROSE, AND IT EARNS ITS PLACE. The other guards here
+      # describe things code can refuse. This one cannot be: nothing in this
+      # repository can stop somebody delegating dc1.lan to a cloud DNS zone,
+      # a dynamic-DNS provider or the router's own DDNS feature. The only
+      # control available is that the reason is written down where the next
+      # person looks — so the test is that it IS written down.
+      #
+      # Why it matters: dc1.lan describes private 10.0.0.0/24 addresses.
+      # Publishing it discloses the internal topology, publishes records that
+      # are useless off-LAN, and creates a second authority for a zone whose
+      # names appear in JWT issuers and CORS origins. Redundancy for this zone
+      # is the second INTERNAL resolver, and nothing else.
+      ansible.builtin.assert:
+        that:
+          - doc is search('(?i)public secondary DNS service is prohibited')
+          - doc is search('(?i)do not delegate, mirror, or register')
+          - doc is search('(?i)dynamic-DNS provider')
+          - doc is search('(?i)second internal resolver')
+        fail_msg: >-
+          docs/dc1-lan-dns.md no longer prohibits a public secondary for
+          dc1.lan. That prohibition cannot be enforced in code — nothing here
+          can prevent somebody delegating the zone to a third party — so the
+          written reason is the only control there is, and it must stay.
+        success_msg: >-
+          docs/dc1-lan-dns.md prohibits a public secondary and says why.
+      vars:
+        doc: "{{ lookup('file', '../docs/dc1-lan-dns.md') }}"
+
+    - name: And the documentation records the router settings it depends on
+      # The zone hard-codes two addresses; the reservations are what keep the
+      # DHCP lease table agreeing with Git. If the documented MACs drift from
+      # the zone's addresses, somebody reserves the wrong pair.
+      ansible.builtin.assert:
+        that:
+          - doc is search('38:d5:7a:26:26:f7')
+          - doc is search('d0:11:e5:e9:c9:bc')
+          - doc is search('10\.0\.0\.22')
+          - doc is search('10\.0\.0\.3')
+          - doc is search('(?i)do not put .1\.1\.1\.1')
+        fail_msg: >-
+          docs/dc1-lan-dns.md must record both address reservations (with
+          their MACs), both resolver addresses, and the warning against
+          putting a public resolver in the router's DNS fields.
+        success_msg: "The router's required settings are documented."
+      vars:
+        doc: "{{ lookup('file', '../docs/dc1-lan-dns.md') }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          dc1.lan serves three records from two nodes that render an identical
+          zone; keel.dc1.lan is reserved and absent; both binaries are pinned
+          and checksum-verified; queries are LAN-only and cannot loop via the
+          router; a public secondary is prohibited in writing.

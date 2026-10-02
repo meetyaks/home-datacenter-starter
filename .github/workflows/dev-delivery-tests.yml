@@ -27,6 +27,13 @@ on:
     paths: &covered
       - 'roles/keel/**'
       - 'roles/keel_reconcile/**'
+      # ⚠️ roles/coredns AND playbooks/ ARE COVERED TOO. Without these, a
+      # change to the LAN resolvers or to playbooks/dns.yml would land with
+      # the suites below never running — and the DNS guards are exactly the
+      # kind that pass by agreeing with whatever is in front of them.
+      - 'roles/coredns/**'
+      - 'playbooks/**'
+      - 'docs/dc1-lan-dns.md'
       - 'playbooks/keel-reconcile.yml'
       - 'inventory/**'
       - 'tests/**'
@@ -150,6 +157,49 @@ jobs:
       # load the file.
       - name: Scheduler and credential mutations
         run: tests/run-auth-mutations.sh
+
+      # ── LAN DNS ──────────────────────────────────────────────────────────
+      #
+      # ⚠️ dc1.lan WAS NEVER DNS. `keel.dc1.lan` resolved from one line in one
+      #    workstation's /etc/hosts; the router served no dc1.lan record and
+      #    no host ran a resolver. These suites hold the replacement honest,
+      #    and they are controller-only — they render the role's own
+      #    templates, bind no port and install nothing.
+      #
+      # ⚠️ LAST, AND THAT ORDERING IS A LESSON RATHER THAN A PREFERENCE. These
+      #    steps were first placed immediately after "DEV environment
+      #    identity". The mutation runner then failed on this runner — it used
+      #    `sed -i ''`, which is BSD syntax that GNU sed does not accept — and
+      #    because a failed step aborts the job, ALL THIRTEEN established
+      #    suites below were skipped. One new suite with a portability bug took
+      #    out the entire lane's signal, including the Keel release guards that
+      #    had nothing to do with it. New suites go after the proven ones.
+      - name: LAN DNS — zone, pins, forwarding and ACL
+        run: ansible-playbook tests/dns-zone.yml
+
+      # ⚠️ ONE ASSERTION HERE IS MAC-ONLY AND SKIPS LOUDLY: `plutil -lint` on
+      #    the rendered CoreDNS plist. Everything else in this suite reads the
+      #    plist as text and needs no Mac. The parse is proved on dc1-arm-1 by
+      #    tests/run-all.sh, which is the machine that loads the file.
+      - name: LAN DNS — launchd and systemd definitions
+        run: ansible-playbook tests/dns-services.yml
+
+      - name: LAN DNS — inventory reaches dc1-x86 by address
+        run: ansible-playbook tests/dns-inventory.yml
+
+      # ⚠️ RUNS THE GUARD AND REQUIRES THE REFUSAL. This runner is not
+      #    dc1-arm-1, so the guard must refuse here — which is exactly the case
+      #    worth testing — and it confirms the attempt installed nothing.
+      - name: LAN DNS — the management-node guard refuses a non-controller
+        run: tests/run-dns-controller-guard.sh
+
+      # ⚠️ tests/run-dns-corefile-parse.sh IS DELIBERATELY NOT HERE. It starts
+      #    the real CoreDNS binary, which means fetching the pinned release —
+      #    network, like run-remote-image-check.sh, which lives in run-all.sh
+      #    for the same reason. It runs on the console, which is also where the
+      #    Corefile will actually be loaded.
+      - name: LAN DNS mutations — every guard is proved to fail
+        run: tests/run-dns-mutations.sh
 
       # ── The static guard check from the existing preflight suite. Its runtime
       #    half needs a source tree this runner does not have, so only the

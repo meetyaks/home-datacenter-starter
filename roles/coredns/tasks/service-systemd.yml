@@ -1,0 +1,43 @@
+---
+# The Linux secondary, under systemd.
+
+- name: Install the systemd unit
+  ansible.builtin.template:
+    src: systemd.service.j2
+    dest: "{{ coredns_systemd_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Restart CoreDNS
+
+- name: Enable it and make sure it is running
+  ansible.builtin.systemd_service:
+    name: "{{ coredns_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+
+- name: Confirm systemd holds exactly one CoreDNS unit
+  # ⚠️ THE SAME "EXACTLY ONE" AS THE launchd SIDE, FOR THE SAME REASON. A
+  # distribution package's own coredns.service left enabled beside this one
+  # would race for port 53, and `Restart=on-failure` would hide it as a unit
+  # that is perpetually restarting while DNS appears to work.
+  ansible.builtin.command:
+    cmd: systemctl list-unit-files --type=service --no-legend --no-pager coredns*.service
+  register: coredns_units
+  changed_when: false
+  become: true
+
+- name: And that it is the one this role rendered
+  ansible.builtin.assert:
+    that:
+      - (coredns_units.stdout_lines | select('search', '\S') | list | length) == 1
+      - coredns_units.stdout is search('^coredns\.service')
+    fail_msg: >-
+      systemd knows these CoreDNS units:
+      {{ coredns_units.stdout_lines | join(' / ') | default('none') }}.
+      Exactly one may exist, and it must be coredns.service from
+      {{ coredns_systemd_unit }}.
+    success_msg: "One systemd unit: coredns.service."

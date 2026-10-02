@@ -1,0 +1,46 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# "AM I THE MANAGEMENT NODE?" — one owner, imported by playbooks/dns.yml.
+#
+# ⚠️ A SEPARATE FILE SO IT CAN BE RUN ALONE, AND THAT IS NOT COSMETIC.
+# tests/run-dns-controller-guard.sh has to execute this guard and watch it
+# refuse. When it lived inside playbooks/dns.yml the only way to run it alone
+# was `--limit localhost`, which left the second play with no hosts and
+# aborted the whole run BEFORE the guard was evaluated — a non-zero exit that
+# looked like the guard working when it had not run at all. The test caught
+# that, which is the only reason it is known.
+#
+# Run directly to check a machine:  ansible-playbook playbooks/dns-controller-guard.yml
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Confirm this really is the management node
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  tasks:
+    - name: This machine must be dc1-arm-1
+      # ⚠️ ASKED OF THE MACHINE, NOT OF THE INVENTORY. `dns_servers` contains a
+      # host called dc1-arm-1 with a LOCAL connection; that name proves
+      # nothing about where the playbook is executing. Only the machine's own
+      # identity does.
+      #
+      # The workstation syekollu-mn0256 is NOT the controller and must carry no
+      # permanent service from this repository — not DNS, not launchd
+      # reconciliation, not credentials. This is the check that enforces it
+      # (enforced: tests/run-dns-controller-guard.sh, which runs this and
+      # requires the refusal).
+      ansible.builtin.assert:
+        that:
+          - (ansible_facts['hostname'] | lower) is match('dc1-arm-1')
+        fail_msg: >-
+          REFUSING: this is "{{ ansible_facts['hostname'] }}", not dc1-arm-1.
+          playbooks/dns.yml configures the primary resolver over a LOCAL
+          connection, so running it here would install a LAN DNS server and a
+          launchd daemon on THIS machine — a permanent service on the wrong
+          host, serving a zone for a network it may not even be on.
+          The management node is dc1-arm-1 (10.0.0.22); run it there. If
+          dc1-arm-1 has genuinely been renamed, change the inventory and this
+          check together — do not bypass it.
+        success_msg: >-
+          Running on {{ ansible_facts['hostname'] }}, the management node.

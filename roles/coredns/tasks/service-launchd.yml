@@ -1,0 +1,63 @@
+---
+# The macOS primary, under launchd.
+
+- name: Install the launchd daemon definition
+  ansible.builtin.template:
+    src: launchd.plist.j2
+    dest: "{{ coredns_launchd_plist }}"
+    owner: root
+    group: wheel
+    mode: "0644"
+  become: true
+  register: coredns_plist
+  notify: Restart CoreDNS
+
+- name: Validate the plist before launchd is asked to load it
+  # ⚠️ `plutil -lint`, BECAUSE launchd's OWN ERROR FOR A MALFORMED PLIST IS
+  # NEARLY SILENT. A broken file produces a daemon that simply never runs,
+  # with nothing in the obvious place to say why — so the file is checked
+  # here, where the failure names itself.
+  ansible.builtin.command:
+    cmd: "plutil -lint {{ coredns_launchd_plist }}"
+  changed_when: false
+
+- name: Bootstrap it
+  # Idempotent by inspection rather than by flag: `bootstrap` fails if the
+  # service is already loaded, so load state is read first.
+  ansible.builtin.command:
+    cmd: "launchctl print system/{{ coredns_launchd_label }}"
+  register: coredns_launchd_loaded
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Load the daemon
+  ansible.builtin.command:
+    cmd: "launchctl bootstrap system {{ coredns_launchd_plist }}"
+  become: true
+  when: coredns_launchd_loaded.rc != 0
+  changed_when: true
+
+- name: Confirm launchd holds exactly this one CoreDNS daemon
+  # ⚠️ EXACTLY ONE. Two definitions — say a hand-copied plist beside this
+  # rendered one — would both try to bind port 53, and the one that lost the
+  # race would restart forever under KeepAlive while the other served. The
+  # symptom is a log full of "address already in use" and a resolver that
+  # looks fine.
+  ansible.builtin.find:
+    paths: /Library/LaunchDaemons
+    patterns: "*coredns*.plist"
+  register: coredns_daemon_files
+  become: true
+
+- name: And that it is the one this role rendered
+  ansible.builtin.assert:
+    that:
+      - (coredns_daemon_files.files | map(attribute='path') | list) == [coredns_launchd_plist]
+    fail_msg: >-
+      /Library/LaunchDaemons holds
+      {{ coredns_daemon_files.files | map(attribute='path') | join(', ') | default('nothing') }}.
+      Exactly one CoreDNS daemon may exist and it must be
+      {{ coredns_launchd_plist }} — a second definition fights this one for
+      port 53.
+    success_msg: "One launchd daemon: {{ coredns_launchd_label }}."

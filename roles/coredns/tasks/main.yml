@@ -1,0 +1,52 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Install and configure CoreDNS as an authoritative resolver for dc1.lan.
+#
+#   1. work out which platform this is, and refuse one we have no pin for
+#   2. install the pinned binary, verifying the bytes before they are used
+#   3. render the Corefile and the zone — from Git, never edited on the host
+#   4. install the right service definition for this operating system
+#   5. verify the resolver actually answers
+#
+# ⚠️ ORDER MATTERS AT STEP 3/4. The service is defined only after a valid
+# configuration exists on disk: a daemon told to start against a missing
+# Corefile fails, and on Linux `Restart=on-failure` would then retry it in a
+# loop while the real cause scrolled past.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Work out this node's platform and paths
+  ansible.builtin.include_tasks: platform.yml
+
+- name: Refuse a platform this role has no verified pin for
+  # ⚠️ FAIL CLOSED ON AN UNPINNED PLATFORM. The alternative is downloading
+  # whatever the release happens to offer and installing it unverified, which
+  # is the one thing a pinned checksum exists to prevent. Adding a platform
+  # means recording its published checksum, not relaxing this.
+  ansible.builtin.assert:
+    that:
+      - coredns_platform in coredns_checksums
+      - coredns_checksums[coredns_platform] | length == 64
+      - coredns_checksums[coredns_platform] is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      This node is {{ coredns_platform }}, for which roles/coredns has no
+      recorded SHA-256. Pinned platforms are
+      {{ coredns_checksums.keys() | list | join(', ') }}. Fetch
+      coredns_{{ coredns_version }}_{{ coredns_platform }}.tgz.sha256 from the
+      release, record it in defaults/main.yml, and verify it against the real
+      download before relying on it.
+    success_msg: >-
+      {{ coredns_platform }} is pinned at
+      {{ coredns_checksums[coredns_platform][:12] }}… for
+      CoreDNS {{ coredns_version }}.
+
+- name: Install the pinned binary
+  ansible.builtin.include_tasks: install.yml
+
+- name: Render the configuration and the zone
+  ansible.builtin.include_tasks: configure.yml
+
+- name: Define the service for this operating system
+  ansible.builtin.include_tasks: "service-{{ 'launchd' if coredns_is_darwin else 'systemd' }}.yml"
+
+- name: Verify it answers
+  ansible.builtin.include_tasks: verify.yml

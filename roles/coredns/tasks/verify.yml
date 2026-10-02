@@ -1,0 +1,83 @@
+---
+# ⚠️ ASK THE RUNNING RESOLVER, NOT THE FILES ON DISK.
+#
+# Everything above proves the configuration was WRITTEN. None of it proves the
+# daemon parsed it, bound its port, or serves the zone — and a Corefile that
+# parses but serves nothing looks identical from the filesystem. So the last
+# word belongs to a real query, through the real port, from this node.
+#
+# This is the same rule the Keel role follows after a deploy: a success
+# message is not evidence.
+
+- name: Give the daemon a moment to bind
+  ansible.builtin.wait_for:
+    host: "{{ coredns_bind_addresses | reject('match', '127\\.') | first | default('127.0.0.1') }}"
+    port: 53
+    timeout: 30
+
+- name: Readiness, as the resolver reports it
+  ansible.builtin.uri:
+    url: "http://{{ coredns_ready_address }}/ready"
+    status_code: [200]
+  register: coredns_ready_check
+  retries: 6
+  delay: 5
+  until: coredns_ready_check is succeeded
+
+- name: Health, as the resolver reports it
+  ansible.builtin.uri:
+    url: "http://{{ coredns_health_address }}/health"
+    status_code: [200]
+
+- name: Resolve every record this zone is supposed to serve
+  # UDP, against this node's own LAN address — the path a client uses.
+  ansible.builtin.command:
+    cmd: >-
+      dig +short +time=3 +tries=1
+      @{{ coredns_bind_addresses | reject('match', '127\\.') | first }}
+      {{ item.name }}.{{ coredns_zone }} A
+  register: coredns_resolved
+  changed_when: false
+  loop: "{{ coredns_zone_records }}"
+  loop_control:
+    label: "{{ item.name }}.{{ coredns_zone }}"
+
+- name: Each one must return exactly its own address
+  ansible.builtin.assert:
+    that:
+      - (item.stdout_lines | select('match', '^\d') | list) == [item.item.ip]
+    fail_msg: >-
+      {{ item.item.name }}.{{ coredns_zone }} resolved to
+      "{{ item.stdout_lines | join(', ') | default('nothing') }}" but the zone
+      says {{ item.item.ip }}.
+    success_msg: "{{ item.item.name }}.{{ coredns_zone }} → {{ item.item.ip }}"
+  loop: "{{ coredns_resolved.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: The reserved production name must not resolve here
+  # ⚠️ AN AUTHORITATIVE NXDOMAIN, NOT A FORWARDED LOOKUP. If this came back
+  # with an answer, either somebody added the reserved name or the zone is not
+  # authoritative and the query escaped to a public resolver — and the second
+  # is worse, because it means internal names are leaving the LAN.
+  ansible.builtin.command:
+    cmd: >-
+      dig +time=3 +tries=1
+      @{{ coredns_bind_addresses | reject('match', '127\\.') | first }}
+      keel.{{ coredns_zone }} A
+  register: coredns_reserved
+  changed_when: false
+
+- name: Confirm it is refused by this zone's own authority
+  ansible.builtin.assert:
+    that:
+      - coredns_reserved.stdout is search('status: NXDOMAIN')
+      - coredns_reserved.stdout is search('flags:[^;]*\baa\b')
+    fail_msg: >-
+      keel.{{ coredns_zone }} did not come back as an AUTHORITATIVE NXDOMAIN.
+      Either the reserved production name has been added to the zone, or this
+      server is not authoritative for {{ coredns_zone }} and the query was
+      forwarded — which would mean internal names are leaving the LAN.
+      Response status line:
+      {{ coredns_reserved.stdout_lines | select('search', 'status:') | join(' ') }}
+    success_msg: "keel.{{ coredns_zone }} → authoritative NXDOMAIN, as reserved."
