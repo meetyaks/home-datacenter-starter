@@ -74,11 +74,89 @@
     force: true
   when: coredns_needs_install | bool
 
-- name: Unpack it
+# ── UNPACKING, AND WHY IT IS TWO TASKS ──────────────────────────────────────
+#
+# ⚠️ `ansible.builtin.unarchive` CANNOT RUN ON macOS HERE, AND THE FIRST REAL
+# DEPLOYMENT FOUND OUT. Running playbooks/dns.yml from dc1-arm-1 stopped on the
+# primary, before dc1-x86 was touched at all:
+#
+#   TASK [coredns : Unpack it]
+#   Failed to find handler for ".../coredns.tgz"
+#   Command "/usr/bin/tar" detected as tar type bsd. GNU tar required.
+#
+# The download had already succeeded against the pinned SHA-256. Nothing was
+# wrong with the archive: macOS ships bsdtar as /usr/bin/tar, it extracts this
+# tarball perfectly well, and the module simply refuses to use it.
+#
+# ⚠️ INSTALLING GNU TAR WAS REJECTED. It would mean adding Homebrew (or a
+# source build) as a prerequisite of the LAN's primary resolver, on the
+# management node, to work around a module's preference — a permanent
+# dependency, an extra update surface and a bootstrap ordering problem, in
+# exchange for nothing the platform's own tar cannot already do. The archive is
+# a single-file .tgz; extracting it is not the hard part.
+#
+# So the platform is asked, and each branch uses what that platform has.
+
+- name: Unpack it (macOS, with the tar the system actually ships)
+  # ⚠️ `argv`, NOT A SHELL STRING. The staging path comes from a tempfile and
+  # is interpolated into the command; as shell text a path containing a space
+  # or a quote would be re-split by the shell, and this runs on the node that
+  # serves the whole LAN's DNS. argv passes each element through untouched and
+  # starts no shell at all.
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/tar
+      - -xzf
+      - "{{ coredns_download_tmp.path }}/coredns.tgz"
+      - -C
+      - "{{ coredns_download_tmp.path }}"
+  changed_when: true
+  when:
+    - coredns_needs_install | bool
+    - coredns_is_darwin | bool
+
+- name: Unpack it (Linux)
+  # Unchanged. GNU tar is what the module wants and what the host has.
   ansible.builtin.unarchive:
     src: "{{ coredns_download_tmp.path }}/coredns.tgz"
     dest: "{{ coredns_download_tmp.path }}"
     remote_src: true
+  when:
+    - coredns_needs_install | bool
+    - not (coredns_is_darwin | bool)
+
+- name: Look for the binary the archive was supposed to contain
+  ansible.builtin.stat:
+    path: "{{ coredns_download_tmp.path }}/coredns"
+  register: coredns_unpacked
+  when: coredns_needs_install | bool
+
+- name: Confirm the extraction produced it
+  # ⚠️ BEFORE THE COPY, SO THE FAILURE NAMES ITSELF. Without this, an
+  # extraction that silently produced nothing — a changed archive layout, a
+  # tar that reported success having written elsewhere, a future platform
+  # branch that is subtly wrong — reaches `copy` and fails with "Source
+  # .../coredns not found", which describes the symptom and not the cause.
+  # The expensive version of that diagnosis is on a host serving LAN DNS.
+  #
+  # `isreg` rather than `exists`: a directory named `coredns` would satisfy
+  # existence and then fail the copy for a third, even less obvious reason.
+  ansible.builtin.assert:
+    that:
+      - coredns_unpacked.stat.exists
+      - coredns_unpacked.stat.isreg
+    fail_msg: >-
+      Extraction left no regular file at
+      {{ coredns_download_tmp.path }}/coredns. The download matched the pinned
+      SHA-256, so the archive is the one we expected — what failed is the
+      unpacking step for this platform
+      ({{ 'macOS, /usr/bin/tar' if coredns_is_darwin else 'Linux, ansible.builtin.unarchive' }}).
+      Check that coredns_{{ coredns_version }}_{{ coredns_platform }}.tgz still
+      contains a single top-level `coredns` binary.
+    success_msg: >-
+      Extraction produced
+      {{ coredns_download_tmp.path }}/coredns
+      ({{ coredns_unpacked.stat.size | default(0) }} bytes).
   when: coredns_needs_install | bool
 
 - name: Install it

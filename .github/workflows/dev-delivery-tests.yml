@@ -184,6 +184,16 @@ jobs:
       - name: LAN DNS — launchd and systemd definitions
         run: ansible-playbook tests/dns-services.yml
 
+      # ⚠️ THE FAILURE THAT STOPPED THE FIRST WATCHED DEPLOYMENT, as a test.
+      #    Running playbooks/dns.yml from dc1-arm-1 died on the primary with
+      #    "Command /usr/bin/tar detected as tar type bsd. GNU tar required."
+      #    — after the pinned checksum had matched. It reads the task file as
+      #    YAML, so it asserts on executable structure, not on comments, and
+      #    runs happily on a Linux runner because it parses rather than
+      #    executes.
+      - name: LAN DNS — the macOS/Linux extraction split
+        run: ansible-playbook tests/dns-install-platform.yml
+
       - name: LAN DNS — inventory reaches dc1-x86 by address
         run: ansible-playbook tests/dns-inventory.yml
 

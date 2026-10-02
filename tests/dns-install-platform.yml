@@ -1,0 +1,279 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# HOW CoreDNS IS UNPACKED, PER PLATFORM.
+#
+#   ansible-playbook tests/dns-install-platform.yml
+#
+# ⚠️ WHAT THIS IS GUARDING. The first watched DNS deployment, run from
+# dc1-arm-1, stopped on the primary before dc1-x86 was touched:
+#
+#   TASK [coredns : Unpack it]
+#   Failed to find handler for ".../coredns.tgz"
+#   Command "/usr/bin/tar" detected as tar type bsd. GNU tar required.
+#
+# The download had already matched the pinned SHA-256. Nothing was wrong with
+# the archive — macOS ships bsdtar as /usr/bin/tar, it extracts this tarball
+# perfectly well, and `ansible.builtin.unarchive` simply refuses to use it.
+#
+# Installing GNU tar was rejected: it would make Homebrew a prerequisite of the
+# LAN's primary resolver to work around a module's preference. So the role asks
+# the platform and each branch uses the tar that platform has.
+#
+# ⚠️ IT READS THE TASK FILE AS YAML, NOT AS TEXT, AND THAT IS THE POINT.
+# Parsing gives the EXECUTABLE structure — module names, argv, `when`, order —
+# and is constitutionally blind to comments. A grep-based version of this suite
+# would pass on a file whose comments described the split while the tasks did
+# something else, which is the failure mode this repository has hit three times
+# (the `no_log` assertion satisfied by a comment; the rendered-file secret scan;
+# the BSD-sed check that flagged its own documentation).
+#
+# Controller-only: parses one file, connects to nothing, installs nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The CoreDNS install path, per platform
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    install_file: ../roles/coredns/tasks/install.yml
+
+  tasks:
+    - name: Parse the role's install tasks
+      ansible.builtin.set_fact:
+        tasks_yaml: "{{ lookup('file', install_file) | from_yaml }}"
+
+    - name: Summarise each task structurally
+      # One normalised record per task: which module it uses, its first argv
+      # element if any, its condition, and its position. Everything below is a
+      # question about these records, so no assertion reads raw text.
+      ansible.builtin.set_fact:
+        summary: >-
+          {{ summary | default([]) + [ {
+               'idx': i,
+               'name': item.name | default(''),
+               'module': (item.keys() | select('match', '^ansible\.builtin\.') | list | first) | default('none'),
+               'argv0': (item['ansible.builtin.command']['argv'][0]) | default(''),
+               'argv': (item['ansible.builtin.command']['argv']) | default([]) | string,
+               'when': (item.when | default('')) | string,
+               'that': (item['ansible.builtin.assert']['that'] | default('')) | string,
+               'checksum': (item['ansible.builtin.get_url']['checksum']) | default(''),
+               'copy_owner': (item['ansible.builtin.copy']['owner']) | default(''),
+               'copy_mode': (item['ansible.builtin.copy']['mode']) | default(''),
+               'notify': (item.notify | default('')) | string
+             } ] }}
+      loop: "{{ tasks_yaml }}"
+      loop_control:
+        index_var: i
+        label: "{{ item.name | default('(unnamed)') }}"
+
+    - name: Locate the tasks this suite is about
+      ansible.builtin.set_fact:
+        tar_tasks: "{{ summary | selectattr('argv0', 'equalto', '/usr/bin/tar') | list }}"
+        unarchive_tasks: "{{ summary | selectattr('module', 'equalto', 'ansible.builtin.unarchive') | list }}"
+        download_tasks: "{{ summary | selectattr('module', 'equalto', 'ansible.builtin.get_url') | list }}"
+        copy_tasks: "{{ summary | selectattr('module', 'equalto', 'ansible.builtin.copy') | list }}"
+        unpacked_asserts: "{{ summary | selectattr('that', 'search', 'coredns_unpacked') | list }}"
+        stat_tasks: "{{ summary | selectattr('module', 'equalto', 'ansible.builtin.stat') | list }}"
+
+    # ── THE DARWIN BRANCH ───────────────────────────────────────────────────
+
+    - name: macOS extracts with the system tar, exactly once
+      ansible.builtin.assert:
+        that:
+          - (tar_tasks | length) == 1
+          - tar_tasks[0].module == 'ansible.builtin.command'
+        fail_msg: >-
+          Expected exactly one task invoking /usr/bin/tar via
+          ansible.builtin.command; found {{ tar_tasks | length }}.
+          macOS cannot use ansible.builtin.unarchive here — it refuses bsdtar
+          with "GNU tar required" — so the Darwin branch must call the system
+          tar itself.
+        success_msg: "macOS unpacks with /usr/bin/tar, via command."
+
+    - name: It passes argv, so nothing is re-split by a shell
+      # ⚠️ NOT A STYLE POINT. The staging path comes from a tempfile and is
+      # interpolated in; as shell text, a path containing a space or a quote
+      # would be re-split, on the node that serves the whole LAN's DNS.
+      ansible.builtin.assert:
+        that:
+          - tar_tasks[0].argv is search('-xzf')
+          - tar_tasks[0].argv is search('-C')
+          - tar_tasks[0].argv is search('coredns\.tgz')
+          - tar_tasks[0].argv is search('coredns_download_tmp\.path')
+        fail_msg: >-
+          The macOS extraction must pass an argv list naming the archive and
+          the staging directory. Got: {{ tar_tasks[0].argv }}
+        success_msg: "Extraction passes argv: -xzf <archive> -C <staging>."
+
+    - name: THE DARWIN BRANCH DOES NOT USE unarchive
+      # The whole defect, stated directly: on this platform that module cannot
+      # run, so the Darwin path must not reach it by any route.
+      ansible.builtin.assert:
+        that:
+          - tar_tasks[0].module != 'ansible.builtin.unarchive'
+          - (unarchive_tasks | selectattr('when', 'search', 'coredns_is_darwin \| bool')
+             | rejectattr('when', 'search', 'not') | list | length) == 0
+        fail_msg: >-
+          An ansible.builtin.unarchive task is reachable on Darwin. That module
+          refuses bsdtar with "GNU tar required" and is what broke the first
+          watched deployment.
+        success_msg: "No unarchive task runs on Darwin."
+
+    - name: And it runs only when something needs installing, on Darwin only
+      ansible.builtin.assert:
+        that:
+          - tar_tasks[0].when is search('coredns_needs_install')
+          - tar_tasks[0].when is search('coredns_is_darwin')
+          - not (tar_tasks[0].when is search('not \(coredns_is_darwin'))
+        fail_msg: >-
+          The macOS extraction's condition is "{{ tar_tasks[0].when }}". It must
+          require BOTH coredns_needs_install and coredns_is_darwin — a
+          converged node must not re-extract, and this branch must not run on
+          Linux.
+        success_msg: "macOS extraction: needs_install AND is_darwin."
+
+    # ── THE LINUX BRANCH ────────────────────────────────────────────────────
+
+    - name: Linux keeps ansible.builtin.unarchive, exactly once
+      ansible.builtin.assert:
+        that:
+          - (unarchive_tasks | length) == 1
+        fail_msg: >-
+          Expected exactly one ansible.builtin.unarchive task for the Linux
+          branch; found {{ unarchive_tasks | length }}. GNU tar is what that
+          module wants and what the Linux host has — this fix does not replace
+          it, it stops Darwin reaching it.
+        success_msg: "Linux still unpacks with ansible.builtin.unarchive."
+
+    - name: And it runs only when something needs installing, off Darwin
+      ansible.builtin.assert:
+        that:
+          - unarchive_tasks[0].when is search('coredns_needs_install')
+          - unarchive_tasks[0].when is search('not \(coredns_is_darwin \| bool\)')
+        fail_msg: >-
+          The Linux extraction's condition is "{{ unarchive_tasks[0].when }}".
+          It must require coredns_needs_install AND explicitly exclude Darwin;
+          without the exclusion the macOS run reaches it again and fails with
+          "GNU tar required".
+        success_msg: "Linux extraction: needs_install AND NOT is_darwin."
+
+    - name: EXACTLY ONE BRANCH CAN RUN ON A GIVEN HOST
+      # Neither both nor neither. Both would extract twice; neither would leave
+      # the copy to fail on a missing file.
+      ansible.builtin.assert:
+        that:
+          - (tar_tasks | length) + (unarchive_tasks | length) == 2
+          - tar_tasks[0].idx != unarchive_tasks[0].idx
+        fail_msg: >-
+          There must be exactly two extraction tasks — one per platform — and
+          they must be distinct.
+        success_msg: "Two extraction tasks, one per platform, mutually exclusive."
+
+    # ── ORDER: VERIFY, EXTRACT, CHECK, INSTALL ──────────────────────────────
+
+    - name: The checksum is verified BEFORE either extraction
+      # ⚠️ THE SECURITY PROPERTY THE SPLIT MUST NOT DISTURB. Extraction runs
+      # the archive's contents through tar as a prelude to installing a binary
+      # that will run as root with CAP_NET_BIND_SERVICE. The bytes are vouched
+      # for first, or the whole pin is decorative.
+      ansible.builtin.assert:
+        that:
+          - (download_tasks | length) == 1
+          - download_tasks[0].checksum is search('sha256:')
+          - download_tasks[0].idx < tar_tasks[0].idx
+          - download_tasks[0].idx < unarchive_tasks[0].idx
+        fail_msg: >-
+          The checksummed download must come before both extraction tasks.
+          download idx={{ download_tasks[0].idx | default('?') }},
+          tar idx={{ tar_tasks[0].idx }},
+          unarchive idx={{ unarchive_tasks[0].idx }},
+          checksum="{{ download_tasks[0].checksum | default('(none)') }}".
+        success_msg: "SHA-256 is verified before anything is unpacked."
+
+    - name: THE EXTRACTED BINARY IS ASSERTED BEFORE IT IS INSTALLED
+      # ⚠️ ORDERING IS THE WHOLE VALUE. After the copy, a missing file is
+      # "Source .../coredns not found" — the symptom, not the cause. Before it,
+      # the failure names the platform and the archive, which is what somebody
+      # standing in front of a down resolver needs.
+      ansible.builtin.assert:
+        that:
+          - (unpacked_asserts | length) >= 1
+          - (stat_tasks | length) >= 1
+          - (copy_tasks | length) == 1
+          - unpacked_asserts[0].idx < copy_tasks[0].idx
+          - stat_tasks[0].idx < unpacked_asserts[0].idx
+          - unpacked_asserts[0].idx > tar_tasks[0].idx
+          - unpacked_asserts[0].idx > unarchive_tasks[0].idx
+        fail_msg: >-
+          The extracted-binary assertion must sit after BOTH extraction
+          branches and before the copy. stat
+          idx={{ stat_tasks[0].idx | default('?') }}, assert
+          idx={{ unpacked_asserts[0].idx | default('?') }}, copy
+          idx={{ copy_tasks[0].idx | default('?') }}.
+        success_msg: "stat → assert → copy, in that order."
+
+    - name: The assertion requires a REGULAR FILE, not merely a path
+      # A directory named `coredns` would satisfy existence and then fail the
+      # copy for a third, even less obvious reason.
+      ansible.builtin.assert:
+        that:
+          - unpacked_asserts[0].that is search('exists')
+          - unpacked_asserts[0].that is search('isreg')
+        fail_msg: >-
+          The extracted-binary assertion checks
+          "{{ unpacked_asserts[0].that }}". It must require both `exists` and
+          `isreg`.
+        success_msg: "The assertion requires a regular file."
+
+    # ── WHAT THE FIX MUST NOT HAVE WEAKENED ────────────────────────────────
+
+    - name: The install still copies as root, 0755, and notifies a restart
+      ansible.builtin.assert:
+        that:
+          - copy_tasks[0].copy_owner == 'root'
+          - copy_tasks[0].copy_mode == '0755'
+          - copy_tasks[0].notify is search('Restart CoreDNS')
+          - copy_tasks[0].when is search('coredns_needs_install')
+        fail_msg: >-
+          The install task must still copy as root with mode 0755, notify
+          "Restart CoreDNS", and run only when needed. Got owner
+          "{{ copy_tasks[0].copy_owner }}", mode "{{ copy_tasks[0].copy_mode }}",
+          notify "{{ copy_tasks[0].notify }}", when "{{ copy_tasks[0].when }}".
+        success_msg: "Install unchanged: root, 0755, notifies a restart."
+
+    - name: The installed binary's version is still checked afterwards
+      ansible.builtin.assert:
+        that:
+          - (summary | selectattr('that', 'search', "'CoreDNS-' ~ coredns_version")
+             | list | length) >= 1
+          - (summary | selectattr('that', 'search', "'CoreDNS-' ~ coredns_version")
+             | map(attribute='idx') | first) > copy_tasks[0].idx
+        fail_msg: >-
+          The post-install version check must still exist and must run after
+          the copy — a verified tarball unpacked to the wrong place would
+          otherwise leave an older binary in service.
+        success_msg: "The installed binary is still verified after copying."
+
+    - name: Nothing in the install path uses a shell
+      # ⚠️ NO shell/raw ANYWHERE HERE. The fix introduces a command task with
+      # an interpolated path; the temptation on the next change is to reach for
+      # `shell` because it is shorter.
+      ansible.builtin.assert:
+        that:
+          - (summary | selectattr('module', 'equalto', 'ansible.builtin.shell') | list | length) == 0
+          - (summary | selectattr('module', 'equalto', 'ansible.builtin.raw') | list | length) == 0
+        fail_msg: >-
+          A shell or raw task appears in the install path:
+          {{ summary | selectattr('module', 'match', 'ansible\.builtin\.(shell|raw)')
+             | map(attribute='name') | join(', ') }}.
+          Paths here come from a tempfile; use command with argv.
+        success_msg: "No shell in the install path."
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          macOS extracts with /usr/bin/tar via argv and never reaches
+          unarchive; Linux keeps unarchive; both are gated on
+          coredns_needs_install; the checksum precedes both; and the extracted
+          binary is asserted before it is installed as root.
