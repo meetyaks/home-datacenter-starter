@@ -65,6 +65,15 @@ jobs:
       - name: DEV environment identity
         run: ansible-playbook tests/dev-environment-identity.yml
 
+      # ⚠️ THE 2026-10-01 OUTAGE, AS A TEST. `production` + password-only has
+      #    no valid configuration in Keel, and the deployment did not notice:
+      #    it pulled, verified the bundle and APPLIED MIGRATIONS before the
+      #    gateway crash-looped on the OIDC requirement. The refusal cases here
+      #    are themselves the proof the guard fires, so this needs no mutation
+      #    runner — if the guard stopped refusing, they go red.
+      - name: Deployment mode vs sign-in methods
+        run: ansible-playbook tests/deployment-mode.yml
+
       - name: Release contract — the site's own reader
         run: ansible-playbook tests/release-contract.yml
 

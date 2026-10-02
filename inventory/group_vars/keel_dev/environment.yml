@@ -69,3 +69,39 @@ keel_reconcile_auto_deploy: true
 # `tests/dev-environment-identity.yml` fails if any other inventory sets
 # `allow_unavailable`, so spreading it is a test failure rather than a habit.
 keel_release_provenance_policy: allow_unavailable
+
+# ── DEPLOYMENT MODE ─────────────────────────────────────────────────────────
+#
+# ⚠️ DEV RUNS WITH KEEL'S PRODUCTION VALIDATOR OFF, AND THIS LINE IS THE ONLY
+# REASON IT MAY.
+#
+# `assertProductionSafe` requires OIDC whenever dev login is off, and dev
+# login is itself forbidden in production. This deployment offers PASSWORD
+# sign-in and has no identity provider — and it cannot be its own, because a
+# self-referential issuer is refused at boot. So `production` here has no
+# valid configuration at all: the gateway pulls, migrates, and then
+# crash-loops with "OIDC configuration is required in production but is
+# incomplete".
+#
+# That is exactly what happened on 2026-10-01: migrations applied, gateway
+# dead, site down. roles/keel now refuses the combination in preflight, and
+# this line is how DEV says which mode it can actually run.
+#
+# What that costs, and what it does not:
+#
+#   KEPT  the real keys from the vault — this mode PERMITS source-visible
+#         fallbacks, it does not introduce them. KEEL_ALLOW_DEV_LOGIN stays
+#         off, so no dev login appears. Digest-pinned images, the provenance
+#         policy and the bundle hash are all unaffected.
+#   LOST  the production validator's other checks: database URLs over TLS,
+#         no demo-marker credentials, CORS an explicit allowlist. None of
+#         those is wrong on dc1-x86 today, and nothing will say so if one
+#         becomes wrong.
+#
+# ⚠️ SET THIS BACK TO `production` — or simply delete the line, since that is
+# the default — the moment either is true: a real OIDC provider is
+# configured, or Keel supports production mode with password-only
+# authentication. A future PROD environment inherits `production` by saying
+# nothing, and will be REFUSED in preflight until it has a provider, which
+# is the right way round.
+keel_deployment_mode: development

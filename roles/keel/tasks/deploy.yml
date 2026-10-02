@@ -47,6 +47,36 @@
   notify: Restart Keel stack
   when: not (keel_oidc_selected | bool)
 
+- name: Install the deployment-mode overlay
+  # ⚠️ RENDERED BY THE ROLE, NOT LEFT ON THE HOST BY HAND. During the
+  # 2026-10-01 outage this file was written manually to get the gateway
+  # booting again — and the very next reconcile would have brought the stack
+  # up WITHOUT it, crash-looping the gateway a second time, because
+  # `keel_compose_cmd` only names files this role knows about.
+  #
+  # A hand-placed override that the deployer does not know about is not a
+  # fix; it is a fix with a timer on it.
+  ansible.builtin.template:
+    src: compose.dev-mode.yml.j2
+    dest: "{{ keel_compose_dev_mode_file }}"
+    owner: "{{ keel_owner }}"
+    group: "{{ keel_group }}"
+    mode: "0644"
+  notify: Restart Keel stack
+  when: keel_dev_mode_selected | bool
+
+- name: Remove a stale deployment-mode overlay when the stack runs in production
+  # Same reasoning as the OIDC overlay above: a leftover would still be loaded
+  # by any invocation that names it, so returning a deployment TO production
+  # has to take the file away rather than merely stop rendering it. Otherwise
+  # a site would report `production` in inventory and run `development` on the
+  # host, which is the worst of both.
+  ansible.builtin.file:
+    path: "{{ keel_compose_dev_mode_file }}"
+    state: absent
+  notify: Restart Keel stack
+  when: not (keel_dev_mode_selected | bool)
+
 - name: Install the PostgreSQL auth policy from the built commit
   # ALSO FROM THE COMMIT, for the same reason as the compose file above: the
   # auth policy is part of the stack definition, and a copy maintained here

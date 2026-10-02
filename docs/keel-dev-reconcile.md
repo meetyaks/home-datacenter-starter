@@ -70,6 +70,10 @@ release/dev : channels/dev.json
 | a channel naming an **older** release with no `advanced.rollback` | the channel moved backwards by accident, or is not the document CI wrote |
 | a release that already used its retry allowance | a timer plus an unconditional retry is an infinite retry |
 | a held deployment lock | two deployers interleaving `compose up` with a migration is how a schema ends up half-applied |
+| `keel_deployment_mode: production` with password-only sign-in | Keel has no valid configuration for it: the validator requires OIDC, and the dev-login escape hatch that would satisfy it is itself forbidden in production. The stack migrates and then crash-loops |
+| a `keel_deployment_mode` this role does not know | Keel reads an unrecognised `KEEL_ENV` as "no mode declared", satisfying neither the production checks nor the development affordances, so a typo must not fall through to permissive |
+
+The last two are **preflight** refusals rather than release ones: they are decided from inventory before an image is pulled. They exist because on 2026-10-01 that combination was not refused — the deployment pulled, verified the bundle, applied **migrations**, and left a migrated database behind a gateway that never served. See [the role's README](../roles/keel/README.md#keel_deployment_mode--and-why-password-only-forces-it) for what `development` keeps and gives up.
 
 ### Failure is not rolled back automatically
 

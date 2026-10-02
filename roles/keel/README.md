@@ -430,6 +430,47 @@ unconditional, so anyone who could reach the gateway could create an account in
 this installation's permanent tenant. Closed in code by default; stated here so
 the rendered env file carries the posture rather than implying it by omission.
 
+### `keel_deployment_mode` — and why password-only forces it
+
+| value | effect |
+|---|---|
+| `production` (default) | Keel's production validator runs. Requires OIDC. |
+| `development` | renders `compose.dev-mode.yml`, which sets `KEEL_ENV: development` on gateway, bootstrap and runtime-worker |
+
+Declaring `keel_auth_methods: password` and leaving the mode at `production`
+has **no valid configuration**. `assertProductionSafe` requires OIDC whenever
+dev login is off, dev login is itself forbidden in production, and this
+instance cannot be its own provider because a self-referential issuer is
+refused at boot. So the gateway pulls, migrates, and then crash-loops with
+`OIDC configuration is required in production but is incomplete`.
+
+> ⚠️ That is not hypothetical. On 2026-10-01 a DEV deployment ran to completion
+> through image pull, bundle verification and **migrations**, and left a
+> migrated database behind a gateway that never served. Every fact needed to
+> predict it was available before a container was touched.
+
+`preflight.yml` now refuses the combination by name, before anything is
+changed, and says which of the two remedies applies — configure a provider, or
+declare the mode this deployment can actually run. An unrecognised value is
+refused too rather than being treated as either one, because Keel reads an
+unrecognised `KEEL_ENV` as "no mode declared".
+
+What `development` costs, and what it does not:
+
+- **kept** — the real vault keys (this mode *permits* source-visible fallbacks,
+  it does not introduce them), `KEEL_ALLOW_DEV_LOGIN` still off, digest-pinned
+  images, the provenance policy and the bundle hash all unaffected
+- **lost** — the validator's other checks: database URLs over TLS, no
+  demo-marker credentials, CORS an explicit allowlist. None is wrong on
+  dc1-x86 today, and nothing will say so if one becomes wrong.
+
+Only `inventory/group_vars/keel_dev/` may set it; every other environment
+inherits `production` by saying nothing and is refused until it has a provider
+(enforced: `tests/dev-environment-identity.yml` "Only keel_dev may turn the
+production validator off"). The gate itself is held honest in both directions
+by `tests/deployment-mode.yml`, and that the overlay's `KEEL_ENV` actually
+survives Compose's merge by `tests/run-compose-auth-profile.sh` section 7.
+
 ## Rollback
 
 ```bash

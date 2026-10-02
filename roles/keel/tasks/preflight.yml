@@ -60,6 +60,13 @@
   # discovering it after a build means discovering it as a crash-looping gateway.
   ansible.builtin.include_tasks: assert-auth-profile.yml
 
+- name: Check the deployment mode can actually run these sign-in methods
+  # ⚠️ IMMEDIATELY AFTER THE AUTH PROFILE, BECAUSE IT DEPENDS ON IT. The
+  # check needs `keel_oidc_selected`, which assert-auth-profile.yml has just
+  # validated — and the pair of them is the difference between refusing in
+  # preflight and crash-looping after migrations.
+  ansible.builtin.include_tasks: assert-deployment-mode.yml
+
 - name: Confirm the target is the expected architecture
   ansible.builtin.assert:
     that:

@@ -1,0 +1,39 @@
+---
+# One overlay case for tests/deployment-mode.yml.
+#
+# ⚠️ `set_fact`, NOT A TASK `vars:`, AND THE REASON IS ANSIBLE PRECEDENCE.
+# This suite loads roles/keel/defaults/main.yml with `include_vars`, and
+# include_vars sits ABOVE task vars in the precedence order — so a `vars:`
+# block on the assertion cannot override anything the defaults file set, and
+# the check silently evaluates the SHIPPED value instead of the case's.
+#
+# That is not hypothetical: the first version of this check used `vars:` and
+# reported "with keel_deployment_mode=development the compose command should
+# name the overlay, but it does not" — because the override had been ignored
+# and the command was still being built from `production`. The same trap is
+# documented in roles/keel_reconcile/tasks/main.yml, about namespacing an
+# include_vars of this very file.
+#
+# set_fact outranks include_vars, so it actually takes effect.
+
+- name: "{{ overlay_case.mode }} — declare the mode"
+  ansible.builtin.set_fact:
+    keel_deployment_mode: "{{ overlay_case.mode }}"
+    keel_dev_mode_selected: "{{ overlay_case.mode != 'production' }}"
+
+- name: "{{ overlay_case.mode }} — the compose command names the overlay only in dev mode"
+  # ⚠️ BOTH DIRECTIONS, IN ONE EQUALITY. An overlay named but never rendered
+  # makes every compose invocation fail on a missing file. One rendered but
+  # never named is worse in a quieter way: the file sits on the host, the
+  # inventory says `development`, and the stack runs `production` anyway.
+  ansible.builtin.assert:
+    that:
+      - (keel_compose_cmd is search('compose.dev-mode.yml')) == (overlay_case.dev | bool)
+    fail_msg: >-
+      With keel_deployment_mode={{ overlay_case.mode }} the compose command
+      {{ 'should' if overlay_case.dev else 'should NOT' }} name the dev-mode
+      overlay, but it {{ 'does not' if overlay_case.dev else 'does' }}:
+      {{ keel_compose_cmd }}
+    success_msg: >-
+      {{ overlay_case.mode }}: overlay
+      {{ 'named' if overlay_case.dev else 'absent' }}, as it must be.

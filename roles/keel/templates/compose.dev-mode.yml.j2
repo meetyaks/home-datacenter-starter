@@ -1,0 +1,35 @@
+# Rendered by roles/keel — do not edit on the host; the next deployment
+# overwrites it.
+#
+# ⚠️ WHY THIS FILE EXISTS. `KEEL_ENV: production` is hardcoded in
+# compose.lab.yml rather than interpolated from the environment, so keel.env
+# cannot change it. A compose overlay is the only way, short of a new Keel
+# release.
+#
+# ⚠️ AND WHY THE MODE IS NOT production HERE. Keel's `assertProductionSafe`
+# requires OIDC unless KEEL_ALLOW_DEV_LOGIN=true, and KEEL_ALLOW_DEV_LOGIN is
+# itself forbidden in production. A deployment with no identity provider has
+# no valid production configuration — the gateway refuses to start with
+# "OIDC configuration is required in production but is incomplete".
+#
+# This deployment declares `keel_deployment_mode: {{ keel_deployment_mode }}`
+# in its inventory, on purpose, and roles/keel refuses the production +
+# password-only combination in preflight rather than letting it crash-loop.
+#
+# ⚠️ WHAT IS GIVEN UP. assertProductionSafe also checks that database URLs
+# use TLS, that no credential carries a demo marker, and that CORS is an
+# explicit allowlist. Nothing checks those in this mode.
+#
+# ⚠️ WHAT IS NOT. The keys in keel.env are the real ones from the vault.
+# This mode PERMITS source-visible fallbacks; it does not introduce them.
+# KEEL_ALLOW_DEV_LOGIN is not set here and no dev login appears.
+#
+# Remove this by setting `keel_deployment_mode: production` once either a
+# real OIDC provider is configured, or Keel supports production mode with
+# password-only authentication.
+services:
+{% for svc in keel_compose_auth_services %}
+  {{ svc }}:
+    environment:
+      KEEL_ENV: {{ keel_deployment_mode }}
+{% endfor %}
