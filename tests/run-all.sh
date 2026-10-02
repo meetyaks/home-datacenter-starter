@@ -28,6 +28,20 @@ echo "══ LAN DNS — the two service definitions (24 checks) ═════
 ansible-playbook tests/dns-services.yml
 
 echo
+echo "══ LAN DNS — the macOS/Linux extraction split (17 checks) ═════════"
+# ⚠️ A REAL DEPLOYMENT DIED ON THIS. The first watched run from dc1-arm-1
+# stopped on the primary, before dc1-x86 was touched:
+#
+#   Command "/usr/bin/tar" detected as tar type bsd. GNU tar required.
+#
+# The pinned checksum had already matched; macOS ships bsdtar and extracts
+# the tarball fine — `ansible.builtin.unarchive` just refuses to use it.
+# Installing GNU tar was rejected: it would make Homebrew a prerequisite of
+# the LAN's primary resolver. This reads the task file as YAML, so it checks
+# the EXECUTABLE structure and is blind to comments.
+ansible-playbook tests/dns-install-platform.yml
+
+echo
 echo "══ LAN DNS — inventory reaches dc1-x86 by address (10 checks) ═════"
 # The circular dependency: DNS is deployed BY Ansible, and the inventory
 # reached the host by a name only DNS could resolve.

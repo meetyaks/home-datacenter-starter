@@ -21,6 +21,7 @@ DEFAULTS=roles/coredns/defaults/main.yml
 COREFILE=roles/coredns/templates/Corefile.j2
 ZONE=roles/coredns/templates/db.zone.j2
 HOSTS=inventory/hosts.yml
+INSTALL=roles/coredns/tasks/install.yml
 
 WORK=$(mktemp -d -t dns-mutations.XXXXXX)
 restore() {
@@ -28,6 +29,7 @@ restore() {
   [ -f "$WORK/corefile" ] && cp "$WORK/corefile" "$COREFILE"
   [ -f "$WORK/zone" ] && cp "$WORK/zone" "$ZONE"
   [ -f "$WORK/hosts" ] && cp "$WORK/hosts" "$HOSTS"
+  [ -f "$WORK/install" ] && cp "$WORK/install" "$INSTALL"
 }
 cleanup() { restore; rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
@@ -36,6 +38,7 @@ cp "$DEFAULTS" "$WORK/defaults"
 cp "$COREFILE" "$WORK/corefile"
 cp "$ZONE" "$WORK/zone"
 cp "$HOSTS" "$WORK/hosts"
+cp "$INSTALL" "$WORK/install"
 
 pass=0
 fail=0
@@ -103,7 +106,7 @@ fi
 
 echo
 echo "── the suites are green before anything is broken ──"
-for s in dns-zone dns-services dns-inventory; do
+for s in dns-zone dns-services dns-inventory dns-install-platform; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
     ok "tests/${s}.yml is green"
   else
@@ -236,11 +239,72 @@ fi
 cp "$WORK/unit" "$UNIT"
 
 echo
+echo "── the macOS/Linux extraction split ──"
+# ⚠️ THE SPLIT EXISTS BECAUSE A REAL DEPLOYMENT DIED ON IT. Running
+# playbooks/dns.yml from dc1-arm-1 stopped on the primary with
+# "Command /usr/bin/tar detected as tar type bsd. GNU tar required." — after
+# the pinned checksum had already matched. These mutations put that failure
+# back, one way at a time.
+restore
+
+# 1. The regression itself: one unarchive task for everybody, as it was.
+perl -0pi -e 's/- name: Unpack it \(macOS.*?(?=- name: Unpack it \(Linux\))//s' "$INSTALL"
+perl -0pi -e 's/(- name: Unpack it \(Linux\).*?\n  when:\n)    - coredns_needs_install \| bool\n    - not \(coredns_is_darwin \| bool\)\n/$1    - coredns_needs_install | bool\n/s' "$INSTALL"
+expect_red dns-install-platform.yml 'exactly one task invoking /usr/bin/tar|macOS cannot use' \
+           "removing the Darwin branch is caught"
+
+# 2. The split inverted: macOS gets unarchive, Linux gets the system tar.
+#    Reversed rather than deleted, because an inverted condition still LOOKS
+#    like a platform split in review — and still fails on the Mac.
+restore
+perl -0pi -e 's/    - coredns_is_darwin \| bool\n/    - __SWAP__\n/' "$INSTALL"
+perl -0pi -e 's/    - not \(coredns_is_darwin \| bool\)\n/    - coredns_is_darwin | bool\n/' "$INSTALL"
+perl -0pi -e 's/    - __SWAP__\n/    - not (coredns_is_darwin | bool)\n/' "$INSTALL"
+expect_red dns-install-platform.yml 'needs_install AND is_darwin|condition is|NOT is_darwin|unarchive task is reachable on Darwin' \
+           "inverting the platform split is caught"
+
+# 3. The Darwin branch losing its needs_install gate — a converged node would
+#    re-extract on every run.
+restore
+perl -0pi -e 's/(- name: Unpack it \(macOS.*?\n  when:\n)    - coredns_needs_install \| bool\n/$1/s' "$INSTALL"
+expect_red dns-install-platform.yml 'needs_install AND is_darwin|condition is' \
+           "the Darwin branch losing its needs_install gate is caught"
+
+# 4. argv replaced by shell text. The staging path is interpolated, so a path
+#    with a space would be re-split — on the node serving the whole LAN's DNS.
+restore
+perl -0pi -e 's/  ansible\.builtin\.command:\n    argv:\n      - \/usr\/bin\/tar\n      - -xzf\n      - "\{\{ coredns_download_tmp\.path \}\}\/coredns\.tgz"\n      - -C\n      - "\{\{ coredns_download_tmp\.path \}\}"\n/  ansible.builtin.shell:\n    cmd: "\/usr\/bin\/tar -xzf \{\{ coredns_download_tmp.path \}\}\/coredns.tgz -C \{\{ coredns_download_tmp.path \}\}"\n/s' "$INSTALL"
+expect_red dns-install-platform.yml 'shell or raw task appears|exactly one task invoking' \
+           "replacing argv with a shell string is caught"
+
+# 5. The extracted-binary assertion deleted — the copy then fails with
+#    "Source .../coredns not found", the symptom rather than the cause.
+restore
+perl -0pi -e 's/- name: Confirm the extraction produced it.*?(?=- name: Install it)//s' "$INSTALL"
+expect_red dns-install-platform.yml 'assertion must sit after BOTH extraction|stat .*assert .*copy' \
+           "deleting the extracted-binary assertion is caught"
+
+# 6. The assertion kept but moved AFTER the copy, where it can no longer
+#    prevent anything.
+restore
+perl -0pi -e 'my $a; s/(- name: Look for the binary.*?)(?=- name: Install it)/$a = $1; ""/se;
+              s/(- name: Remove the staging directory)/$a$1/s' "$INSTALL"
+expect_red dns-install-platform.yml 'assertion must sit after BOTH extraction|stat .*assert .*copy|before the copy' \
+           "moving the assertion after the copy is caught"
+
+# 7. The checksum dropped from the download — extraction would then run
+#    unvouched-for bytes through tar and install the result as root.
+restore
+perl -0pi -e 's/    checksum: "sha256:\{\{ coredns_checksums\[coredns_platform\] \}\}"\n//' "$INSTALL"
+expect_red dns-install-platform.yml 'must come before both extraction|checksum' \
+           "dropping the download checksum is caught"
+
+echo
 echo "── everything is restored ──"
 restore
 cp "$WORK/plist" "$PLIST"
 cp "$WORK/unit" "$UNIT"
-for s in dns-zone dns-services dns-inventory; do
+for s in dns-zone dns-services dns-inventory dns-install-platform; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
     ok "tests/${s}.yml is green again"
   else
@@ -255,5 +319,6 @@ if [ "$fail" -gt 0 ]; then
   exit 1
 fi
 echo "PASS — $pass checks: every essential record, both checksums, the"
-echo "forwarding loop, LAN-only access and both service definitions are"
-echo "proved to FAIL when broken, each for its own reason."
+echo "forwarding loop, LAN-only access, both service definitions and the"
+echo "macOS/Linux extraction split are proved to FAIL when broken, each for"
+echo "its own reason."
