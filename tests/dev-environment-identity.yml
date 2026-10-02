@@ -150,6 +150,25 @@
           persisted, and it has to say so.
         success_msg: "DEV declares allow_unavailable, explicitly."
 
+    - name: DEV explicitly declares the mode it can actually run
+      # ⚠️ EXPLICIT, AND FOR A REASON IT HAS TO STATE. The role's default is
+      # `production`, and `production` on this deployment cannot boot at all:
+      # Keel's validator requires OIDC, there is no provider, and the dev-login
+      # escape hatch that would otherwise satisfy it is itself forbidden in
+      # production. So DEV opts out in writing. An environment that silently
+      # ran with the production validator off would look identical from here.
+      ansible.builtin.assert:
+        that:
+          - devvars.keel_deployment_mode is defined
+          - devvars.keel_deployment_mode == 'development'
+        fail_msg: >-
+          DEV declares keel_deployment_mode
+          "{{ devvars.keel_deployment_mode | default('(unset)') }}". It must be
+          exactly `development` — with password-only sign-in and no identity
+          provider, `production` has no valid configuration, and roles/keel
+          refuses it in preflight rather than migrating into a crash-loop.
+        success_msg: "DEV declares development, explicitly."
+
     - name: The retired boolean is absent from the DEV inventory
       ansible.builtin.assert:
         that:
@@ -197,6 +216,72 @@
       loop_control:
         label: "{{ item.item.path | basename }}"
       when: "'/keel_dev/' not in item.item.path"
+
+    - name: Collect every deployment mode declared outside keel_dev
+      # ⚠️ THE SAME CONTAINMENT, FOR THE SAME REASON. `keel_deployment_mode:
+      # development` is the line that disables Keel's production validator —
+      # TLS database URLs, no demo-marker credentials, an explicit CORS
+      # allowlist. DEV may lose those because nothing on dc1-x86 depends on
+      # them today. A future PROD must inherit `production` from the role
+      # default by saying nothing, and be REFUSED in preflight until it has a
+      # provider — which is the right way round. Copy-and-paste is how that
+      # gets inverted, so it fails here.
+      #
+      # Asserted separately from the provenance scan above, not folded into
+      # it: a refusal for the wrong reason is not a pass, and these two
+      # exceptions have different remedies.
+      # ⚠️ ANCHORED WHOLE-LINE, AND IT FAILS CLOSED. The accepted form is
+      # exactly `keel_deployment_mode: production` and nothing else on the
+      # line — anything this check cannot read as precisely that is reported
+      # rather than waved through. A lookahead on the value looked tidier and
+      # quietly accepted `"development"` and `development  # temporary`.
+      #
+      # ⚠️ COLLECTED ONCE, ASSERTED ONCE, so the message can NAME THE LINE. The
+      # first version computed the offenders twice — once in `that:` and again
+      # in `fail_msg` — and the copy in the message silently produced nothing,
+      # because its continuation lines were indented deeper than the folded
+      # scalar's first line and YAML stopped folding them. The guard fired and
+      # reported an empty offender; one expression cannot disagree with itself.
+      # ⚠️ TWO WAYS THIS CHECK HAS ALREADY FAILED SILENTLY, BOTH FOUND BY
+      # PLANTING `keel_deployment_mode: development` IN linux_servers AND
+      # WATCHING IT PASS. Neither was visible by reading it.
+      #
+      #   1. CONTINUATION LINES MUST SIT AT THE BLOCK'S OWN INDENT. A folded
+      #      scalar only folds those; a line indented deeper is kept verbatim,
+      #      newlines and all. Lining the `|` up under the `{{` read better and
+      #      put raw newlines inside the expression — the fact came back as an
+      #      empty string, and `length` of "" is 0, so the check passed.
+      #
+      #   2. NO `split('\n')` HERE, DELIBERATELY. A block scalar does not
+      #      process backslash escapes, so `'\n'` arrives as a literal
+      #      backslash and an `n`. `split` is not a regex, so each file stayed
+      #      ONE string that no line pattern could match — again an empty list,
+      #      again a pass. Regex escapes are safe because `re` interprets them
+      #      itself, so the lines are found with `regex_findall` instead.
+      ansible.builtin.set_fact:
+        mode_offenders: >-
+          {{ inv_contents.results | default([])
+          | rejectattr('item.path', 'search', '/keel_dev/')
+          | map(attribute='content') | map('b64decode')
+          | map('regex_findall', '(?m)^[ \t]*keel_deployment_mode[ \t]*:.*$') | flatten
+          | reject('match', '^[ \t]*keel_deployment_mode[ \t]*:[ \t]*production[ \t]*$')
+          | map('trim') | list }}
+
+    - name: Only keel_dev may turn the production validator off
+      ansible.builtin.assert:
+        that:
+          - (mode_offenders | length) == 0
+        fail_msg: >-
+          An inventory outside keel_dev declares the deployment mode as
+          something other than plain `production`:
+          {{ mode_offenders | join(' / ') }} — only
+          inventory/group_vars/keel_dev/ may. Every other environment inherits
+          `production` from the role default by saying nothing, and is refused
+          in preflight until it has an identity provider, rather than quietly
+          running with the validator disabled.
+        success_msg: >-
+          No inventory outside keel_dev touches the deployment mode; the
+          production validator is intact everywhere else.
 
     - name: Done
       ansible.builtin.debug:

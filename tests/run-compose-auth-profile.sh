@@ -81,25 +81,29 @@ fi
 
 # ── Render the role's env file and the overlay, for one auth profile ───────
 render_profile() {
-  local methods=$1 oidc=$2 dir="$WORK/$3"
+  local methods=$1 oidc=$2 dir="$WORK/$3" mode=${4:-production}
   mkdir -p "$dir"
   cp "$WORK/compose.lab.yml" "$dir/compose.lab.yml"
   KEEL_AUTH_METHODS_OVERRIDE="$methods" KEEL_OIDC_OVERRIDE="$oidc" \
   ansible-playbook tests/compose-render.yml \
     -e "render_dir=$dir" -e "auth_methods=$methods" -e "want_oidc=$oidc" \
+    -e "deployment_mode=$mode" \
     > "$dir/render.log" 2>&1
   return $?
 }
 
 # Inspect the rendered, MERGED compose config for one service.
 #
-# The overlay is added ONLY when it exists, mirroring `keel_compose_cmd`: in
-# password-only mode the role renders none, and naming a missing file would make
-# this suite test a configuration the deployment never assembles.
+# Each overlay is added ONLY when it exists, mirroring `keel_compose_cmd`: in
+# password-only production mode the role renders neither, and naming a missing
+# file would make this suite test a configuration the deployment never
+# assembles. Compose applies them in -f order, so the later file wins a key —
+# which is how the dev-mode overlay overrides the base stack's KEEL_ENV.
 env_keys_for() {
   local dir=$1 svc=$2
   local files=(-f compose.lab.yml)
   [ -f "$dir/compose.auth-profile.yml" ] && files+=(-f compose.auth-profile.yml)
+  [ -f "$dir/compose.dev-mode.yml" ] && files+=(-f compose.dev-mode.yml)
   ( cd "$dir" && KEEL_IMAGE=keel:test KEEL_WEB_IMAGE=keelweb:test \
       docker compose --env-file keel.env "${files[@]}" config --format json 2>/dev/null ) \
   | python3 -c "
@@ -135,6 +139,11 @@ done
 
 # The posture variables must still ARRIVE WITH THEIR VALUES. An overlay that made
 # these pass-through too would be the same defect wearing the fix's clothes.
+# ⚠️ `KEEL_ENV='production'` HERE IS A STATEMENT ABOUT THE BASE STACK, NOT AN
+# ENDORSEMENT OF THE COMBINATION. production + password-only is refused in
+# preflight (tests/deployment-mode.yml) because Keel cannot boot it; what this
+# asserts is that the base supplies `production` and no overlay is secretly
+# changing it. Section 7 renders the overlay that does.
 gw=$(env_keys_for "$WORK/pw" gateway)
 for expect in "KEEL_AUTH_METHODS='password'" "KEEL_ALLOW_PUBLIC_REGISTRATION='false'" "KEEL_ENV='production'"; do
   if printf '%s\n' "$gw" | grep -qF "$expect"; then
@@ -266,9 +275,64 @@ else
   bad "one keel_compose_cmd definition" "found $(grep -c '^keel_compose_cmd:' roles/keel/defaults/main.yml)"
 fi
 
+# ── 7. The dev-mode overlay actually reaches the container's KEEL_ENV ─────
+#
+# ⚠️ THE MERGED CONFIG, NOT THE FILE. That the role renders an overlay and
+# names it in `keel_compose_cmd` is proved in tests/deployment-mode.yml — but
+# both can be true while the container still runs `production`, because the
+# base stack sets KEEL_ENV too and the winner is decided by Compose's own merge
+# rules, not by anything Ansible can see. The 2026-10-01 outage was a gateway
+# that crash-looped on exactly this variable; a check that stops at the file on
+# disk would have reported the fix as working.
+echo
+echo "── 7. development mode — KEEL_ENV reaches every service as development ──"
+render_profile password no devmode development \
+  || die "rendering the development profile failed; see $WORK/devmode/render.log"
+
+if [ -f "$WORK/devmode/compose.dev-mode.yml" ]; then
+  ok "development renders compose.dev-mode.yml"
+else
+  bad "development renders the overlay" "no compose.dev-mode.yml was written"
+fi
+
+# Every service that carries the auth posture must carry the mode too. A
+# gateway in development behind a bootstrap in production is a migration run
+# under one set of rules and served under another.
+for svc in gateway bootstrap runtime-worker; do
+  line=$(env_keys_for "$WORK/devmode" "$svc" | grep "^KEEL_ENV=" || true)
+  if printf '%s' "$line" | grep -qx "KEEL_ENV='development'"; then
+    ok "$svc: KEEL_ENV='development' survives the merge"
+  else
+    bad "$svc: KEEL_ENV='development'" "got: ${line:-ABSENT} — the base stack's value won"
+  fi
+done
+
+# ⚠️ AND THE MODE MUST NOT DRAG ANYTHING ELSE WITH IT. The overlay exists to
+# change one variable. If it also turned dev login on, the "development" label
+# would be hiding a password-free front door — which is the one thing the
+# inventory comment promises it does not do.
+dev_gw=$(env_keys_for "$WORK/devmode" gateway)
+if printf '%s\n' "$dev_gw" | grep -q "^KEEL_ALLOW_DEV_LOGIN='true'"; then
+  bad "dev mode does not enable dev login" "KEEL_ALLOW_DEV_LOGIN arrived true"
+else
+  ok "dev mode leaves KEEL_ALLOW_DEV_LOGIN alone"
+fi
+if printf '%s\n' "$dev_gw" | grep -qx "KEEL_AUTH_METHODS='password'"; then
+  ok "dev mode leaves the auth methods alone"
+else
+  bad "dev mode leaves the auth methods alone" \
+      "got: $(printf '%s\n' "$dev_gw" | grep '^KEEL_AUTH_METHODS=' || echo ABSENT)"
+fi
+if [ "$(env_keys_for "$WORK/devmode" gateway | grep -c '^KEEL_OIDC_' || true)" = "0" ]; then
+  ok "dev mode introduces no KEEL_OIDC_* key"
+else
+  bad "dev mode introduces no KEEL_OIDC_* key" \
+      "$(env_keys_for "$WORK/devmode" gateway | grep '^KEEL_OIDC_' | tr '\n' ' ')"
+fi
+
 echo
 if [ "$fail" -gt 0 ]; then
   echo "FAILED: $fail of $((pass + fail)) checks." >&2
   exit 1
 fi
-echo "PASS — $pass checks: password-only renders and RUNS with zero KEEL_OIDC_* keys, the posture variables keep their values, oidc mode requires and passes all three, and no compose invocation bypasses the overlay."
+echo "PASS — $pass checks: password-only renders and RUNS with zero KEEL_OIDC_* keys, the posture variables keep their values, oidc mode requires and passes all three, development mode's KEEL_ENV survives the merge without changing anything else, and no compose invocation bypasses the overlay."

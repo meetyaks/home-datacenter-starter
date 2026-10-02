@@ -35,6 +35,20 @@
       ansible.builtin.set_fact:
         keel_auth_methods: "{{ auth_methods }}"
 
+    # ⚠️ `set_fact`, AND THAT IS WHAT MAKES THE DERIVATION REAL. The defaults
+    # loaded above define `keel_dev_mode_selected` as an expression over
+    # `keel_deployment_mode`, and set_fact outranks include_vars — so setting
+    # the mode here re-derives the role's OWN selection rather than restating
+    # it. A task `vars:` block would be outranked and silently ignored.
+    #
+    # ⚠️ IT DOES NOT RUN assert-deployment-mode.yml, deliberately. That gate
+    # refuses production + password-only, which is exactly the profile section
+    # 1 has to render in order to prove the base stack's KEEL_ENV. This play
+    # renders; the gate is proved in tests/deployment-mode.yml.
+    - name: Select the deployment mode under test
+      ansible.builtin.set_fact:
+        keel_deployment_mode: "{{ deployment_mode | default('production') }}"
+
     # ── The oidc inputs, per case ──
     #
     #   yes             a complete, non-self-referential provider
@@ -83,3 +97,22 @@
         path: "{{ render_dir }}/compose.auth-profile.yml"
         state: absent
       when: not (keel_oidc_selected | bool)
+
+    # ── The dev-mode overlay, on the same conditional pair ──
+    #
+    # Mirrors roles/keel/tasks/deploy.yml exactly, including the removal: a
+    # host that moves from development back to production must LOSE the file,
+    # not merely stop having it named. One left behind is a stack running with
+    # the production validator off while the inventory says otherwise.
+    - name: Render the dev-mode overlay (development only)
+      ansible.builtin.template:
+        src: ../roles/keel/templates/compose.dev-mode.yml.j2
+        dest: "{{ render_dir }}/compose.dev-mode.yml"
+        mode: "0644"
+      when: keel_dev_mode_selected | bool
+
+    - name: Remove a stale dev-mode overlay when production
+      ansible.builtin.file:
+        path: "{{ render_dir }}/compose.dev-mode.yml"
+        state: absent
+      when: not (keel_dev_mode_selected | bool)

@@ -1,0 +1,61 @@
+---
+# One case for tests/deployment-mode.yml. Runs the ROLE'S OWN
+# assert-deployment-mode.yml with a given mode and sign-in profile.
+
+- name: "{{ case.name }} — run the role's own check"
+  block:
+    - name: "{{ case.name }} — include assert-deployment-mode.yml"
+      ansible.builtin.include_tasks: ../roles/keel/tasks/assert-deployment-mode.yml
+      vars:
+        keel_deployment_mode: "{{ case.mode }}"
+        keel_auth_methods: "{{ case.auth }}"
+        # ⚠️ DERIVED THE SAME WAY THE ROLE DERIVES IT, from the declared
+        # methods — not asserted independently. A case that set
+        # `keel_oidc_selected` by hand could claim a profile the role would
+        # never produce, and the check would be tested against fiction.
+        keel_oidc_selected: >-
+          {{ 'oidc' in (case.auth | split(',') | map('trim') | list) }}
+        keel_dev_mode_selected: "{{ case.mode != 'production' }}"
+
+    - name: "{{ case.name }} — it was accepted"
+      ansible.builtin.set_fact:
+        mode_result: accepted
+        mode_error: ""
+
+  rescue:
+    - name: "{{ case.name }} — it was refused"
+      ansible.builtin.set_fact:
+        mode_result: refused
+        mode_error: >-
+          {{ (ansible_failed_result.msg | default('')) ~ ' | ' ~
+             (ansible_failed_result.results | default([])
+              | selectattr('failed', 'defined') | selectattr('failed')
+              | map(attribute='msg') | join(' | ')) }}
+
+- name: "{{ case.name }} — the outcome is the expected one"
+  ansible.builtin.assert:
+    that:
+      - mode_result == case.expect
+    fail_msg: >-
+      {{ case.name }}: expected the role to {{ case.expect[:-1] }} mode
+      "{{ case.mode }}" with methods "{{ case.auth }}", but it was
+      {{ mode_result }}.
+      {{ ('The refusal said: ' ~ mode_error) if mode_result == 'refused'
+         else 'It was accepted — so a deployment that cannot start would have
+               proceeded through migrations before anything noticed.' }}
+    success_msg: "{{ case.name }} → {{ mode_result }}"
+
+- name: "{{ case.name }} — and refused for its own reason"
+  # ⚠️ A REFUSAL FOR THE WRONG REASON IS NOT A PASS. "unrecognised mode" and
+  # "production needs a provider" are different faults with different fixes,
+  # and an operator acts on the message rather than on the exit code.
+  ansible.builtin.assert:
+    that:
+      - mode_error is search(case.because)
+    fail_msg: >-
+      {{ case.name }}: refused, but for the wrong reason. Expected a message
+      matching /{{ case.because }}/ and got: {{ mode_error }}
+    success_msg: "{{ case.name }} → refused because {{ case.because }}"
+  when:
+    - case.expect == 'refused'
+    - case.because is defined

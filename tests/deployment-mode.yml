@@ -1,0 +1,120 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE COMBINATION THAT CANNOT BOOT IS REFUSED BEFORE ANYTHING IS CHANGED.
+#
+#   ansible-playbook tests/deployment-mode.yml
+#
+# ⚠️ WHAT THIS IS ACTUALLY GUARDING. On 2026-10-01 a DEV deployment ran to
+# completion through image pull, bundle verification and MIGRATIONS, and then
+# the gateway crash-looped:
+#
+#   InsecureProductionConfigError: OIDC configuration is required in
+#   production but is incomplete
+#
+# leaving a migrated database behind a gateway that never served. Every fact
+# needed to predict that was available before a single container was
+# touched: the mode was `production`, the sign-in methods were `password`,
+# and Keel requires OIDC in production unless a dev-only toggle is on —
+# which production forbids.
+#
+# So roles/keel refuses it in preflight. These cases hold that refusal
+# honest, in both directions: it must fire on the impossible combination,
+# and it must NOT fire on the three that work.
+#
+# ⚠️ IT RUNS roles/keel/tasks/assert-deployment-mode.yml ITSELF. Nothing here
+# restates a condition — a harness with its own copy would pass against a
+# rule the role does not have.
+#
+# Controller-only: no host, no containers, no docker.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Deployment mode versus sign-in methods
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Load the role's real defaults
+      ansible.builtin.include_vars:
+        file: ../roles/keel/defaults/main.yml
+
+    - name: THE SHIPPED DEFAULT IS THE STRICT ONE
+      # ⚠️ SO A FUTURE PROD INHERITS IT BY EXISTING. An environment that says
+      # nothing gets `production` and is refused until it has a provider,
+      # rather than quietly running with the validator off.
+      ansible.builtin.assert:
+        that:
+          - keel_deployment_mode == 'production'
+        fail_msg: >-
+          roles/keel/defaults/main.yml ships
+          keel_deployment_mode={{ keel_deployment_mode }}. The default must be
+          `production`, so that an environment which declares nothing gets the
+          validator rather than silently losing it.
+        success_msg: "Shipped default is production."
+
+    - name: Run every case
+      ansible.builtin.include_tasks: deployment-mode-case.yml
+      loop:
+        - name: production with oidc is accepted
+          mode: production
+          auth: "password,oidc"
+          expect: accepted
+
+        - name: PRODUCTION WITH PASSWORD-ONLY IS REFUSED
+          # The 2026-10-01 outage, as a test.
+          mode: production
+          auth: password
+          expect: refused
+          because: CANNOT START
+
+        - name: development with password-only is accepted
+          # What DEV actually declares.
+          mode: development
+          auth: password
+          expect: accepted
+
+        - name: development with oidc is accepted
+          # Not a useful combination, but not an invalid one — the mode only
+          # ever RELAXES, so it cannot make a working profile fail.
+          mode: development
+          auth: "password,oidc"
+          expect: accepted
+
+        - name: an unrecognised mode is refused
+          # ⚠️ FAIL CLOSED ON A TYPO. Keel reads an unrecognised KEEL_ENV as
+          # "no mode declared", which satisfies neither the production checks
+          # nor the development affordances — so `prod` must not be treated
+          # as production, nor fall through to permissive.
+          mode: prod
+          auth: password
+          expect: refused
+          because: does not understand
+
+        - name: an empty mode is refused
+          mode: ""
+          auth: password
+          expect: refused
+          because: does not understand
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    # ── AND THE OVERLAY FOLLOWS THE MODE ────────────────────────────────────
+
+    - name: The compose command names the dev-mode overlay only in dev mode
+      # Each case is a separate file because the override has to be a
+      # `set_fact` — see the header of deployment-mode-overlay-case.yml for
+      # why a task `vars:` block cannot work here.
+      ansible.builtin.include_tasks: deployment-mode-overlay-case.yml
+      loop:
+        - {mode: production, dev: false}
+        - {mode: development, dev: true}
+      loop_control:
+        loop_var: overlay_case
+        label: "{{ overlay_case.mode }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          production requires a provider and is refused without one;
+          development is accepted and names its overlay; a typo fails closed.

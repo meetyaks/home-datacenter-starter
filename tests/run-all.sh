@@ -89,6 +89,22 @@ echo "══ rendered auth posture (password-only, registration closed) ══�
 ansible-playbook tests/env-render.yml
 
 echo
+echo "══ deployment mode vs sign-in methods (9 checks) ══════════════════"
+# ⚠️ THE 2026-10-01 OUTAGE, AS A TEST. `production` + password-only has NO
+# valid configuration in Keel: the validator requires OIDC, and the dev-login
+# escape hatch it would otherwise accept is itself forbidden in production. The
+# deployment did not notice — it pulled, verified the bundle and APPLIED
+# MIGRATIONS, and only then did the gateway crash-loop, leaving a migrated
+# database behind a gateway that never served.
+#
+# Runs roles/keel/tasks/assert-deployment-mode.yml itself, in both directions:
+# the impossible combination must be refused in preflight, the three workable
+# ones must not be, and a typo must fail closed rather than fall through to
+# permissive. No mutation runner needed — the refusal cases ARE the proof that
+# the guard fires, since a guard that stopped firing would fail them.
+ansible-playbook tests/deployment-mode.yml
+
+echo
 echo "══ enrollment operator path (19 checks, executes the play) ═════════"
 # ⚠️ EXECUTES the play against a local stand-in host — never dc1-x86. The email
 # validator shipped rejecting EVERY valid address and passed --syntax-check,
