@@ -1,0 +1,202 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# EVERY CONDITIONAL IN roles/coredns IS A STRING, NOT A MAPPING.
+#
+#   ansible-playbook tests/dns-task-shape.yml
+#
+# ⚠️ WHAT THIS IS GUARDING, AND WHY NOTHING ELSE COULD HAVE CAUGHT IT.
+#
+# The third watched deployment reached the LAST task of the primary — CoreDNS
+# installed, launchd daemon running, every record already resolving — and then
+# died on an assertion that had never been executed anywhere:
+#
+#   TASK [coredns : Confirm it is refused by this zone's own authority]
+#   Conditional expressions must be strings.
+#   roles/coredns/tasks/verify.yml:74
+#
+# The item read:
+#
+#   - coredns_reserved.stdout is search('status: NXDOMAIN')
+#
+# `status: ` is a colon followed by a space, so YAML parsed the whole item as
+# a MAPPING rather than a string:
+#
+#   {"coredns_reserved.stdout is search('status": "NXDOMAIN')"}
+#
+# and Ansible refuses a non-string conditional outright.
+#
+# ⚠️ THE TESTS COULD NOT HAVE FOUND IT, AND THAT IS THE REAL GAP. Every other
+# DNS suite is controller-only: they render templates and parse install.yml,
+# but NOTHING executes roles/coredns/tasks/verify.yml, because running it
+# needs a host with a live resolver on port 53. A task file that is never
+# executed and never shape-checked is a file where a YAML-level defect waits
+# until a deployment finds it — which is precisely what happened, twice over,
+# on the most expensive possible surface.
+#
+# So this checks the SHAPE of every conditional in the role, statically. It
+# cannot prove the logic is right; it proves Ansible will accept the file at
+# all.
+#
+# ⚠️ SCOPED TO roles/coredns ON PURPOSE. The same trap exists elsewhere in
+# this repository — roles/keel/tasks/backup.yml and restore.yml currently
+# carry `cmd: {{ keel_compose_cmd }} down`, an unquoted Jinja scalar that is
+# not valid YAML at all — but fixing those is a separate change against a
+# different role, and widening this suite to cover them would make it red on
+# `main` for a reason this PR did not introduce. Recorded here so it is not
+# rediscovered as a surprise.
+#
+# Controller-only: parses files, connects to nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Conditionals in roles/coredns are strings
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Find the role's task and handler files
+      ansible.builtin.find:
+        paths:
+          - ../roles/coredns/tasks
+          - ../roles/coredns/handlers
+        patterns: "*.yml"
+      register: role_files
+
+    - name: There are files to check
+      # ⚠️ A SUITE THAT SILENTLY SCANNED NOTHING WOULD PASS FOREVER. If the
+      # glob breaks — a renamed directory, a moved role — this says so instead
+      # of reporting a clean run over an empty list.
+      ansible.builtin.assert:
+        that:
+          - (role_files.files | length) >= 8
+        fail_msg: >-
+          Found only {{ role_files.files | length }} task/handler files under
+          roles/coredns. Expected at least 8 — the glob is probably wrong, and
+          a shape check that scans nothing passes for the wrong reason.
+        success_msg: "{{ role_files.files | length }} task/handler files to check."
+
+    - name: Parse them all
+      # from_yaml, so comments are irrelevant and the structure is what Ansible
+      # itself will see.
+      #
+      # ⚠️ WRAPPED IN A RESCUE SO AN UNPARSEABLE FILE SAYS SO. A file that is
+      # not valid YAML at all makes `from_yaml` raise inside the template, and
+      # Ansible surfaces that as
+      #
+      #   can only concatenate list (not "CapturedExceptionMarker") to list
+      #
+      # which names neither the file nor the problem. That is not hypothetical
+      # — a `when:` scalar containing ": " is a hard parse error rather than a
+      # mapping, and this suite's own mutation produced exactly that message
+      # before the rescue was added.
+      block:
+        - name: Read and parse each task file
+          ansible.builtin.set_fact:
+            all_tasks: >-
+              {{ all_tasks | default([]) + (lookup('file', item.path) | from_yaml | default([], true)) }}
+            last_parsed: "{{ item.path }}"
+          loop: "{{ role_files.files }}"
+          loop_control:
+            label: "{{ item.path | basename }}"
+
+      rescue:
+        - name: Say which file could not be parsed
+          ansible.builtin.fail:
+            msg: >-
+              A task file under roles/coredns is not valid YAML and Ansible
+              could not read it. The last file parsed successfully was
+              "{{ last_parsed | default('(none — the first file failed)') }}",
+              so the offender is the next one in this list:
+              {{ role_files.files | map(attribute='path') | map('basename') | join(', ') }}.
+              A common cause is a `when:` or `cmd:` scalar containing ": " or
+              starting with "{{ '{{' }}" — both need quoting. Underlying error:
+              {{ ansible_failed_result.msg | default('(none)') }}
+
+    - name: Collect every conditional expression they contain
+      # ⚠️ `that` IS A MODULE PARAMETER, NOT A TASK KEY, so it is reached by
+      # subscript under the assert module. `when`, `failed_when` and
+      # `changed_when` are task keys. All four are refused by Ansible if they
+      # are not strings, so all four are collected.
+      ansible.builtin.set_fact:
+        conditionals: >-
+          {{ conditionals | default([])
+             + [ item['ansible.builtin.assert']['that'] | default([]) ]
+             + [ item.when | default([]) ]
+             + [ item.failed_when | default([]) ]
+             + [ item.changed_when | default([]) ] }}
+      loop: "{{ all_tasks }}"
+      loop_control:
+        label: "{{ item.name | default('(unnamed)') }}"
+
+    - name: Name the ones YAML turned into mappings
+      ansible.builtin.set_fact:
+        mapping_conditionals: "{{ conditionals | flatten | select('mapping') | list }}"
+
+    - name: NO CONDITIONAL IS A MAPPING
+      # ⚠️ THE EXACT FAILURE, AS A TEST. A mapping here means some item
+      # contains ": " unquoted, and Ansible will refuse the task at runtime
+      # with "Conditional expressions must be strings" — on a host, mid-play,
+      # after earlier tasks have already changed things.
+      ansible.builtin.assert:
+        that:
+          - (mapping_conditionals | length) == 0
+        fail_msg: >-
+          {{ mapping_conditionals | length }} conditional expression(s) in
+          roles/coredns parse as MAPPINGS rather than strings:
+          {{ mapping_conditionals | map('to_json') | join('  ') }}
+          An item containing ": " must be quoted — and single-quoted, because
+          a double-quoted YAML scalar would eat backslash escapes like \b.
+          Ansible refuses a non-string conditional with "Conditional
+          expressions must be strings".
+        success_msg: >-
+          All {{ conditionals | flatten | length }} conditional expressions are
+          strings.
+
+    - name: NO CONDITIONAL CONTAINS A CONTROL CHARACTER
+      # ⚠️ THE OTHER HALF OF THE SAME TRAP, AND THE QUIETER ONE. Quoting the
+      # item fixes the mapping problem — but quoting it with DOUBLE quotes
+      # introduces a different defect, because a double-quoted YAML scalar
+      # processes backslash escapes. `search("flags:[^;]*\baa\b")` then
+      # reaches Ansible with two literal BACKSPACE characters (0x08) where the
+      # word-boundary anchors were meant to be, and the expression stops
+      # matching anything.
+      #
+      # That failure is worse than the one it replaces: the file parses, the
+      # task runs, and the assertion simply never matches — a check that looks
+      # present and tests nothing. Single quotes pass backslashes through, and
+      # this proves it stayed that way.
+      #
+      # ⚠️ THE PATTERN IS `[^ -~]` — printable ASCII, space through tilde —
+      # chosen because it needs NO backslash escapes of its own. A class
+      # written with \x00-\x1f would itself depend on how the escape survives
+      # YAML and Jinja, which is the very thing being tested.
+      ansible.builtin.assert:
+        that:
+          - (conditionals | flatten | select('string')
+             | select('search', '[^ -~]') | list | length) == 0
+        fail_msg: >-
+          A conditional contains a non-printable character, almost certainly a
+          backslash escape eaten by a double-quoted YAML scalar (\b → 0x08):
+          {{ conditionals | flatten | select('string')
+             | select('search', '[^ -~]') | map('to_json') | join('  ') }}
+          Use single quotes around conditionals that contain regex escapes.
+        success_msg: "No conditional carries a mangled escape."
+
+    - name: Every task file is a list of tasks Ansible can read
+      # A file that parses as something other than a list of mappings is not a
+      # task file, however valid its YAML.
+      ansible.builtin.assert:
+        that:
+          - (all_tasks | length) > 0
+          - (all_tasks | reject('mapping') | list | length) == 0
+        fail_msg: >-
+          Some entry in roles/coredns' task files is not a task mapping:
+          {{ all_tasks | reject('mapping') | list | map('to_json') | join('  ') }}
+        success_msg: "{{ all_tasks | length }} tasks, all well-formed."
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          {{ role_files.files | length }} files, {{ all_tasks | length }} tasks,
+          {{ conditionals | flatten | length }} conditionals — all strings, so
+          Ansible will accept every one of them.

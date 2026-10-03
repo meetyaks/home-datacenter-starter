@@ -22,6 +22,7 @@ COREFILE=roles/coredns/templates/Corefile.j2
 ZONE=roles/coredns/templates/db.zone.j2
 HOSTS=inventory/hosts.yml
 INSTALL=roles/coredns/tasks/install.yml
+VERIFY=roles/coredns/tasks/verify.yml
 
 WORK=$(mktemp -d -t dns-mutations.XXXXXX)
 restore() {
@@ -30,6 +31,7 @@ restore() {
   [ -f "$WORK/zone" ] && cp "$WORK/zone" "$ZONE"
   [ -f "$WORK/hosts" ] && cp "$WORK/hosts" "$HOSTS"
   [ -f "$WORK/install" ] && cp "$WORK/install" "$INSTALL"
+  [ -f "$WORK/verify" ] && cp "$WORK/verify" "$VERIFY"
 }
 cleanup() { restore; rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
@@ -39,6 +41,7 @@ cp "$COREFILE" "$WORK/corefile"
 cp "$ZONE" "$WORK/zone"
 cp "$HOSTS" "$WORK/hosts"
 cp "$INSTALL" "$WORK/install"
+cp "$VERIFY" "$WORK/verify"
 
 pass=0
 fail=0
@@ -106,7 +109,7 @@ fi
 
 echo
 echo "── the suites are green before anything is broken ──"
-for s in dns-zone dns-services dns-inventory dns-install-platform; do
+for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
     ok "tests/${s}.yml is green"
   else
@@ -355,11 +358,51 @@ expect_red dns-install-platform.yml 'it must be first|only moves the failure' \
            "creating the directories too late is caught"
 
 echo
+echo "── conditionals Ansible will actually accept ──"
+# ⚠️ THE THIRD dc1-arm-1 FAILURE, AND THE MOST EXPENSIVE SURFACE IT COULD HAVE
+# BEEN FOUND ON. The deployment reached the LAST task of the primary — CoreDNS
+# installed, launchd running, every record already resolving — and died with
+# "Conditional expressions must be strings", because an unquoted `that:` item
+# containing ": " is parsed by YAML as a mapping. No controller-only suite
+# executes verify.yml, so nothing had ever looked at it.
+restore
+
+# 1. The regression itself: drop the quotes back off.
+perl -0pi -e "s{- 'coredns_reserved\.stdout is search\(\"status: NXDOMAIN\"\)'}{- coredns_reserved.stdout is search('status: NXDOMAIN')}" "$VERIFY"
+expect_red dns-task-shape.yml 'parse as MAPPINGS rather than strings|must be quoted' \
+           "an unquoted conditional containing \": \" is caught"
+
+# 2. The quieter half: quoted, but with DOUBLE quotes, so YAML eats the \b
+#    escapes and the word-boundary anchors become literal backspaces. The file
+#    parses, the task runs, and the assertion silently matches nothing.
+restore
+perl -0pi -e "s{- 'coredns_reserved\.stdout is search\(\"flags:\[\^;\]\*\\\\baa\\\\b\"\)'}{- \"coredns_reserved.stdout is search('flags:[^;]*\\\\baa\\\\b')\"}" "$VERIFY"
+expect_red dns-task-shape.yml 'non-printable character|eaten by a double-quoted' \
+           "a double-quoted conditional whose escapes are eaten is caught"
+
+# 3. The same trap in a `when:` rather than a `that:` — both are refused by
+#    Ansible, so both are collected. List form, which yields a mapping item
+#    exactly as the `that:` case did.
+restore
+perl -0pi -e 's{(- name: Give the daemon a moment to bind\n)}{$1  when:\n    - coredns_zone is search(\x27dc1: lan\x27)\n}' "$VERIFY"
+expect_red dns-task-shape.yml 'parse as MAPPINGS rather than strings' \
+           "the same trap in a when: clause is caught"
+
+# 4. A task file that is not valid YAML at all. A SCALAR `when:` containing
+#    ": " is a hard parse error rather than a mapping, and the suite used to
+#    report it as "can only concatenate list (not CapturedExceptionMarker)" —
+#    naming neither the file nor the cause.
+restore
+perl -0pi -e 's{(- name: Give the daemon a moment to bind\n)}{$1  when: coredns_zone is search(\x27dc1: lan\x27)\n}' "$VERIFY"
+expect_red dns-task-shape.yml 'not valid YAML and Ansible could not read it' \
+           "an unparseable task file is reported by name, not as a template error"
+
+echo
 echo "── everything is restored ──"
 restore
 cp "$WORK/plist" "$PLIST"
 cp "$WORK/unit" "$UNIT"
-for s in dns-zone dns-services dns-inventory dns-install-platform; do
+for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
     ok "tests/${s}.yml is green again"
   else

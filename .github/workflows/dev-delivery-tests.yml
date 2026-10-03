@@ -191,6 +191,17 @@ jobs:
       #    YAML, so it asserts on executable structure, not on comments, and
       #    runs happily on a Linux runner because it parses rather than
       #    executes.
+      # ⚠️ THE THIRD dc1-arm-1 FAILURE, AS A TEST. The deployment reached the
+      #    LAST task of the primary — CoreDNS installed, launchd running,
+      #    every record resolving — and died on "Conditional expressions must
+      #    be strings", because an unquoted `that:` item containing ": " is
+      #    parsed by YAML as a mapping. No controller-only suite EXECUTES
+      #    roles/coredns/tasks/verify.yml, so nothing had ever looked at it.
+      #    This checks the shape of every conditional in the role statically,
+      #    which is the only thing CI can do for a file it cannot run.
+      - name: LAN DNS — task shape, conditionals Ansible will accept
+        run: ansible-playbook tests/dns-task-shape.yml
+
       - name: LAN DNS — the macOS/Linux extraction split
         run: ansible-playbook tests/dns-install-platform.yml
 
