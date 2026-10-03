@@ -28,7 +28,7 @@ echo "══ LAN DNS — the two service definitions (24 checks) ═════
 ansible-playbook tests/dns-services.yml
 
 echo
-echo "══ LAN DNS — the macOS/Linux extraction split (17 checks) ═════════"
+echo "══ LAN DNS — install path: directories + extraction (24 checks) ═══"
 # ⚠️ A REAL DEPLOYMENT DIED ON THIS. The first watched run from dc1-arm-1
 # stopped on the primary, before dc1-x86 was touched:
 #
