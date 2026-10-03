@@ -28,6 +28,15 @@ echo "══ LAN DNS — the two service definitions (24 checks) ═════
 ansible-playbook tests/dns-services.yml
 
 echo
+echo "══ LAN DNS — task shape: Ansible will accept every conditional ════"
+# ⚠️ THE THIRD dc1-arm-1 FAILURE, AS A TEST. The deployment reached the LAST
+# task of the primary — CoreDNS installed, every record resolving — and died
+# on "Conditional expressions must be strings": an unquoted `that:` item
+# containing ": " is parsed by YAML as a mapping. NOTHING controller-only
+# executes verify.yml, so nothing had ever looked at it. This checks the shape
+# of every conditional in the role statically.
+ansible-playbook tests/dns-task-shape.yml
+
 echo "══ LAN DNS — install path: directories + extraction (24 checks) ═══"
 # ⚠️ A REAL DEPLOYMENT DIED ON THIS. The first watched run from dc1-arm-1
 # stopped on the primary, before dc1-x86 was touched:

@@ -69,10 +69,27 @@
   changed_when: false
 
 - name: Confirm it is refused by this zone's own authority
+  # ⚠️ BOTH ITEMS ARE QUOTED, AND THE FIRST ONE HAS TO BE. It reads
+  # `search('status: NXDOMAIN')` — and `status: ` is a colon followed by a
+  # space, so an UNQUOTED list item is parsed by YAML as a MAPPING, not a
+  # string:
+  #
+  #   {"coredns_reserved.stdout is search('status": "NXDOMAIN')"}
+  #
+  # Ansible then refuses the task outright with "Conditional expressions must
+  # be strings." That is exactly how the third watched deployment stopped, on
+  # the very last task of the primary, after CoreDNS had been installed and
+  # every record had already resolved correctly.
+  #
+  # ⚠️ SINGLE-QUOTED YAML WITH DOUBLE QUOTES INSIDE, NOT THE REVERSE. A
+  # double-quoted YAML scalar processes backslash escapes, so `\b` in the
+  # second item would become a literal backspace (0x08) and the word-boundary
+  # anchor would silently stop matching. Single quotes pass the backslashes
+  # through untouched.
   ansible.builtin.assert:
     that:
-      - coredns_reserved.stdout is search('status: NXDOMAIN')
-      - coredns_reserved.stdout is search('flags:[^;]*\baa\b')
+      - 'coredns_reserved.stdout is search("status: NXDOMAIN")'
+      - 'coredns_reserved.stdout is search("flags:[^;]*\baa\b")'
     fail_msg: >-
       keel.{{ coredns_zone }} did not come back as an AUTHORITATIVE NXDOMAIN.
       Either the reserved production name has been added to the zone, or this
