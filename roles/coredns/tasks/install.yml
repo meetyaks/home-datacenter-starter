@@ -1,7 +1,31 @@
 ---
 # The pinned binary, verified before it is installed.
 
-- name: Create the configuration and log directories
+- name: Create the directories this role installs into
+  # ⚠️ coredns_bin_dir IS IN THIS LOOP BECAUSE A CLEAN MAC DOES NOT HAVE IT.
+  # The second deployment attempt on dc1-arm-1 got all the way through the
+  # corrected Darwin extraction — tar succeeded, the binary was there, the
+  # isreg assertion passed, 73,452,546 bytes — and then:
+  #
+  #   TASK [coredns : Install it]
+  #   Destination directory /usr/local/sbin does not exist
+  #
+  # /usr/local/sbin is simply absent on a stock macOS install. Homebrew
+  # creates /usr/local/bin, nothing creates /usr/local/sbin, and `copy` will
+  # not create a missing parent. The role already owned two directories and
+  # assumed the third.
+  #
+  # ⚠️ FOLDED INTO THE EXISTING TASK RATHER THAN GIVEN ITS OWN. One task owns
+  # "the directories this role installs into", so the ownership and mode are
+  # stated once. A second task would be a second place to change when the
+  # group expression or the mode moves, and the two would drift.
+  #
+  # ⚠️ AND IT IS FIRST, WHICH IS LOAD-BEARING. Everything downstream — the
+  # installed-version check that runs `{{ coredns_bin_dir }}/coredns`, the
+  # extraction, the copy — assumes the directory is there. Creating it
+  # anywhere later would simply move the failure
+  # (enforced: tests/dns-install-platform.yml "the directories exist before
+  # anything reads or writes them").
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
@@ -11,6 +35,7 @@
   loop:
     - "{{ coredns_conf_dir }}"
     - "{{ coredns_log_dir }}"
+    - "{{ coredns_bin_dir }}"
   become: true
 
 - name: Create the service account

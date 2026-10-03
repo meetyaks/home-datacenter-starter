@@ -14,6 +14,19 @@ Installs CoreDNS as an authoritative resolver for `dc1.lan` on both LAN nodes �
 
 Step 5 is the one that matters. Everything before it proves the configuration was *written*; only a real query proves the daemon parsed it, bound its port and serves the zone — a Corefile that parses but serves nothing looks identical from the filesystem.
 
+## The role creates the directories it installs into
+
+Including **`coredns_bin_dir`**. A stock macOS has no `/usr/local/sbin` — Homebrew creates `/usr/local/bin`, nothing creates `/usr/local/sbin` — and `ansible.builtin.copy` will not create a missing destination. The second deployment attempt on dc1-arm-1 got through the corrected extraction and then stopped:
+
+```
+TASK [coredns : Install it]
+Destination directory /usr/local/sbin does not exist
+```
+
+One task owns all three directories (`coredns_conf_dir`, `coredns_log_dir`, `coredns_bin_dir`) so the ownership and mode are stated once: `state: directory`, `owner: root`, `mode: 0755`, group `wheel` on Darwin and `root` on Linux, with `become`. It is the **first** task in `install.yml`, because everything after it assumes the directories exist — the installed-version check runs `{{ coredns_bin_dir }}/coredns`, the download stages beside it, and the copy writes into it. Creating it later only moves the failure.
+
+`/usr/local/sbin` is on the default `PATH` and will hold a binary that runs as root, so root ownership and `0755` are load-bearing, not cosmetic.
+
 ## Unpacking is platform-split, and GNU tar was deliberately not installed
 
 The first watched deployment, run from dc1-arm-1, stopped on the primary before dc1-x86 was touched:

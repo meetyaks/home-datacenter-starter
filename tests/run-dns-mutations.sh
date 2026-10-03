@@ -300,6 +300,61 @@ expect_red dns-install-platform.yml 'must come before both extraction|checksum' 
            "dropping the download checksum is caught"
 
 echo
+echo "── the directories the role installs into ──"
+# ⚠️ THE SECOND dc1-arm-1 FAILURE. The corrected Darwin extraction worked —
+# tar succeeded, the binary was there, isreg passed at 73,452,546 bytes — and
+# the next task said "Destination directory /usr/local/sbin does not exist".
+# A stock macOS has no /usr/local/sbin and `copy` will not create one.
+restore
+
+# 1. The regression itself: the binary directory assumed rather than created.
+edit 's{^    - "\{\{ coredns_bin_dir \}\}"\n}{}' "$INSTALL"
+expect_red dns-install-platform.yml 'No directory task includes coredns_bin_dir|does not exist' \
+           "dropping coredns_bin_dir from the bootstrap loop is caught"
+
+# 2. A second task for it — one owner becomes two, and the mode and group
+#    then have two places to drift apart.
+restore
+perl -0pi -e 's{^    - "\{\{ coredns_bin_dir \}\}"\n}{}m;
+              s{(\n- name: Create the service account)}{\n- name: Create the binary directory separately\n  ansible.builtin.file:\n    path: "\{\{ coredns_bin_dir \}\}"\n    state: directory\n    owner: root\n    group: "\{\{ \x27wheel\x27 if coredns_is_darwin else \x27root\x27 \}\}"\n    mode: "0755"\n  become: true\n$1}s' "$INSTALL"
+expect_red dns-install-platform.yml 'exactly one directory-creating task|One task creates all three' \
+           "splitting the directories across two tasks is caught"
+
+# 3. A world-writable directory on the default PATH, holding a binary that
+#    runs as root.
+restore
+perl -0pi -e 's{(state: directory\n    owner: root\n    group: [^\n]*\n    mode: )"0755"}{$1"0777"}s' "$INSTALL"
+expect_red dns-install-platform.yml 'must be state=directory, owner=root, mode=0755|privilege-escalation' \
+           "a world-writable binary directory is caught"
+
+# 4. Not root-owned.
+restore
+perl -0pi -e 's{(state: directory\n    owner: )root}{$1nobody}s' "$INSTALL"
+expect_red dns-install-platform.yml 'must be state=directory, owner=root' \
+           "a non-root-owned binary directory is caught"
+
+# 5. The platform branches swapped — wrong on BOTH nodes, and the kind of
+#    thing that reads fine in review.
+restore
+edit "s{'wheel' if coredns_is_darwin else 'root'}{'root' if coredns_is_darwin else 'wheel'}" "$INSTALL"
+expect_red dns-install-platform.yml 'wheel on Darwin, root on Linux|must be exactly' \
+           "swapping the Darwin/Linux group is caught"
+
+# 6. The path hardcoded, so the Linux node inherits a macOS directory.
+restore
+edit 's{^    - "\{\{ coredns_bin_dir \}\}"$}{    - /usr/local/sbin}' "$INSTALL"
+expect_red dns-install-platform.yml 'hardcoded /usr/local|creates coredns_bin_dir' \
+           "hardcoding /usr/local/sbin is caught"
+
+# 7. Created, but too late — after the version check already tried to run
+#    the binary out of it. Moving the failure is not fixing it.
+restore
+perl -0pi -e 'my $d; s{(- name: Create the directories this role installs into.*?)(?=\n- name: Create the service account)}{$d = $1; ""}se;
+              s{(- name: Make a staging directory for the download)}{$d\n\n$1}s' "$INSTALL"
+expect_red dns-install-platform.yml 'it must be first|only moves the failure' \
+           "creating the directories too late is caught"
+
+echo
 echo "── everything is restored ──"
 restore
 cp "$WORK/plist" "$PLIST"
@@ -320,5 +375,5 @@ if [ "$fail" -gt 0 ]; then
 fi
 echo "PASS — $pass checks: every essential record, both checksums, the"
 echo "forwarding loop, LAN-only access, both service definitions and the"
-echo "macOS/Linux extraction split are proved to FAIL when broken, each for"
-echo "its own reason."
+echo "macOS/Linux extraction split and the install directories are proved to"
+echo "FAIL when broken, each for its own reason."

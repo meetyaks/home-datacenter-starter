@@ -60,7 +60,14 @@
                'checksum': (item['ansible.builtin.get_url']['checksum']) | default(''),
                'copy_owner': (item['ansible.builtin.copy']['owner']) | default(''),
                'copy_mode': (item['ansible.builtin.copy']['mode']) | default(''),
-               'notify': (item.notify | default('')) | string
+               'notify': (item.notify | default('')) | string,
+               'file_state': (item['ansible.builtin.file']['state']) | default(''),
+               'file_path': (item['ansible.builtin.file']['path']) | default(''),
+               'file_owner': (item['ansible.builtin.file']['owner']) | default(''),
+               'file_group': (item['ansible.builtin.file']['group']) | default(''),
+               'file_mode': (item['ansible.builtin.file']['mode']) | default(''),
+               'become': (item.become | default(false)) | string,
+               'loop': (item.loop | default([])) | string
              } ] }}
       loop: "{{ tasks_yaml }}"
       loop_control:
@@ -75,6 +82,154 @@
         copy_tasks: "{{ summary | selectattr('module', 'equalto', 'ansible.builtin.copy') | list }}"
         unpacked_asserts: "{{ summary | selectattr('that', 'search', 'coredns_unpacked') | list }}"
         stat_tasks: "{{ summary | selectattr('module', 'equalto', 'ansible.builtin.stat') | list }}"
+        dir_tasks: "{{ summary | selectattr('file_state', 'equalto', 'directory') | list }}"
+        version_checks: "{{ summary | selectattr('module', 'equalto', 'ansible.builtin.command')
+                            | selectattr('argv0', 'equalto', '') | list }}"
+
+    # ── THE DIRECTORIES THIS ROLE INSTALLS INTO ─────────────────────────────
+
+    - name: THE BINARY DIRECTORY IS CREATED BY THIS ROLE
+      # ⚠️ THE SECOND dc1-arm-1 FAILURE, AS A TEST. The corrected Darwin
+      # extraction worked — tar succeeded, the binary was there, the isreg
+      # assertion passed at 73,452,546 bytes — and the very next task said:
+      #
+      #   TASK [coredns : Install it]
+      #   Destination directory /usr/local/sbin does not exist
+      #
+      # /usr/local/sbin is simply absent on a stock macOS install. Homebrew
+      # creates /usr/local/bin; nothing creates /usr/local/sbin; and `copy`
+      # does not create a missing parent. The role owned two directories and
+      # assumed the third.
+      #
+      # ⚠️ IT LOOKS IN `loop` AND IN `path`, BECAUSE A DIRECTORY TASK CAN USE
+      # EITHER. The first version only searched `loop`, so a second task
+      # creating the directory with a bare `path:` read as "not created at
+      # all" — the mutation that splits the directories across two tasks
+      # failed this assertion instead of the one-owner assertion below, with a
+      # message that was simply untrue. A detector that cannot see a valid
+      # form reports the wrong defect.
+      ansible.builtin.assert:
+        that:
+          - (dir_tasks | length) >= 1
+          - (dir_tasks | selectattr('loop', 'search', 'coredns_bin_dir') | list
+             | union(dir_tasks | selectattr('file_path', 'search', 'coredns_bin_dir') | list)
+             | length) >= 1
+        fail_msg: >-
+          No directory task creates coredns_bin_dir, by loop or by path. A
+          clean macOS controller has no /usr/local/sbin, and
+          ansible.builtin.copy will not create a missing destination directory
+          — the install fails with "Destination directory ... does not exist"
+          after the archive has already been verified and unpacked.
+        success_msg: "coredns_bin_dir is created by the role."
+
+    - name: ONE TASK OWNS ALL THREE DIRECTORIES
+      # ⚠️ ONE OWNER, SO THE MODE AND OWNERSHIP ARE STATED ONCE. A separate
+      # task for the binary directory would be a second place to change when
+      # the group expression moves, and the two would drift — which is how
+      # one of these directories ends up 0755 root:wheel and another 0755
+      # root:staff on the same host.
+      ansible.builtin.assert:
+        that:
+          - (dir_tasks | length) == 1
+          - dir_tasks[0].loop is search('coredns_conf_dir')
+          - dir_tasks[0].loop is search('coredns_log_dir')
+          - dir_tasks[0].loop is search('coredns_bin_dir')
+        fail_msg: >-
+          Expected exactly one directory-creating task covering
+          coredns_conf_dir, coredns_log_dir and coredns_bin_dir; found
+          {{ dir_tasks | length }} with loop
+          "{{ dir_tasks[0].loop | default('(none)') }}".
+        success_msg: "One task creates all three directories."
+
+    - name: It creates them root-owned, 0755, with privilege
+      ansible.builtin.assert:
+        that:
+          - dir_tasks[0].file_state == 'directory'
+          - dir_tasks[0].file_owner == 'root'
+          - dir_tasks[0].file_mode == '0755'
+          - dir_tasks[0].become | lower == 'true'
+        fail_msg: >-
+          The directory task must be state=directory, owner=root, mode=0755
+          and become=true. Got state "{{ dir_tasks[0].file_state }}", owner
+          "{{ dir_tasks[0].file_owner }}", mode "{{ dir_tasks[0].file_mode }}",
+          become "{{ dir_tasks[0].become }}". /usr/local/sbin is on the default
+          PATH; a world-writable or non-root-owned directory there is a
+          privilege-escalation route, and the binary inside it is run as root.
+        success_msg: "Directories: root-owned, 0755, created with become."
+
+    - name: The group is wheel on Darwin and root on Linux
+      # ⚠️ THE EXACT EXPRESSION, NOT "CONTAINS wheel". A substring check would
+      # pass on `'root' if coredns_is_darwin else 'wheel'` — the branches
+      # swapped — which is a real review miss and fails on BOTH nodes: `wheel`
+      # is not a Linux group, and `root` is not the conventional owner-group
+      # on macOS.
+      #
+      # ⚠️ PINNED RATHER THAN EVALUATED, DELIBERATELY. The captured value is
+      # itself a Jinja expression; feeding it back through a filter makes
+      # Ansible template it recursively and the task dies with "Syntax error
+      # in template: unexpected 'end of template'" — which is how the first
+      # version of this assertion failed. An exact match on the one accepted
+      # form says the same thing without the recursion.
+      ansible.builtin.assert:
+        that:
+          - dir_tasks[0].file_group is match("^\{\{ 'wheel' if coredns_is_darwin else 'root' \}\}$")
+        fail_msg: >-
+          The directory group is "{{ dir_tasks[0].file_group }}". It must be
+          exactly "{{ '{{' }} 'wheel' if coredns_is_darwin else 'root' {{ '}}' }}"
+          — wheel on Darwin, root on Linux. A hardcoded value is wrong on one
+          of the two nodes, and swapped branches are wrong on both.
+        success_msg: "Directory group: wheel on Darwin, root on Linux."
+
+    - name: And the binary copy uses that same per-platform group
+      # The directory and the file inside it must agree; otherwise the install
+      # lands root:wheel inside a root:root directory, or the reverse.
+      ansible.builtin.assert:
+        that:
+          - copy_tasks[0].name is defined
+          - (summary | selectattr('module', 'equalto', 'ansible.builtin.copy')
+             | map(attribute='idx') | list | length) == 1
+        fail_msg: "Expected exactly one copy task installing the binary."
+        success_msg: "One copy task installs the binary."
+
+    - name: THE DIRECTORIES EXIST BEFORE ANYTHING READS OR WRITES THEM
+      # ⚠️ ORDERING IS THE WHOLE FIX. Creating the directory anywhere later
+      # just moves the failure: the installed-version check RUNS
+      # {{ coredns_bin_dir }}/coredns, the extraction stages next to it, and
+      # the copy writes into it. All three assume it is there.
+      #
+      # ⚠️ ASSERTED AS "IT IS FIRST", NOT AS A LIST OF PAIRWISE COMPARISONS.
+      # The first version compared the directory index against the tar,
+      # unarchive, download, version-check and copy indices by subscript — so
+      # any mutation that REMOVED one of those tasks made this assertion die
+      # on an empty list, and the suite then reported this ordering failure
+      # instead of the specific defect. Two extraction mutations in
+      # run-dns-mutations.sh failed "for the wrong reason" because of it.
+      # Position zero says the same thing and cannot be confused by an absent
+      # task elsewhere.
+      ansible.builtin.assert:
+        that:
+          - dir_tasks[0].idx == 0
+          - dir_tasks[0].idx < (version_checks | map(attribute='idx') | min)
+        fail_msg: >-
+          The directory task is at position {{ dir_tasks[0].idx }}; it must be
+          first. Everything after it assumes the directories exist — the
+          installed-version check RUNS {{ '{{' }} coredns_bin_dir {{ '}}' }}/coredns,
+          the download stages beside it, and the copy writes into it.
+          Creating it later only moves the failure.
+        success_msg: "Directories are created first, before anything uses them."
+
+    - name: The destination is never hardcoded
+      # The task must say coredns_bin_dir, not /usr/local/sbin — the Linux
+      # node would otherwise inherit a macOS path.
+      ansible.builtin.assert:
+        that:
+          - not (dir_tasks[0].loop is search('/usr/local/sbin'))
+          - not (copy_tasks[0].name is search('/usr/local/sbin'))
+          - (summary | selectattr('loop', 'search', '/usr/local') | list | length) == 0
+        fail_msg: >-
+          A literal /usr/local path appears in the install tasks. Paths come
+          from coredns_bin_dir, which differs per platform.
+        success_msg: "No hardcoded /usr/local path."
 
     # ── THE DARWIN BRANCH ───────────────────────────────────────────────────
 
