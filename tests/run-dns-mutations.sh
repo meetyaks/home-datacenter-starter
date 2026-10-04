@@ -673,6 +673,12 @@ expect_red dns-harness-integrity.yml 'PRE-EXISTING DISPOSABLE STATE|contaminate 
            "a gate that builds its baseline on top of a stray is caught"
 
 restore
+# The lsof selection that reported every TCP-only port as closed.
+perl -0pi -e 's{    if sudo lsof -nP -iTCP:"\$p" -sTCP:LISTEN >/dev/null 2>&1 \\\n       \|\| sudo lsof -nP -iUDP:"\$p" >/dev/null 2>&1; then\n}{    if sudo lsof -nP -iTCP:"\$p" -sTCP:LISTEN -iUDP:"\$p" >/dev/null 2>&1; then\n}' "$GATE_SH"
+expect_red dns-harness-integrity.yml 'TCP and UDP separately|TCP-only port' \
+           "a port probe that reports TCP-only ports as closed is caught"
+
+restore
 # The teardown ownership race that spared a process which was in fact ours.
 perl -0pi -e 's{  for _p in \$\(pgrep -f "\$ROOT/sbin/coredns" 2>/dev/null\); do\n.*?^  \[ -n "\$DISPOSABLE_PID" \][^\n]*\n[^\n]*\n}{  if [ -n "\$DISPOSABLE_PID" ] \&\& kill -0 "\$DISPOSABLE_PID" 2>/dev/null; then\n    if ps -p "\$DISPOSABLE_PID" -o command= | grep -q "\$ROOT"; then\n      tsudo kill "\$DISPOSABLE_PID" 2>/dev/null \&\& echo "  killed disposable pid \$DISPOSABLE_PID"\n    else\n      echo "  pid \$DISPOSABLE_PID is no longer ours — NOT killing it"\n    fi\n  fi\n}ms' "$LAUNCHD"
 expect_red dns-harness-integrity.yml 'by prefix, not by a stale PID|no longer ours' \

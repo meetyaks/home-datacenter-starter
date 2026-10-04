@@ -219,6 +219,28 @@
           includes test state and reports it as live.
         success_msg: "A pre-existing stray refuses the run instead of poisoning the baseline."
 
+    - name: The port probe asks about TCP and UDP separately
+      # ⚠️ THE GATE CONTRADICTED ITSELF IN ITS OWN BASELINE:
+      #
+      #   listeners  ... TCP 127.0.0.1:8653; TCP 127.0.0.1:8654 ...
+      #   ports      53=open 8080=closed 8181=closed 8653=closed 8654=closed
+      #
+      # `lsof -iTCP:P -sTCP:LISTEN -iUDP:P` suppresses the TCP match once the
+      # UDP selection is added, so every TCP-ONLY port read as closed. Port
+      # 53 looked correct only because it also has a UDP listener — the one
+      # port in the list that could not reveal the bug.
+      ansible.builtin.assert:
+        that:
+          - gate is search('lsof -nP -iTCP:"\$p" -sTCP:LISTEN >/dev/null')
+          - gate is search('lsof -nP -iUDP:"\$p" >/dev/null')
+          - not (gate is search('-iTCP:"\$p" -sTCP:LISTEN -iUDP:"\$p"'))
+        fail_msg: >-
+          The port probe must query TCP-LISTEN and UDP in separate lsof
+          invocations. Combining them in one selection makes lsof report
+          every TCP-only port as closed, which contradicts the listener set
+          captured beside it.
+        success_msg: "The port probe asks about TCP and UDP separately."
+
     - name: Teardown identifies its processes by prefix, not by a stale PID
       # ⚠️ "pid N is no longer ours" MEANT TWO THINGS, AND ONE LEAKED. The
       # old check was `kill -0 $PID && ps -p $PID | grep $ROOT`. Between the

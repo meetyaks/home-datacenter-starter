@@ -172,9 +172,24 @@ b_plist=$(shasum -a 256 "$LIVE_PLIST"                | awk '{print $1}')
 b_state=$(sudo launchctl print "system/$LIVE_LABEL" 2>/dev/null | awk '/state = /{print $3; exit}')
 b_lsn=$(sudo lsof -nP -iTCP -sTCP:LISTEN -iUDP 2>/dev/null \
         | awk '$1 ~ /^coredns/ {print $8, $9}' | sort -u | tr '\n' ';')
+# ⚠️ TWO LOOKUPS, NOT ONE COMBINED SELECTION — AND THE GATE'S OWN OUTPUT
+# CAUGHT THIS. A passing run printed, from the same measurement:
+#
+#   listeners  ... TCP 127.0.0.1:8653; TCP 127.0.0.1:8654 ...
+#   ports      53=open 8080=closed 8181=closed 8653=closed 8654=closed
+#
+# Both cannot be true. `lsof -iTCP:P -sTCP:LISTEN -iUDP:P` suppresses the TCP
+# match when the UDP selection is added, so EVERY TCP-only port read as
+# closed. Port 53 looked right purely because it also has a UDP listener —
+# the one port that could not expose the bug.
+#
+# Reproduced and fixed by asking the two questions separately. This field is
+# diagnostic only; the authoritative listener set comes from the broad lsof
+# above, which is why the contradiction was visible rather than silent.
 ports_listen() {
   for p in 53 8080 8181 8653 8654; do
-    if sudo lsof -nP -iTCP:"$p" -sTCP:LISTEN -iUDP:"$p" >/dev/null 2>&1; then
+    if sudo lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 \
+       || sudo lsof -nP -iUDP:"$p" >/dev/null 2>&1; then
       printf '%s=open ' "$p"; else printf '%s=closed ' "$p"; fi
   done
 }
