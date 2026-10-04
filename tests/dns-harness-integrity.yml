@@ -136,6 +136,14 @@
           - linux is search('the image ships no ambient dig')
           - linux is search('the role installed dig before verification')
           - not (corefile is search('bind9-dnsutils'))
+          # ⚠️ AND IT ASKS dpkg, NOT THE RUN LOG. The first version grepped
+          # the log for "bind9-dnsutils", which Ansible prints only when the
+          # install FAILS and it quotes the package in the error. A
+          # successful run names the task, not the package — so the check was
+          # green for as long as the install was broken and went red on the
+          # run where it finally worked.
+          - linux is search('dpkg-query -s bind9-dnsutils')
+          - not (linux is search("grep -q 'bind9-dnsutils' /tmp/coredns"))
         fail_msg: >-
           tests/run-coredns-role.sh must assert the image has no dig BEFORE
           running the role, and that the role then supplies it. Without the

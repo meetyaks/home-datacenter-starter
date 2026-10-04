@@ -173,9 +173,17 @@ ok "the role converged (exit 0)"
 inx 'command -v dig' >/dev/null 2>&1 \
   && ok "the role installed dig before verification" \
   || bad "the role installed dig" "still absent after a successful run"
-grep -q 'bind9-dnsutils' /tmp/coredns-linux-1.log \
+# ⚠️ ASKED OF dpkg, NOT OF THE RUN LOG. The first version grepped the log for
+# "bind9-dnsutils" — and that string is only in the log when the install
+# FAILS and Ansible quotes the package in its error. A successful run names
+# the task, not the package, so the check went red on the run where the
+# install finally worked. A test that passes only while the thing is broken
+# is worse than no test.
+# ⚠️ `dpkg-query -s`, NOT `-W -f=${Status}` — inx runs its argument through
+# `bash -lc`, which would expand ${Status} to nothing before dpkg ever saw it.
+inx 'dpkg-query -s bind9-dnsutils' 2>/dev/null | grep -q 'Status: install ok installed' \
   && ok "it installed the canonical Debian package (bind9-dnsutils)" \
-  || bad "bind9-dnsutils was installed" "not named in the run log"
+  || bad "bind9-dnsutils is installed" "dpkg does not report it as installed"
 grep -q 'Unpack it (Linux)' /tmp/coredns-linux-1.log \
   && ok "the Linux unarchive path executed (not the Darwin tar path)" \
   || bad "the Linux extraction path executed" "not present in the run log"

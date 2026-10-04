@@ -27,6 +27,7 @@ SHAPE=tests/dns-task-shape.yml
 MAIN_TASKS=roles/coredns/tasks/main.yml
 CONFIGURE=roles/coredns/tasks/configure.yml
 PREREQ=roles/coredns/tasks/verifier-prereq.yml
+ROLE_SH=tests/run-coredns-role.sh
 # ⚠️ A TEST SCRIPT MUTATED AS IF IT WERE PRODUCTION CODE. The macOS harness
 # runs a real root daemon beside the live resolver, so its safety properties
 # are load-bearing in exactly the way a role's are, and they get the same
@@ -45,6 +46,7 @@ restore() {
   [ -f "$WORK/main_tasks" ] && cp "$WORK/main_tasks" "$MAIN_TASKS"
   [ -f "$WORK/configure" ] && cp "$WORK/configure" "$CONFIGURE"
   [ -f "$WORK/prereq" ] && cp "$WORK/prereq" "$PREREQ"
+  [ -f "$WORK/role_sh" ] && cp "$WORK/role_sh" "$ROLE_SH"
   [ -f "$WORK/launchd" ] && cp "$WORK/launchd" "$LAUNCHD"
   return 0
 }
@@ -61,6 +63,7 @@ cp "$SHAPE" "$WORK/shape"
 cp "$MAIN_TASKS" "$WORK/main_tasks"
 cp "$CONFIGURE" "$WORK/configure"
 cp "$PREREQ" "$WORK/prereq"
+cp "$ROLE_SH" "$WORK/role_sh"
 cp "$LAUNCHD" "$WORK/launchd"
 
 pass=0
@@ -599,6 +602,15 @@ restore
 perl -ni -e 'print unless /^    update_cache: true$/' "$PREREQ"
 expect_red dns-task-shape.yml 'update_cache|refreshed' \
            "dropping update_cache from the dig install is caught"
+
+restore
+# ⚠️ A CHECK THAT WAS GREEN ONLY WHILE THE INSTALL WAS BROKEN. Grepping the
+# run log for the package name passes when Ansible quotes it in an ERROR and
+# fails on the run where the install finally works. Backwards is worse than
+# absent, so re-introducing it must be caught.
+perl -pi -e "s{^inx 'dpkg-query -s bind9-dnsutils' .*\$}{grep -q 'bind9-dnsutils' /tmp/coredns-linux-1.log \\\\}" "$ROLE_SH"
+expect_red dns-harness-integrity.yml 'dpkg-query|run log' \
+           "proving an install by grepping the run log is caught"
 
 echo
 echo "── the disposable macOS harness must stay disposable ──"
