@@ -1,0 +1,221 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# SEMAPHORE UI — THE CONTROLLER'S OPERATOR INTERFACE.
+#
+# Semaphore is an operator UI and a controlled job runner. It is NOT a second
+# source of truth: Git holds the inventory and the playbooks, and Semaphore
+# fetches a reviewed branch and runs what is in it. Every value here that
+# could turn it into a configuration authority of its own is pinned, and the
+# ones that matter are asserted in tests/semaphore-config.yml.
+#
+# The authoritative operator document is docs/dc1-semaphore.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── THE PINNED UPSTREAM RELEASE ──────────────────────────────────────────────
+#
+# ⚠️ EVERY VALUE BELOW WAS TAKEN FROM THE OFFICIAL RELEASE AND VERIFIED, not
+# copied from documentation. On 2026-10-04 the artifacts were downloaded, their
+# SHA-256 compared against the official checksum file published in the same
+# release, extracted, and executed on macOS ARM64 to read the version string
+# back. The evidence is recorded in docs/dc1-semaphore.md.
+#
+#   release   https://github.com/semaphoreui/semaphore/releases/tag/v2.19.12
+#   checksums semaphore_community_2.19.12_checksums.txt   (same release)
+#   published 2026-08-30, prerelease=false, draft=false
+#
+# ⚠️ THE COMMUNITY EDITION, DELIBERATELY. This release publishes TWO families
+# of artifact: `semaphore_<ver>_<os>_<arch>` (97 MB on darwin_arm64) and
+# `semaphore_community_<ver>_<os>_<arch>` (48 MB). Both are MIT-licensed and
+# both report the same version and commit, but the larger one bundles the
+# licensed Pro feature set. This installation has no Pro licence and needs
+# none of it, so it installs the smaller, open edition rather than shipping
+# code it cannot legally or usefully enable.
+#
+# Their version strings differ in the trailing build timestamp, which is
+# per-EDITION, not per-artifact — verified by running both:
+#     community  darwin_arm64  2.19.12-012ed06-1788086239
+#     community  linux_amd64   2.19.12-012ed06-1788086239   (same)
+#     standard   darwin_arm64  2.19.12-012ed06-1788086244   (differs)
+# so one expected string covers every community artifact, and it is also what
+# distinguishes the edition at runtime.
+semaphore_version: "2.19.12"
+semaphore_edition: "community"
+
+# ⚠️ NO `latest`, NO FLOATING TAG, NO DOCKER HUB, NO HOMEBREW. A controller
+# that silently upgrades itself is a controller whose behaviour is not in Git.
+# An upgrade is a reviewed change to these three lines plus a watched
+# deployment — see "Upgrading" in docs/dc1-semaphore.md.
+semaphore_release_base: >-
+  https://github.com/semaphoreui/semaphore/releases/download/v{{ semaphore_version }}
+
+semaphore_artifacts:
+  darwin_arm64: "semaphore_community_{{ semaphore_version }}_darwin_arm64.tar.gz"
+  linux_amd64: "semaphore_community_{{ semaphore_version }}_linux_amd64.tar.gz"
+
+# SHA-256 as published in semaphore_community_2.19.12_checksums.txt, and
+# independently recomputed from the downloaded bytes.
+semaphore_checksums:
+  darwin_arm64: "f99cd2829722c9f4a7074cafa07a43ad7f027055b0b0eb48931059d38c62261e"
+  linux_amd64: "2576f8a473c5e91bd0d7833976111c56f0ad43720210f9ca437037d10acd97cc"
+
+# What `semaphore version` must print once installed, verified by running
+# both community artifacts on 2026-10-04. Checked by verify.yml: a binary
+# reporting anything else is not the artifact that was pinned, whatever its
+# checksum said at download time — and in particular, the standard edition
+# reports ...244 and would be caught here.
+semaphore_expected_version: "2.19.12-012ed06-1788086239"
+
+# ── SERVICE IDENTITY ─────────────────────────────────────────────────────────
+#
+# ⚠️ NOT root, AND NOT THE HUMAN dc1-arm-1 ACCOUNT. Semaphore executes
+# playbooks; running it as the operator would give every job the operator's
+# SSH keys, keychain and shell environment, and running it as root would give
+# them everything. It gets its own identity with nothing attached to it, and
+# the SSH/become credentials it will eventually need are added later through
+# Semaphore's own encrypted key store — never by reading ~/.ssh.
+#
+# The leading underscore is the macOS convention for a non-login service
+# account and is what keeps it out of the login window.
+semaphore_user: "_semaphore"
+semaphore_group: "_semaphore"
+semaphore_user_realname: "Semaphore UI Service"
+
+# ⚠️ NO HARDCODED UID. A fixed number collides sooner or later, and a
+# collision silently hands the new service another account's files. The uid
+# is allocated by ansible.builtin.user with `system: yes`, which scans the
+# existing UniqueIDs via dscl and picks a free one below 500 — the range
+# macOS reserves for service accounts. account.yml additionally REFUSES if an
+# account of this name already exists with a different shape, rather than
+# adopting someone else's.
+
+# ── FILESYSTEM ───────────────────────────────────────────────────────────────
+#
+# Versioned binary + stable symlink: the running service always starts from
+# /usr/local/sbin/semaphore, while each version lands in its own immutable
+# directory. Rollback is re-pointing one link, and the previous version is
+# still on disk to point back to.
+semaphore_libexec_dir: "/usr/local/libexec/semaphore"
+semaphore_versioned_dir: "{{ semaphore_libexec_dir }}/{{ semaphore_version }}"
+semaphore_bin_link: "/usr/local/sbin/semaphore"
+semaphore_conf_dir: "/usr/local/etc/semaphore"
+semaphore_config_path: "{{ semaphore_conf_dir }}/config.json"
+semaphore_state_dir: "/usr/local/var/lib/semaphore"
+semaphore_db_path: "{{ semaphore_state_dir }}/semaphore.db"
+# Semaphore clones repositories and stages ephemeral project data here. It is
+# under the state directory on purpose: NOT /tmp, which macOS prunes and which
+# other users can read.
+semaphore_tmp_path: "{{ semaphore_state_dir }}/tmp"
+semaphore_backup_dir: "{{ semaphore_state_dir }}/backups"
+semaphore_log_dir: "/var/log/semaphore"
+
+# ── NETWORK EXPOSURE ─────────────────────────────────────────────────────────
+#
+# ⚠️ LOOPBACK ONLY, AND THAT IS THE WHOLE EXPOSURE MODEL FOR THIS MILESTONE.
+# Operator access is an SSH tunnel:
+#     ssh -L 3000:127.0.0.1:3000 dc1-arm-1@10.0.0.22
+# There is no LAN listener, no semaphore.dc1.lan record, no reverse proxy and
+# no certificate. `semaphore.dc1.lan` over TLS is a separate, later decision
+# that depends on Orbi DNS activation.
+#
+# Upstream builds the listener from `interface` + `port` (util/config.go:
+# Interface is "put in front of the port"). Verified on 2026-10-04: with
+# interface 127.0.0.1 the process binds exactly 127.0.0.1:<port> and nothing
+# on 0.0.0.0.
+# (enforced: tests/semaphore-config.yml "the listener is loopback only")
+semaphore_interface: "127.0.0.1"
+semaphore_port: 3000
+
+# ── ADMINISTRATOR ────────────────────────────────────────────────────────────
+#
+# Identity is configuration; the password is a vault secret and has no default
+# of any kind (see below). No second user is created in this milestone.
+semaphore_admin_login: "dc1admin"
+semaphore_admin_name: "DC1 Operator"
+semaphore_admin_email: "ops@dc1.lan"
+
+# ⚠️ AN UNAVOIDABLE UPSTREAM EXPOSURE, MADE EXPLICIT RATHER THAN HIDDEN.
+# v2.19.12 offers exactly two ways to create a user, and neither is clean:
+#
+#   semaphore users add --password <plaintext>   password lands in argv
+#   semaphore setup                              reads the password from stdin,
+#                                                but calls GenerateSecrets()
+#                                                and rewrites config.json,
+#                                                rotating access_key_encryption
+#                                                on every run — which destroys
+#                                                every stored credential
+#
+# There is no stdin, file or environment path for `users add` in this release
+# (cli/cmd/user_add.go). So bootstrapping the administrator automatically
+# means the password is visible in `ps` for the lifetime of one short command,
+# to other local accounts on the controller.
+#
+# Set this to false to refuse that trade. The role then installs and verifies
+# everything else and FAILS with the exact manual command, which the operator
+# runs themselves. Steady-state runs are unaffected either way: the admin is
+# only ever created when `semaphore users list` shows it absent.
+semaphore_admin_bootstrap_enabled: true
+
+# ── SECRETS ──────────────────────────────────────────────────────────────────
+#
+# ⚠️ NO USABLE FALLBACK, ON PURPOSE. Each of these resolves to an undefined
+# vault variable. preflight-secrets.yml runs BEFORE anything is created and
+# fails if any is missing or empty, so a run without the vault stops before it
+# touches the host rather than installing a service with a guessable secret.
+#
+# Upstream requires (util/config.go):
+#   cookie_hash           session cookie HMAC        base64
+#   cookie_encryption     session cookie encryption  base64
+#   access_key_encryption AES key for stored creds   base64 decoding to
+#                                                    EXACTLY 16, 24 or 32 bytes
+#                                                    — upstream validates this
+#                                                    and names
+#                                                    `openssl rand -base64 32`
+#
+# ⚠️ LOSING access_key_encryption LOSES EVERY STORED CREDENTIAL. It is not
+# recoverable from the database; the database holds only ciphertext. It must
+# survive upgrades, reinstalls and restores, which is why it lives in the
+# vault and never in generated state. See "Recovery" in docs/dc1-semaphore.md.
+semaphore_cookie_hash: "{{ vault_semaphore_cookie_hash | default('') }}"
+semaphore_cookie_encryption: "{{ vault_semaphore_cookie_encryption | default('') }}"
+semaphore_access_key_encryption: "{{ vault_semaphore_access_key_encryption | default('') }}"
+semaphore_admin_password: "{{ vault_semaphore_admin_password | default('') }}"
+
+# Minimum admin password length enforced by preflight-secrets.yml. Upstream
+# does not impose one, so this repository does.
+semaphore_admin_password_min_length: 16
+
+# ── LAUNCHD ──────────────────────────────────────────────────────────────────
+semaphore_launchd_label: "org.dc1.semaphore"
+semaphore_launchd_plist: "/Library/LaunchDaemons/{{ semaphore_launchd_label }}.plist"
+
+# ⚠️ AN EXPLICIT PATH, BECAUSE A DAEMON INHERITS NOTHING. launchd does not
+# source a shell profile, so the interactive Homebrew PATH the operator sees
+# does not exist for this process. Semaphore shells out to ansible-playbook,
+# ansible-galaxy, git and ssh; if they are not on this list the UI installs
+# cleanly and then fails on the first job with "executable not found".
+# platform.yml resolves each one on the real host and refuses if any is
+# missing, so this list is checked rather than hoped.
+semaphore_path_entries:
+  - /opt/homebrew/bin
+  - /opt/homebrew/sbin
+  - /usr/local/bin
+  - /usr/local/sbin
+  - /usr/bin
+  - /bin
+  - /usr/sbin
+  - /sbin
+
+semaphore_required_tools:
+  - ansible-playbook
+  - ansible-galaxy
+  - python3
+  - git
+  - ssh
+
+# ── GIT AS THE SOURCE OF TRUTH ───────────────────────────────────────────────
+#
+# Recorded here so the UI bootstrap and the documentation cannot drift from
+# each other. Semaphore consumes these; it does not own them.
+semaphore_project_name: "DC1 Control Plane"
+semaphore_repo_url: "https://github.com/meetyaks/home-datacenter-starter.git"
+semaphore_repo_branch: "main"

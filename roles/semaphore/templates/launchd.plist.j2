@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Semaphore UI, as a launchd system daemon.
+
+  ⚠️ NO SECRET IS IN THIS FILE. The plist is world-readable by design —
+  launchd reads it as root before any user context exists — so every secret
+  stays in config.json (0600, service-owned) and this only names the path to
+  it. An EnvironmentVariables block holding cookie_hash or the access-key
+  encryption key would publish them to every local account.
+
+  ⚠️ EXPLICIT PATH, BECAUSE A DAEMON INHERITS NOTHING. launchd sources no
+  shell profile, so the operator's interactive PATH — Homebrew included —
+  does not exist here. Semaphore shells out to ansible-playbook, git and ssh;
+  without this block it installs cleanly and then fails on its first job.
+  roles/semaphore/tasks/platform.yml resolves each tool against exactly this
+  list and refuses if one is missing.
+
+  ⚠️ RunAtLoad + KeepAlive SuccessfulExit=false. The daemon should come back
+  if it crashes, but NOT be restarted into a loop when it exits cleanly —
+  which is what a bare `KeepAlive: true` does during an orderly stop.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{{ semaphore_launchd_label }}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{ semaphore_bin_link }}</string>
+    <string>server</string>
+    <string>--config</string>
+    <string>{{ semaphore_config_path }}</string>
+  </array>
+
+  {# Never root, never the operator. #}
+  <key>UserName</key>
+  <string>{{ semaphore_user }}</string>
+  <key>GroupName</key>
+  <string>{{ semaphore_group }}</string>
+
+  <key>WorkingDirectory</key>
+  <string>{{ semaphore_state_dir }}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{ semaphore_path_entries | join(':') }}</string>
+    {# HOME must point at the service's own state directory. Without it the
+       process inherits no HOME, and git and ansible-galaxy write to
+       unpredictable places — or fail. #}
+    <key>HOME</key>
+    <string>{{ semaphore_state_dir }}</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  {# Bounded restart behaviour: without a throttle, a daemon that fails at
+     startup is restarted as fast as launchd can fork it. #}
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  {# Graceful termination: SIGTERM first, and time to finish a running job
+     before launchd escalates. #}
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>{{ semaphore_log_dir }}/semaphore.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{ semaphore_log_dir }}/semaphore.err</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,37 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# "AM I THE MANAGEMENT NODE?" — one owner, imported by playbooks/semaphore.yml.
+#
+# A separate file so it can be run alone and watched refusing. When this kind
+# of guard lived inside the playbook it protected, the only way to run it
+# alone was `--limit localhost`, which left the second play with no hosts and
+# aborted the run BEFORE the guard was evaluated — a non-zero exit that looked
+# like the guard working when it had not run at all.
+#
+# Run directly to check a machine:
+#   ansible-playbook playbooks/semaphore-controller-guard.yml
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Confirm this really is the management node
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  tasks:
+    - name: This machine must be dc1-arm-1
+      # ⚠️ ASKED OF THE MACHINE, NOT OF THE INVENTORY. Semaphore is installed
+      # over a LOCAL connection, so running this anywhere else would create a
+      # permanent launchd daemon, a hidden service account and a credential
+      # store on the wrong computer — on a workstation that leaves the house.
+      ansible.builtin.assert:
+        that:
+          - "(ansible_facts['hostname'] | lower) is match('dc1-arm-1')"
+        fail_msg: >-
+          REFUSING: this is "{{ ansible_facts['hostname'] }}", not dc1-arm-1.
+          playbooks/semaphore.yml installs a launchd system daemon, creates a
+          hidden service account and writes an encrypted credential store over
+          a LOCAL connection. The management node is dc1-arm-1 (10.0.0.22);
+          run it there. If dc1-arm-1 has genuinely been renamed, change the
+          inventory and this check together — do not bypass it.
+        success_msg: >-
+          Running on {{ ansible_facts['hostname'] }}, the management node.

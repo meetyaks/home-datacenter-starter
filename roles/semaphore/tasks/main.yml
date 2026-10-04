@@ -1,0 +1,51 @@
+---
+# Semaphore UI on the controller. Order matters; each include says why it is
+# where it is.
+
+- name: Identify the platform and the tools the daemon will need
+  ansible.builtin.include_tasks: platform.yml
+
+# ⚠️ BEFORE THE FIRST MUTATION, DELIBERATELY. A run without the vault must
+# stop while the host is untouched, not after it has created an account,
+# installed a binary and written a config with an empty encryption key.
+- name: Every secret is present and well-formed before anything is created
+  ansible.builtin.include_tasks: preflight-secrets.yml
+
+- name: The dedicated service identity
+  ansible.builtin.include_tasks: account.yml
+
+- name: The pinned binary
+  ansible.builtin.include_tasks: install.yml
+
+- name: Directories and the configuration
+  ansible.builtin.include_tasks: configure.yml
+
+# After configure.yml, because `migrate` reads the config to find the
+# database; before service.yml, because the daemon will not start against an
+# unmigrated database.
+- name: The database
+  ansible.builtin.include_tasks: database.yml
+
+- name: Define the service
+  ansible.builtin.include_tasks: service.yml
+
+# ⚠️ THE FLUSH THAT MUST COME BEFORE VERIFICATION. Ansible runs notified
+# handlers at the END of the play, so without this the restart is still
+# pending while verify.yml interrogates the process running the OLD
+# configuration — and passes. That defect reached a live deployment in the
+# CoreDNS rollout: a resolver answering on the previous port while the file
+# on disk said otherwise. It is reproduced on demand by
+# `tests/run-semaphore-linux.sh --red`, which requires the run to FAIL
+# without this task.
+# (enforced: tests/semaphore-task-shape.yml "handlers are flushed before
+#  anything verifies the service")
+- name: Apply every pending restart BEFORE anything verifies the service
+  ansible.builtin.meta: flush_handlers
+
+# The administrator is created against a RUNNING, migrated database, and
+# only when `users list` shows it absent.
+- name: The administrator
+  ansible.builtin.include_tasks: admin.yml
+
+- name: Verify it answers
+  ansible.builtin.include_tasks: verify.yml

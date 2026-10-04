@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Back up the Semaphore database. Installed by roles/semaphore; not scheduled.
+#
+#   semaphore-backup [destination-directory]
+#
+# ⚠️ `VACUUM INTO`, NOT `cp`. The database runs in WAL mode, so at any moment
+# committed data lives partly in semaphore.db and partly in semaphore.db-wal.
+# Copying the main file alone — the obvious thing to do — produces a backup
+# that is silently missing recent writes, and copying all three while they are
+# being written can produce an inconsistent set. `VACUUM INTO` asks SQLite
+# itself for a consistent single-file snapshot and is safe while the service
+# is running. Verified against a live server on 2026-10-04: the snapshot
+# passed `PRAGMA integrity_check` and contained the records written moments
+# before.
+#
+# ⚠️ A BACKUP IS NOT A RESTORE. This file contains only ciphertext for every
+# stored credential. Restoring it is useless without
+# vault_semaphore_access_key_encryption, which lives in the vault and is NOT
+# included here — deliberately, so that a stolen backup is not a stolen
+# credential store. See "Recovery" in docs/dc1-semaphore.md.
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+DB="{{ semaphore_db_path }}"
+DEST="${1:-{{ semaphore_backup_dir }}}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+OUT="${DEST}/semaphore-${STAMP}.db"
+
+[ -r "$DB" ] || { echo "cannot read $DB" >&2; exit 1; }
+mkdir -p "$DEST"
+
+# VACUUM INTO refuses to overwrite, which is the behaviour we want.
+sqlite3 "$DB" "VACUUM INTO '${OUT}'"
+chmod 0600 "$OUT"
+
+# A backup that has not been checked is a hope, not a backup.
+if ! sqlite3 "$OUT" 'PRAGMA integrity_check;' | grep -qx ok; then
+  echo "integrity check FAILED for ${OUT}" >&2
+  exit 1
+fi
+
+echo "backup: ${OUT}"
+echo "integrity: ok"
+echo
+echo "NOTE: this file is useless on its own. Restoring it also requires"
+echo "      vault_semaphore_access_key_encryption, which is not in here."

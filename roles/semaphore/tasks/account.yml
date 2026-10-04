@@ -1,0 +1,138 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# A DEDICATED, NON-LOGIN SERVICE IDENTITY.
+#
+# ⚠️ READ BEFORE WRITE, AND REFUSE RATHER THAN ADOPT. If an account of this
+# name already exists, it might be ours from a previous run — or it might be
+# somebody else's, in which case silently taking it over hands Semaphore
+# another service's home directory and group memberships. So the existing
+# account is inspected first and the run stops unless it looks like ours.
+#
+# ⚠️ ansible.builtin.user IS USED ON DARWIN, NOT RAW dscl, BECAUSE IT IS
+# ACTUALLY CORRECT HERE. Its DarwinUser class drives dscl(1), maps `hidden`
+# to IsHidden, and with `system: yes` allocates a free UniqueID below 500 by
+# listing the existing ones — which is the conflict detection a hardcoded
+# number would lack. Checked against the installed ansible-core before
+# relying on it. What it does NOT do on Darwin is create the home directory
+# ("Does not create home directories" — its own docstring), so that is done
+# explicitly in configure.yml rather than assumed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Look for an existing service account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ semaphore_user }}"
+    fail_key: false
+
+- name: Decide whether this account already exists
+  ansible.builtin.set_fact:
+    semaphore_account_exists: "{{ (getent_passwd[semaphore_user] | default(None)) is not none }}"
+
+- name: An existing account must be one this role could have created
+  # ⚠️ THE "REFUSE RATHER THAN REUSE" RULE. The home directory is the
+  # discriminator: ours points at the Semaphore state directory. Anything
+  # else with this name belongs to something we do not know about, and
+  # adopting it would change its shell, its group and its home.
+  ansible.builtin.assert:
+    that:
+      - (getent_passwd[semaphore_user][4] | default('')) == semaphore_state_dir
+    fail_msg: >-
+      An account named {{ semaphore_user }} already exists, but its home is
+      "{{ getent_passwd[semaphore_user][4] | default('(none)') }}" rather
+      than {{ semaphore_state_dir }}. REFUSING to adopt it — it was created
+      by something else, and taking it over would move its home, change its
+      shell and alter its group. Remove it deliberately, or set
+      semaphore_user to a name that is free.
+    success_msg: "{{ semaphore_user }} already exists and matches this role."
+  when: semaphore_account_exists | bool
+
+- name: The service group exists
+  ansible.builtin.group:
+    name: "{{ semaphore_group }}"
+    state: present
+    system: true
+  become: true
+
+- name: The service account exists, hidden and unable to log in
+  # ⚠️ NO PASSWORD IS SET, ON EITHER PLATFORM. This account must not be able
+  # to authenticate at all: no login window entry, no ssh, no su. On Darwin
+  # `system: yes` also sets IsHidden, which is what keeps it off the login
+  # screen; the shell is a refusal either way.
+  ansible.builtin.user:
+    name: "{{ semaphore_user }}"
+    comment: "{{ semaphore_user_realname }}"
+    group: "{{ semaphore_group }}"
+    home: "{{ semaphore_state_dir }}"
+    create_home: false
+    shell: "{{ '/usr/bin/false' if semaphore_is_darwin | bool else '/usr/sbin/nologin' }}"
+    system: true
+    hidden: "{{ true if semaphore_is_darwin | bool else omit }}"
+    state: present
+  become: true
+  register: semaphore_account
+
+- name: Re-read the account so later tasks use what is really there
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ semaphore_user }}"
+    fail_key: false
+
+- name: It must not have become an administrator
+  # ⚠️ CHECKED, NOT ASSUMED. Nothing above adds the account to admin/sudo,
+  # but a later edit could, and the consequence — a UI that runs playbooks,
+  # owned by an account with administrative rights — is exactly what the
+  # dedicated identity exists to prevent.
+  ansible.builtin.command:
+    cmd: "{{ 'dsmemberutil checkmembership -U ' ~ semaphore_user ~ ' -G admin' if semaphore_is_darwin | bool else 'id -nG ' ~ semaphore_user }}"
+  register: semaphore_admin_membership
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: The service account is not in an administrative group
+  ansible.builtin.assert:
+    that:
+      - not (semaphore_admin_membership.stdout | lower is search('is a member'))
+      - not (semaphore_admin_membership.stdout is search('(^| )(admin|wheel|sudo)( |$)'))
+    fail_msg: >-
+      {{ semaphore_user }} appears to hold administrative group membership:
+      "{{ semaphore_admin_membership.stdout | trim }}". A UI that executes
+      playbooks must not also be an administrator of the machine it runs on.
+    success_msg: "{{ semaphore_user }} holds no administrative group membership."
+
+- name: The service account cannot reach the operator's home
+  # ⚠️ THE SSH-KEY BOUNDARY, ASSERTED. Semaphore must never read
+  # /Users/dc1-arm-1/.ssh — its credentials come from its own encrypted key
+  # store, added later through the UI. This proves the account has no path
+  # into the operator's home at all, rather than trusting that no task copies
+  # a key. Skipped where the directory does not exist (CI, containers).
+  ansible.builtin.stat:
+    path: "/Users/{{ semaphore_operator_account | default('dc1-arm-1') }}/.ssh"
+  register: semaphore_operator_ssh
+  when: semaphore_is_darwin | bool
+
+- name: Prove the operator's .ssh is unreadable by the service account
+  ansible.builtin.command:
+    cmd: "sudo -n -u {{ semaphore_user }} test -r /Users/{{ semaphore_operator_account | default('dc1-arm-1') }}/.ssh"
+  register: semaphore_ssh_probe
+  changed_when: false
+  failed_when: false
+  become: true
+  when:
+    - semaphore_is_darwin | bool
+    - semaphore_operator_ssh.stat.exists | default(false)
+
+- name: The service account must NOT be able to read the operator's .ssh
+  ansible.builtin.assert:
+    that:
+      - semaphore_ssh_probe.rc != 0
+    fail_msg: >-
+      {{ semaphore_user }} can read the operator's ~/.ssh. Semaphore executes
+      playbooks; if it can read the operator's private keys then every job it
+      runs holds the operator's access to every host, which defeats the whole
+      point of a dedicated identity. Tighten the permissions on that
+      directory before continuing.
+    success_msg: "{{ semaphore_user }} cannot read the operator's ~/.ssh."
+  when:
+    - semaphore_is_darwin | bool
+    - semaphore_operator_ssh.stat.exists | default(false)

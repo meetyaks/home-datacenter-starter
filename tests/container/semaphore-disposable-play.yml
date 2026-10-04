@@ -1,0 +1,19 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE SEMAPHORE ROLE'S OWN TASKS, against a disposable instance.
+#
+# ⚠️ IMPORTED BY REFERENCE, NEVER RE-IMPLEMENTED. A harness that restated the
+# role would pass while the role stayed broken.
+#
+# Every value that could touch real state is an override supplied by the
+# runner: the prefix, the service account, the launchd label and the port.
+# The secrets below are generated per run by the runner and are throwaway.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: Semaphore, disposable
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  roles:
+    - role: semaphore

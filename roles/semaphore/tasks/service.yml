@@ -1,0 +1,61 @@
+---
+# The service definition, platform-split. launchd is production; systemd
+# exists so the disposable Linux container can exercise the same lifecycle
+# in CI.
+
+# ── macOS ───────────────────────────────────────────────────────────────────
+- name: Render the launchd job
+  ansible.builtin.template:
+    src: launchd.plist.j2
+    dest: "{{ semaphore_launchd_plist }}"
+    owner: root
+    group: wheel
+    # 0644: launchd reads it as root before any user context exists, and it
+    # deliberately contains no secret.
+    mode: "0644"
+  become: true
+  when: semaphore_is_darwin | bool
+  notify: Restart Semaphore
+
+- name: Is the launchd job already loaded?
+  ansible.builtin.command:
+    cmd: "launchctl print system/{{ semaphore_launchd_label }}"
+  register: semaphore_launchd_loaded
+  changed_when: false
+  failed_when: false
+  become: true
+  when: semaphore_is_darwin | bool
+
+- name: Load the launchd job
+  # ⚠️ `bootstrap system <path>`, NOT `load`. The modern verb is explicit
+  # about the domain, and it is also what `bootout` pairs with in teardown.
+  ansible.builtin.command:
+    cmd: "launchctl bootstrap system {{ semaphore_launchd_plist }}"
+  become: true
+  when:
+    - semaphore_is_darwin | bool
+    - semaphore_launchd_loaded.rc != 0
+  changed_when: true
+
+# ── Linux ───────────────────────────────────────────────────────────────────
+- name: Render the systemd unit
+  ansible.builtin.template:
+    src: systemd.service.j2
+    dest: /etc/systemd/system/semaphore.service
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: not (semaphore_is_darwin | bool)
+  notify:
+    - Reload systemd
+    - Restart Semaphore
+
+- name: Enable the service
+  ansible.builtin.systemd_service:
+    name: semaphore
+    enabled: true
+    daemon_reload: true
+    state: started
+  become: true
+  when: not (semaphore_is_darwin | bool)

@@ -1,0 +1,25 @@
+---
+# Semaphore UI on the controller.
+#
+#   ansible-playbook playbooks/semaphore.yml --ask-vault-pass --ask-become-pass
+#
+# ⚠️ BOTH PROMPTS ARE REQUIRED. The vault holds the four secrets this role
+# refuses to run without, and macOS sudo tickets are TTY-scoped — Ansible's
+# become runs in a pipe-wired subprocess that cannot see a ticket cached by
+# `sudo -v`, so it must collect the password itself.
+#
+# Operator access after deployment is an SSH tunnel; there is no LAN listener:
+#   ssh -L 3000:127.0.0.1:3000 dc1-arm-1@10.0.0.22
+#
+# See docs/dc1-semaphore.md.
+
+- name: Refuse to run anywhere but the management node
+  ansible.builtin.import_playbook: semaphore-controller-guard.yml
+
+- name: Semaphore UI
+  hosts: dc1-arm-1
+  gather_facts: true
+  become: false
+
+  roles:
+    - role: semaphore

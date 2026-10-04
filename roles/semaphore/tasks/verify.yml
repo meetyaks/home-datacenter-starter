@@ -1,0 +1,169 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# ASK THE RUNNING SERVICE, DO NOT TRUST THE FILESYSTEM.
+#
+# Everything before this proves configuration was WRITTEN. Only these checks
+# prove a process parsed it, bound the right address and serves.
+#
+# ⚠️ EVERY CONDITIONAL HERE IS A QUOTED STRING. An unquoted `that:` item
+# containing ": " is parsed by YAML as a mapping and Ansible refuses the task
+# with "Conditional expressions must be strings" — which killed a CoreDNS
+# deployment on its last task. (enforced: tests/semaphore-task-shape.yml)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Wait for the listener
+  ansible.builtin.wait_for:
+    host: "{{ semaphore_interface }}"
+    port: "{{ semaphore_port }}"
+    state: started
+    timeout: 60
+
+- name: Ask the API whether it is alive
+  # ⚠️ /api/ping, AND THE BODY IS CHECKED. Determined by probing the real
+  # binary on 2026-10-04, not guessed:
+  #     /api/ping  -> 200, body "pong"      the health endpoint
+  #     /ping      -> 200, body <!DOCTYPE html>
+  # `/ping` is the single-page-app catch-all. A status-only check against it
+  # passes while the API is completely broken, which is why the body matters
+  # as much as the code.
+  ansible.builtin.uri:
+    url: "http://{{ semaphore_interface }}:{{ semaphore_port }}/api/ping"
+    return_content: true
+    status_code: 200
+  register: semaphore_ping
+  retries: 10
+  delay: 3
+  until: semaphore_ping is succeeded
+
+- name: The health endpoint must actually say pong
+  ansible.builtin.assert:
+    that:
+      - "(semaphore_ping.content | trim) == 'pong'"
+    fail_msg: >-
+      /api/ping returned "{{ semaphore_ping.content | trim | truncate(60) }}"
+      rather than "pong". A 200 alone is not health here — the SPA catch-all
+      also returns 200.
+    success_msg: "/api/ping returns pong."
+
+- name: Find out who is listening, and on what
+  # ⚠️ THE LISTENER IS THE EXPOSURE MODEL, SO IT IS MEASURED. Checking that
+  # the port answers on 127.0.0.1 does NOT prove it is bound only there: a
+  # process on 0.0.0.0 answers loopback too. This reads the socket table.
+  ansible.builtin.command:
+    cmd: "{{ 'lsof -nP -iTCP:' ~ semaphore_port ~ ' -sTCP:LISTEN' if semaphore_is_darwin | bool else 'ss -lntpH sport = :' ~ semaphore_port }}"
+  register: semaphore_listener
+  changed_when: false
+  become: true
+
+- name: It must be bound to loopback and nothing else
+  ansible.builtin.assert:
+    that:
+      - "semaphore_listener.stdout is search('127\\.0\\.0\\.1:' ~ semaphore_port)"
+      - "not (semaphore_listener.stdout is search('0\\.0\\.0\\.0:' ~ semaphore_port))"
+      - "not (semaphore_listener.stdout is search('\\*:' ~ semaphore_port))"
+    fail_msg: >-
+      Semaphore is not bound to loopback only:
+      {{ semaphore_listener.stdout | trim }}.
+      This milestone exposes the UI through an SSH tunnel; a LAN listener
+      publishes an operator console that can run playbooks.
+    success_msg: "Listening on {{ semaphore_interface }}:{{ semaphore_port }} only."
+
+# ⚠️ ASK ps WHO OWNS THE PROCESS — DO NOT GREP THE LISTENER LINE FOR A
+# USERNAME. The first version did exactly that, and the Linux harness caught
+# it on the first real run: `ss -lntpH` prints the process NAME and pid
+# (`users:(("semaphore",pid=3733,fd=3))`) and never the owning user, so the
+# assertion could not have passed even on a perfectly correct install. On
+# macOS `lsof` does print a USER column, so the bug would have been invisible
+# there and shipped — this is precisely the asymmetry the Linux harness
+# exists to expose.
+- name: Find the pid of the running server
+  ansible.builtin.command:
+    cmd: "pgrep -f 'semaphore server'"
+  register: semaphore_pid_probe
+  changed_when: false
+  become: true
+
+- name: Ask who owns that process
+  ansible.builtin.command:
+    cmd: "ps -o user= -p {{ (semaphore_pid_probe.stdout_lines | first) | trim }}"
+  register: semaphore_proc_owner
+  changed_when: false
+  become: true
+  when: (semaphore_pid_probe.stdout_lines | length) > 0
+
+- name: It must be running as the dedicated service account
+  ansible.builtin.assert:
+    that:
+      - "(semaphore_pid_probe.stdout_lines | length) > 0"
+      - "(semaphore_proc_owner.stdout | default('') | trim) == semaphore_user"
+    fail_msg: >-
+      The server process is owned by
+      "{{ semaphore_proc_owner.stdout | default('(no process found)') | trim }}",
+      not {{ semaphore_user }}. Semaphore executes playbooks; running it as
+      root or as the operator gives every job those privileges.
+    success_msg: >-
+      Running as {{ semaphore_proc_owner.stdout | trim }}
+      (pid {{ (semaphore_pid_probe.stdout_lines | first) | trim }}).
+
+- name: Confirm the running binary is the pinned one
+  ansible.builtin.command:
+    cmd: "{{ semaphore_bin_link }} version"
+  register: semaphore_running_version
+  changed_when: false
+
+- name: The running binary must report the pinned version
+  ansible.builtin.assert:
+    that:
+      - "(semaphore_running_version.stdout | trim) == semaphore_expected_version"
+    fail_msg: >-
+      {{ semaphore_bin_link }} reports
+      "{{ semaphore_running_version.stdout | trim }}", not
+      "{{ semaphore_expected_version }}".
+    success_msg: "Pinned version {{ semaphore_expected_version }} confirmed."
+
+- name: Check the on-disk permissions that protect the secrets
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ semaphore_config_path }}"
+    - "{{ semaphore_db_path }}"
+  register: semaphore_perms
+  become: true
+
+- name: The configuration and database must not be readable by others
+  ansible.builtin.assert:
+    that:
+      - "(item.stat.mode | default('0000'))[-1] == '0'"
+      - "(item.stat.mode | default('0000'))[-2] == '0'"
+    fail_msg: >-
+      {{ item.item }} is mode {{ item.stat.mode | default('unknown') }}.
+      The configuration holds the key that decrypts every stored credential
+      and the database holds their ciphertext; neither is any other local
+      account's business.
+    success_msg: "{{ item.item }} is {{ item.stat.mode | default('?') }}."
+  loop: "{{ semaphore_perms.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read the service log back
+  ansible.builtin.slurp:
+    src: "{{ semaphore_log_dir }}/semaphore.log"
+  register: semaphore_log
+  become: true
+  failed_when: false
+
+- name: No secret may appear in the service log
+  # ⚠️ COMPARED, NOT PRINTED. The assertion tests for the presence of each
+  # secret and the failure message names which one leaked — never its value.
+  ansible.builtin.assert:
+    that:
+      - "semaphore_cookie_hash not in (semaphore_log.content | default('') | b64decode)"
+      - "semaphore_cookie_encryption not in (semaphore_log.content | default('') | b64decode)"
+      - "semaphore_access_key_encryption not in (semaphore_log.content | default('') | b64decode)"
+      - "semaphore_admin_password not in (semaphore_log.content | default('') | b64decode)"
+    fail_msg: >-
+      A secret value appears in {{ semaphore_log_dir }}/semaphore.log.
+      Rotate it: anything written there has been readable for as long as the
+      file has existed.
+    success_msg: "No configured secret appears in the service log."
+  no_log: true
