@@ -37,6 +37,38 @@
     coredns_corefile: "{{ coredns_conf_dir }}/Corefile"
     coredns_zone_file: "{{ coredns_conf_dir }}/db.{{ coredns_zone }}"
 
+- name: The three ports must be usable and must not collide
+  # ⚠️ coredns_dns_port IS A TESTABILITY SEAM, NOT A TUNING KNOB. Production
+  # is 53 and no inventory overrides it; the disposable macOS test picks a
+  # free high port so the role's real lifecycle can run beside the live
+  # daemon. Validated here because a bad value is otherwise discovered as a
+  # CoreDNS startup failure with a far less helpful message.
+  #
+  # ⚠️ AND ALL THREE MUST DIFFER. CoreDNS binds DNS, health and readiness
+  # separately; two sharing a port means the second bind fails and the whole
+  # process exits — which is exactly how the fifth deployment died, when the
+  # health endpoint collided with Keel's console on 8080 and the failure
+  # surfaced 30 seconds later as a timeout on port 53.
+  ansible.builtin.assert:
+    that:
+      - (coredns_dns_port | int) >= 1
+      - (coredns_dns_port | int) <= 65535
+      - (coredns_dns_port | string) is match('^[0-9]+$')
+      - (coredns_dns_port | int) != (coredns_health_address | regex_replace('^.*:', '') | int)
+      - (coredns_dns_port | int) != (coredns_ready_address | regex_replace('^.*:', '') | int)
+      - (coredns_health_address | regex_replace('^.*:', '') | int)
+        != (coredns_ready_address | regex_replace('^.*:', '') | int)
+    fail_msg: >-
+      Ports are dns={{ coredns_dns_port }},
+      health={{ coredns_health_address }}, ready={{ coredns_ready_address }}.
+      The DNS port must be an integer in 1–65535, and all three must be
+      distinct — CoreDNS binds them separately and exits if any bind fails.
+    success_msg: >-
+      dns={{ coredns_dns_port }},
+      health={{ coredns_health_address | regex_replace('^.*:', '') }},
+      ready={{ coredns_ready_address | regex_replace('^.*:', '') }} — distinct
+      and in range.
+
 - name: Require explicit bind addresses
   # ⚠️ NO DEFAULT, AND NO WILDCARD. A resolver that binds 0.0.0.0 listens on
   # every interface the host happens to have — a VPN, a tunnel, a second NIC —

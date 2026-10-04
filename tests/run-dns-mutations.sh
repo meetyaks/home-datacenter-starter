@@ -24,6 +24,13 @@ HOSTS=inventory/hosts.yml
 INSTALL=roles/coredns/tasks/install.yml
 VERIFY=roles/coredns/tasks/verify.yml
 SHAPE=tests/dns-task-shape.yml
+MAIN_TASKS=roles/coredns/tasks/main.yml
+CONFIGURE=roles/coredns/tasks/configure.yml
+# ⚠️ A TEST SCRIPT MUTATED AS IF IT WERE PRODUCTION CODE. The macOS harness
+# runs a real root daemon beside the live resolver, so its safety properties
+# are load-bearing in exactly the way a role's are, and they get the same
+# treatment: break one, require tests/dns-harness-integrity.yml to notice.
+LAUNCHD=tests/run-coredns-launchd.sh
 
 WORK=$(mktemp -d -t dns-mutations.XXXXXX)
 restore() {
@@ -34,6 +41,10 @@ restore() {
   [ -f "$WORK/install" ] && cp "$WORK/install" "$INSTALL"
   [ -f "$WORK/verify" ] && cp "$WORK/verify" "$VERIFY"
   [ -f "$WORK/shape" ] && cp "$WORK/shape" "$SHAPE"
+  [ -f "$WORK/main_tasks" ] && cp "$WORK/main_tasks" "$MAIN_TASKS"
+  [ -f "$WORK/configure" ] && cp "$WORK/configure" "$CONFIGURE"
+  [ -f "$WORK/launchd" ] && cp "$WORK/launchd" "$LAUNCHD"
+  return 0
 }
 cleanup() { restore; rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
@@ -45,6 +56,9 @@ cp "$HOSTS" "$WORK/hosts"
 cp "$INSTALL" "$WORK/install"
 cp "$VERIFY" "$WORK/verify"
 cp "$SHAPE" "$WORK/shape"
+cp "$MAIN_TASKS" "$WORK/main_tasks"
+cp "$CONFIGURE" "$WORK/configure"
+cp "$LAUNCHD" "$WORK/launchd"
 
 pass=0
 fail=0
@@ -112,7 +126,7 @@ fi
 
 echo
 echo "── the suites are green before anything is broken ──"
-for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape; do
+for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape dns-harness-integrity; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
     ok "tests/${s}.yml is green"
   else
@@ -508,11 +522,98 @@ fi
 restore
 
 echo
+echo "── the handler flush, the port seam, and the harnesses themselves ──"
+# ⚠️ THE SIXTH DEFECT AND THE SEAM THAT MADE IT TESTABLE. Without the flush,
+# Ansible runs the restart at the END of the play, so verify.yml interrogates
+# the process still running the old configuration — observed on dc1-arm-1 as
+# PID 35119 serving 8181 while the Corefile on disk said 8654.
+restore
+
+# 1. The regression itself: no flush at all.
+perl -ni -e 'print unless /ansible\.builtin\.meta: flush_handlers/' "$MAIN_TASKS"
+expect_red dns-task-shape.yml 'flush handlers exactly once|Found\s+flush at \[\]' \
+           "removing the handler flush is caught"
+
+# 2. Flushed, but AFTER verification — which prevents nothing.
+restore
+perl -0pi -e 's{(- name: Apply every pending restart.*?\n  ansible\.builtin\.meta: flush_handlers\n)}{}s;
+              s{(- name: Verify it answers\n  ansible\.builtin\.include_tasks: verify\.yml\n)}{$1\n- name: Apply every pending restart BEFORE anything verifies the service\n  ansible.builtin.meta: flush_handlers\n}s' "$MAIN_TASKS"
+expect_red dns-task-shape.yml 'BEFORE verify\.yml runs|Found\s+flush at' \
+           "flushing AFTER verification is caught"
+
+# 3. Flushed BEFORE the configuration is even written, so nothing is pending.
+restore
+perl -0pi -e 's{(- name: Apply every pending restart.*?\n  ansible\.builtin\.meta: flush_handlers\n)}{}s;
+              s{(- name: Install the pinned binary\n)}{- name: Apply every pending restart BEFORE anything verifies the service\n  ansible.builtin.meta: flush_handlers\n\n$1}s' "$MAIN_TASKS"
+expect_red dns-task-shape.yml 'AFTER the service is defined|Found\s+flush at' \
+           "flushing before the configuration changes is caught"
+
+# 4. The restart notification dropped from the Corefile template, so no
+#    handler is ever pending and a config change never reaches the daemon.
+restore
+perl -0pi -e 's{(src: Corefile\.j2\n(?:.*\n)*?)  notify: Restart CoreDNS\n}{$1}' "$CONFIGURE"
+expect_red dns-harness-integrity.yml 'notifies a restart|Corefile template must notify' \
+           "dropping the Corefile restart notification is caught"
+
+echo
+echo "── the DNS port seam must not drift in production ──"
+restore
+edit 's{^coredns_dns_port: 53$}{coredns_dns_port: 5353}' "$DEFAULTS"
+expect_red dns-zone.yml 'must be exactly 53|defaults to 53' \
+           "changing the production DNS port default is caught"
+
+restore
+edit 's{^coredns_dns_port: 53$}{coredns_dns_port: 70000}' "$DEFAULTS"
+expect_red dns-zone.yml 'must be exactly 53|defaults to 53' \
+           "an out-of-range DNS port is caught"
+
+restore
+edit 's{^coredns_dns_port: 53$}{coredns_dns_port: 8653}' "$DEFAULTS"
+expect_red dns-zone.yml 'must be exactly 53|defaults to 53|same port as each other' \
+           "a DNS port colliding with the health port is caught"
+
+restore
+edit 's{^\{\{ coredns_zone \}\}:\{\{ coredns_dns_port \}\} \{$}{\{\{ coredns_zone \}\}:53 \{}' "$COREFILE"
+expect_red dns-harness-integrity.yml 'hardcodes the DNS port|coredns_dns_port' \
+           "one hardcoded :53 server block is caught"
+
+echo
+echo "── the verifier prerequisite the role now owns ──"
+restore
+perl -0pi -e 's{- name: Make sure this node can verify a resolver before it installs one\n(?:.*\n)*?  ansible\.builtin\.include_tasks: verifier-prereq\.yml\n}{}' "$MAIN_TASKS"
+expect_red dns-harness-integrity.yml 'verifier-prereq|dig' \
+           "removing dig ownership from the role is caught"
+
+echo
+echo "── the disposable macOS harness must stay disposable ──"
+restore
+# A harness that pointed at the live prefix or label would destroy the very
+# thing it is supposed to leave untouched.
+perl -pi -e 's{^LABEL="org\.dc1\.corednsdisposable\$\{STAMP\}"$}{LABEL="org.coredns.coredns"}' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'unique disposable label|org\.coredns\.coredns' \
+           "a macOS harness reusing the LIVE launchd label is caught"
+
+restore
+perl -ni -e 'print unless /^trap teardown EXIT INT TERM$/' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'teardown on success, failure and interrupt|trap' \
+           "omitting the macOS teardown trap is caught"
+
+restore
+perl -ni -e 'print unless /the daemon was RESTARTED before verification/' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'prove the pid changed|RESTARTED before verification' \
+           "treating a still-running old PID as success is caught"
+
+restore
+perl -ni -e 'print unless /third run reported changed=0/' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'changed=0|no-op' \
+           "allowing second-run churn is caught"
+
+echo
 echo "── everything is restored ──"
 restore
 cp "$WORK/plist" "$PLIST"
 cp "$WORK/unit" "$UNIT"
-for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape; do
+for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape dns-harness-integrity; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
     ok "tests/${s}.yml is green again"
   else
@@ -527,6 +628,8 @@ if [ "$fail" -gt 0 ]; then
   exit 1
 fi
 echo "PASS — $pass checks: every essential record, both checksums, the"
-echo "forwarding loop, LAN-only access, both service definitions and the"
-echo "macOS/Linux extraction split and the install directories are proved to"
+echo "forwarding loop, LAN-only access, both service definitions, the"
+echo "macOS/Linux extraction split, the install directories, the handler"
+echo "flush, the production DNS port, the role's ownership of dig, and the"
+echo "disposable macOS harness's own safety properties are proved to"
 echo "FAIL when broken, each for its own reason."

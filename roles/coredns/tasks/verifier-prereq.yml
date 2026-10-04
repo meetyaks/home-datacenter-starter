@@ -1,0 +1,101 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE ROLE OWNS WHAT ITS OWN VERIFICATION NEEDS.
+#
+# ⚠️ verify.yml SHELLS OUT TO `dig`, AND NOTHING EVER DECLARED THAT. It worked
+# on dc1-x86 because dig happened to be installed there — a clean-host
+# assumption of exactly the kind that produced the first two defects of this
+# rollout (`unarchive` assuming GNU tar, `copy` assuming /usr/local/sbin). A
+# fresh supported host without dig would install CoreDNS successfully and then
+# fail in verification with "No such file or directory", naming a binary the
+# role never said it required.
+#
+# ⚠️ AND IT RUNS BEFORE install.yml, NOT BEFORE verify.yml. Refusing early is
+# the point: a role that installs a resolver it cannot then verify leaves the
+# host in a state nobody has checked. Ordering is asserted in
+# tests/dns-task-shape.yml.
+#
+# ⚠️ THE SUPPORT CONTRACT IS TWO PLATFORMS, SO THIS HANDLES TWO. defaults names
+# checksums for `darwin_arm64` and `linux_amd64` only, and tasks/main.yml
+# REFUSES any platform without a pin. The Linux node is Ubuntu, so the Debian
+# family is the whole of the Linux scope — a multi-distribution package map
+# would be speculative generality for hosts this role already declines to run
+# on. An unexpected family fails loudly rather than guessing a package name.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Look for the dig the verifier will use
+  ansible.builtin.stat:
+    path: "{{ '/usr/bin/dig' if coredns_is_darwin else '/usr/bin/dig' }}"
+  register: coredns_dig
+
+- name: macOS must already have the system dig
+  # ⚠️ ASSERTED, NEVER INSTALLED. macOS ships dig at /usr/bin/dig as part of
+  # the base system. Installing one would mean adding Homebrew as a
+  # prerequisite of the LAN's primary resolver — the same dependency this role
+  # explicitly rejected when it chose bsdtar over GNU tar. If it is genuinely
+  # missing, that is a broken base system and the operator needs to know,
+  # not have a package manager quietly introduced.
+  ansible.builtin.assert:
+    that:
+      - coredns_dig.stat.exists
+      - coredns_dig.stat.isreg
+    fail_msg: >-
+      /usr/bin/dig is missing on this macOS host. It is part of the base
+      system, so its absence means something is wrong with the installation
+      rather than something this role should fix. verify.yml cannot confirm
+      the resolver answers without it. This role will NOT install Homebrew to
+      obtain it — resolve the base system first.
+    success_msg: "/usr/bin/dig is present; verification can run."
+  when: coredns_is_darwin | bool
+
+- name: Linux gets dig from the role, as a declared prerequisite
+  # ⚠️ bind9-dnsutils IS THE CANONICAL DEBIAN/UBUNTU PACKAGE for dig. The older
+  # `dnsutils` name is a transitional package that merely depends on it, so
+  # naming the real one keeps working when the transitional package is
+  # eventually dropped. Both Ubuntu 26.04 (dc1-x86) and Debian bookworm (the
+  # disposable test container) provide it.
+  ansible.builtin.apt:
+    name: bind9-dnsutils
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+  when:
+    - not (coredns_is_darwin | bool)
+    - ansible_facts['os_family'] == 'Debian'
+
+- name: Refuse a Linux family this role does not support
+  # ⚠️ FAIL CLOSED RATHER THAN GUESS A PACKAGE NAME. The role already refuses
+  # a platform it has no checksum for; this is the same rule applied to the
+  # verifier's prerequisite. Adding a family means adding its package here AND
+  # its CoreDNS checksum there — both, or neither.
+  ansible.builtin.fail:
+    msg: >-
+      This host is {{ ansible_facts['os_family'] }}, which roles/coredns does
+      not support. The declared scope is macOS (darwin_arm64) and Debian-family
+      Linux (linux_amd64) — see coredns_checksums in defaults/main.yml. To add
+      a family, record its CoreDNS checksum and the package that provides dig
+      together; do not add one without the other.
+  when:
+    - not (coredns_is_darwin | bool)
+    - ansible_facts['os_family'] != 'Debian'
+
+- name: Confirm dig is now actually present
+  # ⚠️ ASKED OF THE FILESYSTEM AFTER THE PACKAGE STEP, not inferred from apt
+  # reporting success. The whole point of this file is that the role stops
+  # assuming the verifier exists; assuming the installer worked would be the
+  # same mistake one layer along.
+  ansible.builtin.stat:
+    path: /usr/bin/dig
+  register: coredns_dig_after
+
+- name: And that verification can therefore run
+  ansible.builtin.assert:
+    that:
+      - coredns_dig_after.stat.exists
+      - coredns_dig_after.stat.isreg
+    fail_msg: >-
+      /usr/bin/dig is still absent after the prerequisite step. verify.yml
+      cannot confirm the resolver answers, so this role refuses to install a
+      service it would be unable to check.
+    success_msg: "dig is available at /usr/bin/dig; verification can run."

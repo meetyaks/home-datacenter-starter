@@ -1,0 +1,21 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE CoreDNS ROLE'S OWN TASKS, against a disposable instance.
+#
+# ⚠️ IMPORTED BY REFERENCE, NEVER RE-IMPLEMENTED. A harness that restated the
+# role would pass while the role stayed broken — this repository has been
+# bitten by that more than once, and four of the six defects in this rollout
+# lived in files no test executed.
+#
+# Every value that could touch live state is an override supplied by the
+# runner: the prefix, the launchd label, and all three ports. Nothing here
+# names a production path.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: CoreDNS, disposable
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  roles:
+    - role: coredns

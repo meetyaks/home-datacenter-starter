@@ -44,8 +44,17 @@
   # race would restart forever under KeepAlive while the other served. The
   # symptom is a log full of "address already in use" and a resolver that
   # looks fine.
+  #
+  # ⚠️ IT SCANS THE DIRECTORY THIS ROLE'S OWN PLIST LIVES IN, not a hardcoded
+  # /Library/LaunchDaemons. In production those are the same path, so the
+  # check is unchanged. The difference matters only for the disposable test
+  # on the management node: a hardcoded scan finds the LIVE daemon's plist,
+  # compares it against the disposable one, and fails — which would make the
+  # launchd half of this role permanently untestable beside a running
+  # instance. That untestability is how three of this rollout's defects
+  # reached a production node.
   ansible.builtin.find:
-    paths: /Library/LaunchDaemons
+    paths: "{{ coredns_launchd_plist | dirname }}"
     patterns: "*coredns*.plist"
   register: coredns_daemon_files
   become: true

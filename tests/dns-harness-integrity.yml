@@ -1,0 +1,192 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE END-TO-END HARNESSES MUST STAY HARNESSES.
+#
+#   ansible-playbook tests/dns-harness-integrity.yml
+#
+# ⚠️ WHY A SUITE ABOUT TESTS. The two new harnesses are the first things in
+# this repository that EXECUTE roles/coredns, and the macOS one runs a real
+# launchd daemon on the management node beside the live resolver. Its safety
+# rests on four properties that are invisible once written and catastrophic if
+# lost: a unique label, a confined prefix, teardown that always runs, and
+# assertions that actually distinguish a restarted daemon from a stale one.
+#
+# A harness that pointed at the live label would bootout the LAN's primary
+# resolver. One without a teardown trap would leave a daemon and a prefix
+# behind on every failure. One that did not compare PIDs would pass against
+# precisely the defect it exists to catch.
+#
+# None of that is checked by running the harness — a broken harness passes.
+# So it is checked here, statically, and each property has a mutation in
+# tests/run-dns-mutations.sh.
+#
+# Controller-only: reads files, runs nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The CoreDNS end-to-end harnesses
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    launchd: "{{ lookup('file', '../tests/run-coredns-launchd.sh') }}"
+    linux: "{{ lookup('file', '../tests/run-coredns-role.sh') }}"
+    corefile: "{{ lookup('file', '../roles/coredns/templates/Corefile.j2') }}"
+    configure: "{{ lookup('file', '../roles/coredns/tasks/configure.yml') }}"
+    mainyml: "{{ lookup('file', '../roles/coredns/tasks/main.yml') }}"
+
+  tasks:
+    # ── THE macOS HARNESS MUST NOT BE ABLE TO TOUCH LIVE STATE ─────────────
+
+    - name: The disposable launchd label is unique and never the live one
+      # ⚠️ THE LIVE LABEL IS org.coredns.coredns. A harness using it would
+      # `launchctl bootout` the LAN's primary resolver and then remove its
+      # prefix — the worst possible outcome from a test.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('LABEL="org\.dc1\.corednsdisposable\$\{STAMP\}"')
+          - not (launchd is search('LABEL="org\.coredns\.coredns"'))
+          - launchd is search('STAMP=\$\$-\$\(date')
+        fail_msg: >-
+          tests/run-coredns-launchd.sh must build a per-run unique label of the
+          form org.dc1.corednsdisposable${STAMP}, and must never use the live
+          label org.coredns.coredns. Using the live label would bootout the
+          LAN's primary resolver.
+        success_msg: "The disposable label is unique and distinct from the live one."
+
+    - name: Teardown is trapped on success, failure AND interrupt
+      ansible.builtin.assert:
+        that:
+          - launchd is search('trap teardown EXIT INT TERM')
+          - linux is search('trap cleanup EXIT INT TERM')
+        fail_msg: >-
+          Both harnesses must trap teardown on EXIT, INT and TERM. Without it
+          a failed or interrupted run leaves a launchd daemon loaded, a
+          prefix on disk, or the handler flush removed from the role.
+        success_msg: "Teardown is trapped on success, failure and interrupt."
+
+    - name: Teardown removes only the exact temporary root
+      # ⚠️ A GUARDED rm, NOT A BARE ONE. The prefix is root-owned, so the
+      # removal runs under sudo; a mistyped or empty variable there is
+      # unrecoverable. The case statement refuses anything that is not the
+      # mktemp pattern.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('/\*/coredns-disposable\.\*\)')
+          - launchd is search('REFUSING to remove unexpected path')
+          - launchd is search('bootout "system/\$\{LABEL\}"')
+        fail_msg: >-
+          Teardown must remove only a path matching the mktemp pattern and
+          must bootout only the unique label. A bare `rm -rf "$ROOT"` or a
+          bootout of anything else is not acceptable in a test that runs as
+          root beside a live resolver.
+        success_msg: "Teardown is confined to the exact label and prefix."
+
+    - name: It proves the live daemon is untouched, before and after
+      ansible.builtin.assert:
+        that:
+          - launchd is search('LIVE_PID_BEFORE')
+          - launchd is search('live PID unchanged')
+          - launchd is search('live Corefile fingerprint unchanged')
+          - launchd is search('live daemon still answers identically')
+          - launchd is search('no disposable launchd label survives')
+        fail_msg: >-
+          The macOS harness must record the live daemon's PID, fingerprints
+          and answers before it runs and compare them after teardown, and
+          must prove nothing disposable survived. Non-interference is a claim
+          that has to be measured.
+        success_msg: "Live-daemon non-interference is measured, not assumed."
+
+    # ── THE ASSERTIONS THAT MAKE THE HARNESSES MEAN ANYTHING ───────────────
+
+    - name: BOTH HARNESSES PROVE THE PID CHANGED AFTER A CONFIG CHANGE
+      # ⚠️ THIS IS THE WHOLE POINT. The sixth defect was verification reading
+      # a stale process. A harness that did not compare PIDs across the
+      # reconfigure run would pass against that exact defect.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('the daemon was RESTARTED before verification')
+          - linux is search('the service RESTARTED before verification')
+        fail_msg: >-
+          Both harnesses must assert the service PID CHANGED after a
+          configuration change. Without that comparison they cannot
+          distinguish a restarted daemon from the stale one that caused the
+          defect.
+        success_msg: "Both harnesses require a PID change after reconfiguration."
+
+    - name: Both harnesses require a genuine no-op on an unchanged rerun
+      ansible.builtin.assert:
+        that:
+          - launchd is search('third run reported changed=0')
+          - linux is search('third run reported changed=0')
+          - launchd is search('no restart on the no-op run')
+          - linux is search('no restart on the no-op run')
+        fail_msg: >-
+          Both harnesses must assert changed=0 AND no restart on an unchanged
+          rerun. Churn that restarts the LAN's resolver on every reconcile is
+          a defect, not a cosmetic issue.
+        success_msg: "Both harnesses require changed=0 and no restart on rerun."
+
+    - name: The Linux harness refuses an ambient dig
+      # ⚠️ OTHERWISE IT PROVES NOTHING ABOUT OWNERSHIP. If the image shipped
+      # dig, the role could stop installing it and the suite would stay green.
+      ansible.builtin.assert:
+        that:
+          - linux is search('the disposable host starts WITHOUT dig')
+          - linux is search('the image ships no ambient dig')
+          - linux is search('the role installed dig before verification')
+          - not (corefile is search('bind9-dnsutils'))
+        fail_msg: >-
+          tests/run-coredns-role.sh must assert the image has no dig BEFORE
+          running the role, and that the role then supplies it. Without the
+          first check the second proves nothing.
+        success_msg: "The Linux harness proves dig ownership rather than assuming it."
+
+    # ── THE PRODUCTION PROPERTIES THE HARNESSES DEPEND ON ──────────────────
+
+    - name: The Corefile takes its DNS port from the variable, not a literal
+      ansible.builtin.assert:
+        that:
+          - corefile is search('\{\{ coredns_zone \}\}:\{\{ coredns_dns_port \}\} \{')
+          - corefile is search('(?m)^\.:\{\{ coredns_dns_port \}\} \{')
+          - not (corefile is search('(?m)^\{\{ coredns_zone \}\}:53 \{'))
+          - not (corefile is search('(?m)^\.:53 \{'))
+        fail_msg: >-
+          Both Corefile server-block headers must use
+          {{ '{{' }} coredns_dns_port {{ '}}' }}. A hardcoded :53 in either one
+          leaves the disposable macOS instance with nowhere to listen — the
+          live daemon holds 127.0.0.1:53 and macOS refuses other 127/8
+          addresses — which is what made the launchd path untestable.
+        success_msg: "Both Corefile headers use the DNS port variable."
+
+    - name: The Corefile template still notifies a restart
+      # Without the notification nothing is pending, the flush has nothing to
+      # run, and a configuration change never reaches the running daemon.
+      ansible.builtin.assert:
+        that:
+          # Quoted: an unquoted item containing ": " parses as a mapping.
+          - "configure is search('(?s)src: Corefile\\.j2.*?notify: Restart CoreDNS')"
+          - "configure is search('(?s)src: db\\.zone\\.j2.*?notify: Restart CoreDNS')"
+        fail_msg: >-
+          Both the Corefile and the zone template must notify
+          "Restart CoreDNS". A flush with nothing pending changes nothing, and
+          the daemon keeps serving the previous configuration.
+        success_msg: "Both templates notify a restart."
+
+    - name: The role owns its verifier prerequisite, before installing
+      ansible.builtin.assert:
+        that:
+          - mainyml is search('verifier-prereq\.yml')
+          - (mainyml.index('verifier-prereq.yml')) < (mainyml.index('install.yml'))
+        fail_msg: >-
+          roles/coredns/tasks/main.yml must include verifier-prereq.yml, and
+          BEFORE install.yml — a role that installs a resolver it cannot
+          verify leaves a host nobody has checked.
+        success_msg: "The verifier prerequisite is owned, and runs before install."
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Both harnesses are disposable, trapped, confined, and assert the
+          properties that make them meaningful; the Corefile port is a
+          variable and the templates still notify a restart.

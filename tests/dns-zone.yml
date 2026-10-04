@@ -93,6 +93,27 @@
           coredns_ready_address | regex_replace('^.*:', '') }}) avoid Keel's
           console port ({{ keelvars.keel_web_loopback_port }}).
 
+    - name: PRODUCTION STILL USES PORT 53, AND THE SEAM DEFAULTS TO IT
+      # ⚠️ coredns_dns_port EXISTS ONLY SO THE ROLE CAN BE TESTED. It was added
+      # because the macOS launchd path had nowhere to run: the live daemon
+      # holds 127.0.0.1:53, and macOS refuses to bind another 127/8 address
+      # without an `ifconfig lo0 alias` — so a disposable instance could use
+      # neither another address nor another port, and three of this rollout's
+      # defects reached production through that untested path.
+      #
+      # The disposable test overrides it with a free high port. Production
+      # must not: every LAN client expects 53, and a drift here would be
+      # invisible until nothing could resolve.
+      ansible.builtin.assert:
+        that:
+          - (coredns_dns_port | int) == 53
+          - (coredns_dns_port | string) == '53'
+        fail_msg: >-
+          coredns_dns_port is {{ coredns_dns_port }}. The shipped default must
+          be exactly 53 — it is a testability seam, not a tuning knob, and
+          only the disposable test may override it.
+        success_msg: "coredns_dns_port defaults to 53, as production requires."
+
     - name: And they stay on loopback, where only this host can reach them
       ansible.builtin.assert:
         that:
@@ -370,6 +391,9 @@
     - name: The zone is served from a file and never forwarded
       ansible.builtin.assert:
         that:
+          # ⚠️ BOTH HEADERS RENDER `:53` WITH THE SHIPPED DEFAULT. The port is
+          # a variable now, so this proves the seam did not change what
+          # production actually serves.
           - core_text is search('(?m)^dc1\.lan:53 \{')
           # ⚠️ `.:53` WITH NO SPACE, AND THIS CHECK IS HERE BECAUSE THE
           # TEMPLATE GOT IT WRONG. A block header is `ZONE...[:PORT]`, so

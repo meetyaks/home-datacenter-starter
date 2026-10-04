@@ -28,6 +28,32 @@ echo "══ LAN DNS — the two service definitions (24 checks) ═════
 ansible-playbook tests/dns-services.yml
 
 echo
+echo "══ LAN DNS — the role EXECUTED on Linux, end to end ═══════════════"
+# ⚠️ THE SUITE THAT WOULD HAVE CAUGHT ALL SIX DEFECTS. Every other DNS suite
+# renders templates or parses YAML; this one runs the role against a
+# throwaway systemd host and then asks the running process questions. It
+# needs a NATIVE amd64 host — the role pins linux_amd64 only, and dig
+# segfaults under qemu — so on Apple Silicon it skips loudly and runs for
+# real on the amd64 CI runner.
+tests/run-coredns-role.sh
+
+echo
+echo "══ LAN DNS — RED: the same role WITHOUT the handler flush ═════════"
+# ⚠️ THE SIXTH DEFECT, REPRODUCED ON DEMAND. Ansible defers notified handlers
+# to the end of the play, so verify.yml interrogated the process still running
+# the OLD configuration — dc1-arm-1 answered on 8181 from PID 35119 while the
+# Corefile on disk said 8654. This removes the flush inside the container and
+# REQUIRES the run to fail with the old PID alive and the new port absent; it
+# exits 0 only when the defect reproduces. The flush is restored on exit.
+tests/run-coredns-role.sh --red
+
+echo
+echo "══ LAN DNS — the role EXECUTED on macOS launchd, disposably ═══════"
+# ⚠️ OPERATOR-RUN, ON THE MANAGEMENT NODE. A disposable prefix, a unique
+# launchd label and three free high ports, beside the live resolver, with
+# before/after proof that the live daemon is untouched. Skips on Linux.
+tests/run-coredns-launchd.sh
+
 echo "══ LAN DNS — task shape: Ansible will accept every conditional ════"
 # ⚠️ THE THIRD dc1-arm-1 FAILURE, AS A TEST. The deployment reached the LAST
 # task of the primary — CoreDNS installed, every record resolving — and died
@@ -36,6 +62,16 @@ echo "══ LAN DNS — task shape: Ansible will accept every conditional ═�
 # executes verify.yml, so nothing had ever looked at it. This checks the shape
 # of every conditional in the role statically.
 ansible-playbook tests/dns-task-shape.yml
+
+echo
+echo "══ LAN DNS — the harnesses are still harnesses (11 checks) ════════"
+# ⚠️ A BROKEN HARNESS PASSES. The two suites above are the first things here
+# that EXECUTE the role, and the macOS one runs a real root daemon beside the
+# LAN's primary resolver. Its safety rests on a unique label, a confined
+# prefix, teardown that always runs, and assertions that can tell a restarted
+# daemon from a stale one — none of which running it would reveal as missing.
+# A harness that had lost the first would bootout the live resolver.
+ansible-playbook tests/dns-harness-integrity.yml
 
 echo "══ LAN DNS — install path: directories + extraction (24 checks) ═══"
 # ⚠️ A REAL DEPLOYMENT DIED ON THIS. The first watched run from dc1-arm-1

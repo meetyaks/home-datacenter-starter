@@ -322,6 +322,54 @@
              | selectattr('name', 'search', 'bind')
              | list }}
 
+    - name: Summarise roles/coredns/tasks/main.yml, in order
+      # ⚠️ `ansible.builtin.meta` CANNOT BE REACHED WITH selectattr — Jinja
+      # reads the dots as a nested path (task['ansible']['builtin']['meta']).
+      # So each task is reduced to its index, name and JSON here, and the
+      # ordering assertion below asks questions of those instead.
+      ansible.builtin.set_fact:
+        main_summary: >-
+          {{ main_summary | default([]) + [ {
+               'idx': i,
+               'name': item.name | default(''),
+               'json': item | to_json
+             } ] }}
+      loop: "{{ lookup('file', '../roles/coredns/tasks/main.yml') | from_yaml }}"
+      loop_control:
+        index_var: i
+        label: "{{ item.name | default('(unnamed)') }}"
+
+    - name: HANDLERS ARE FLUSHED BEFORE ANYTHING VERIFIES THE SERVICE
+      # ⚠️ THE SIXTH DEFECT, AS A STATIC GUARD. Ansible runs notified handlers
+      # at the END of a play, so without an explicit flush the Corefile is
+      # rewritten, `Restart CoreDNS` is notified, and verify.yml interrogates
+      # the process still running the OLD configuration. On dc1-arm-1 that
+      # meant polling health port 8654 while PID 35119 — started hours
+      # earlier — kept serving 8181, and because the play then failed, the
+      # pending handler never ran at all.
+      #
+      # Order is the whole property: a flush AFTER verification, or none,
+      # reproduces the defect exactly.
+      ansible.builtin.assert:
+        that:
+          - (flush_idx | length) == 1
+          - (verify_idx | length) == 1
+          - (service_idx | length) == 1
+          - (flush_idx | first) < (verify_idx | first)
+          - (flush_idx | first) > (service_idx | first)
+        fail_msg: >-
+          roles/coredns/tasks/main.yml must flush handlers exactly once,
+          AFTER the service is defined and BEFORE verify.yml runs. Found
+          flush at {{ flush_idx }}, service include at {{ service_idx }},
+          verify include at {{ verify_idx }}. Without it, verification reads
+          a process that has not been restarted yet.
+        success_msg: >-
+          flush_handlers sits between the service definition and verification.
+      vars:
+        flush_idx: "{{ main_summary | selectattr('json', 'search', 'flush_handlers') | map(attribute='idx') | list }}"
+        service_idx: "{{ main_summary | selectattr('name', 'search', 'Define the service') | map(attribute='idx') | list }}"
+        verify_idx: "{{ main_summary | selectattr('name', 'search', 'Verify it answers') | map(attribute='idx') | list }}"
+
     - name: Done
       ansible.builtin.debug:
         msg: >-
