@@ -663,6 +663,20 @@ expect_red dns-harness-integrity.yml 'expired sudo timestamp|tsudo' \
            "teardown that fails silently on an expired sudo timestamp is caught"
 
 restore
+# ⚠️ THE DEFECT THE FIRST REAL dc1-arm-1 RUN FOUND. Dropping
+# --ask-become-pass leaves the harness relying on the tty-scoped sudo ticket
+# that Ansible's pipe-wired subprocess cannot see.
+perl -pi -e 's{ansible-playbook --ask-become-pass }{ansible-playbook }' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'ask-become-pass|cached ticket' \
+           "relying on a cached sudo ticket instead of --ask-become-pass is caught"
+
+restore
+# A password supplied as an argument is visible in ps to every local user.
+perl -pi -e 's{ansible-playbook --ask-become-pass }{ansible-playbook -e ansible_become_password=hunter2 }' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'ask-become-pass|ansible_become_password|command line' \
+           "passing a become password on the command line is caught"
+
+restore
 # The orphan-name RED bug, re-introduced in the macOS harness.
 perl -0pi -e "s{  perl -0pi -e 's\\{- name: Apply every pending restart.*?\\n}{  perl -ni -e 'print unless /ansible.builtin.meta: flush_handlers/' \"\\\$MAIN\"\n}s" "$LAUNCHD"
 perl -0pi -e 's{  if grep -q .Apply every pending restart. "\$MAIN"; then\n(?:.*?\n)*?  fi\n}{}' "$LAUNCHD"

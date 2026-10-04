@@ -45,6 +45,10 @@ cd "$(dirname "$0")/.." || { echo "cannot reach the repository root" >&2; exit 1
 
 MODE=${1:-}
 
+# Counts the BECOME prompts so the operator knows how many are still coming.
+# Initialised because `set -u` makes $((++PROMPTS)) an error on an unset name.
+PROMPTS=0
+
 pass=0
 fail=0
 ok()   { printf '  \033[32mpass\033[0m  %s\n' "$1"; pass=$((pass + 1)); }
@@ -320,7 +324,31 @@ need_sudo() {
 }
 
 run_role() {   # run_role <dns> <health> <ready> <logfile>
-  ansible-playbook -i localhost, -c local \
+  # ⚠️ --ask-become-pass, AND `sudo -v` IS NOT A SUBSTITUTE. The first real
+  # run of this harness on dc1-arm-1 died here:
+  #
+  #   TASK [coredns : Create the directories this role installs into]
+  #   Task failed: Premature end of stream waiting for become success.
+  #   >>> Standard Error
+  #   sudo: a password is required
+  #
+  # The harness had already run `sudo -v` and the timestamp was valid — in
+  # THIS shell. macOS sudo defaults to timestamp_type=tty, so the ticket is
+  # scoped to the controlling terminal. Ansible's local connection runs
+  # `sudo -n ...` in a subprocess wired to pipes, with no controlling tty, so
+  # it looks up a different timestamp record, finds none, and `-n` makes it
+  # fail rather than prompt.
+  #
+  # The fix is the one every documented invocation of this role already uses
+  # (roles/coredns/README.md, docs/dc1-lan-dns.md): let Ansible collect the
+  # password itself. It costs one prompt per run, three per GREEN pass, and
+  # the password never reaches a command line, an environment variable, a
+  # file or this log.
+  # (enforced: tests/dns-harness-integrity.yml "the role is run with
+  #  --ask-become-pass, never a cached ticket", mutation "relying on a cached
+  #  sudo ticket instead of --ask-become-pass")
+  echo "  (Ansible will now ask for your BECOME password — this is prompt $((++PROMPTS)) of 3)" >&2
+  ansible-playbook --ask-become-pass -i localhost, -c local \
     tests/container/coredns-disposable-play.yml \
     -e coredns_bin_dir_darwin="$ROOT/sbin" \
     -e coredns_conf_dir_darwin="$ROOT/etc" \

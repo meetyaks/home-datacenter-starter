@@ -197,6 +197,37 @@
           harness exists to remove.
         success_msg: "Denied sudo fails the run rather than reporting a pass."
 
+    - name: The role is run with --ask-become-pass, never a cached ticket
+      # ⚠️ THE FIRST REAL RUN ON dc1-arm-1 DIED ON THIS. The harness primed
+      # sudo with `sudo -v` and the ticket was valid in its own shell — but
+      # macOS sudo defaults to timestamp_type=tty, and Ansible's local
+      # connection runs `sudo -n` in a pipe-wired subprocess with no
+      # controlling tty. Different timestamp record, none found, and `-n`
+      # fails instead of prompting:
+      #
+      #   Task failed: Premature end of stream waiting for become success.
+      #   sudo: a password is required
+      #
+      # Every documented invocation of this role already passes
+      # --ask-become-pass. The harness must too. getpass prompts and reads on
+      # /dev/tty, so the password reaches neither the log nor the command
+      # line — which is also why the run log may be redirected safely.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('ansible-playbook --ask-become-pass')
+          # A password must never be passed as an argument or an environment
+          # variable, which are both visible in `ps` to every local user.
+          - not (launchd is search('ansible_become_password'))
+          - not (launchd is search('become-password-file'))
+          - not (launchd is search('ANSIBLE_BECOME_PASS'))
+        fail_msg: >-
+          tests/run-coredns-launchd.sh must invoke ansible-playbook with
+          --ask-become-pass. `sudo -v` caches a TTY-scoped ticket that
+          Ansible's subprocess cannot see, so the run dies at the first
+          privileged task. A password must never be supplied through an
+          argument, an environment variable or a file.
+        success_msg: "The role is run with --ask-become-pass and no password ever leaves the tty."
+
     - name: Teardown survives an expired sudo timestamp
       # Teardown is where a root-owned daemon and prefix are removed. With
       # bare `sudo -n`, every removal fails silently once the grace period
