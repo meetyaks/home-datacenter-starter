@@ -231,9 +231,33 @@ PID1=$(inx 'systemctl show coredns -p MainPID --value' 2>/dev/null | tr -d '\r\n
 
 if [ "$MODE" = "--red" ]; then
   cp "$MAIN" "$WORK/main.yml.orig"
-  perl -ni -e 'print unless /ansible\.builtin\.meta: flush_handlers/' "$MAIN"
+  # ⚠️ REMOVE THE WHOLE TASK, NAME AND ALL. Deleting only the
+  # `ansible.builtin.meta: flush_handlers` line leaves an orphan `- name:`
+  # with no module, and Ansible dies on "no module/action detected in task"
+  # in a third of a second — before it installs anything, before it
+  # reconfigures anything, and nowhere near verification.
+  #
+  # The run still "fails", the old pid is still alive, the old port is still
+  # live and the new one is still absent, so three of the four RED checks
+  # below pass TRIVIALLY. That is a vacuous proof: it would hold just as well
+  # against a typo. The fourth check — that it failed polling the NEW ready
+  # port against the OLD process — is the one that caught this, which is
+  # precisely why "red for the right reason" is a rule here.
+  # The `(?:  #[^\n]*\n|\n)*` spans the comment block that sits between the
+  # task's name and its module — the task is heavily annotated, and a pattern
+  # that assumed the two lines were adjacent would match nothing and leave
+  # the flush in place, turning the RED run green for no reason at all.
+  perl -0pi -e 's{- name: Apply every pending restart[^\n]*\n(?:  \#[^\n]*\n|\n)*  ansible\.builtin\.meta: flush_handlers\n}{}' "$MAIN"
   RED_APPLIED=yes
   grep -q 'flush_handlers' "$MAIN" && { bad "RED: flush removed" "still present"; exit 1; }
+  # ⚠️ AND NO ORPHANED NAME MAY REMAIN. This is the actual check, not a YAML
+  # parse: a `- name:` with no module is the exact wreckage the first version
+  # left behind, and it is what made the run die instantly instead of
+  # reaching verification. Checked by absence of the task name, so the
+  # harness needs no YAML library on the host.
+  grep -q 'Apply every pending restart' "$MAIN" \
+    && { bad "RED: no orphaned task left behind" \
+              "the name survived without its module — the run would die parsing, not verifying"; exit 1; }
   echo "  RED mode: flush removed from $MAIN (restored in cleanup)"
   inx 'rm -rf /work && cp -a /repo /work' >/dev/null 2>&1
 fi
@@ -256,9 +280,19 @@ if [ "$MODE" = "--red" ]; then
     inx 'curl -sS -o /dev/null --max-time 3 http://127.0.0.1:8753/health' >/dev/null 2>&1 \
       && bad "RED: the NEW health port is absent" "8753 is already listening" \
       || ok "RED: the NEW health port 8753 is absent"
-    grep -qE 'Connection refused|8754' /tmp/coredns-linux-2.log \
-      && ok "RED: it failed polling the NEW ready port against the OLD process" \
-      || bad "RED: failed for the stale-process reason" "see /tmp/coredns-linux-2.log"
+    # ⚠️ THE CHECK THAT CAUGHT A VACUOUS RED. The three above can all pass
+    # when the run dies instantly for an unrelated reason — nothing started,
+    # so of course the old pid is alive and the new port is absent. This one
+    # requires the failure to be ABOUT the new ports, which only happens if
+    # the role actually got as far as verifying. It is the difference between
+    # reproducing the defect and merely failing.
+    if grep -qE 'Connection refused|8753|8754' /tmp/coredns-linux-2.log; then
+      ok "RED: it failed polling the NEW ports against the OLD process"
+    else
+      bad "RED: failed for the stale-process reason" \
+          "the run failed, but not at verification — see the tail below"
+      tail -25 /tmp/coredns-linux-2.log | sed 's/^/           /'
+    fi
   fi
   echo; echo "RED phase complete — the harness reproduces the defect on Linux."
   exit $((fail > 0))
