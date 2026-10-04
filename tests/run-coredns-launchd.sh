@@ -69,6 +69,21 @@ PLIST="$ROOT/${LABEL}.plist"
 # across reboots needs the system directory, and a disposable service must
 # NOT persist. Nothing permanent is created.
 
+# ⚠️ THE EXITS THAT HAPPEN BEFORE THE TEARDOWN TRAP IS ARMED. $ROOT already
+# exists by this point — mktemp created it — so an early refusal must take it
+# with it, or the run leaves a stray prefix behind while reporting that it
+# changed nothing. Nothing privileged has been created yet, so no sudo is
+# needed and none is used; the path is still checked against the mktemp
+# pattern before anything is removed.
+early_abort() {
+  case "$ROOT" in
+    /*/coredns-disposable.*) rm -rf "$ROOT" && echo "  removed $ROOT" ;;
+    *) echo "  REFUSING to remove unexpected path: $ROOT" ;;
+  esac
+  echo "Nothing disposable was created. No host state was changed." >&2
+  exit 1
+}
+
 free_port() {
   # Ask the kernel for an unused port by binding one and releasing it.
   python3 - <<'PY'
@@ -81,6 +96,23 @@ PY
 }
 DNS_PORT=$(free_port); HEALTH_PORT=$(free_port); READY_PORT=$(free_port)
 DNS_PORT2=$(free_port); HEALTH_PORT2=$(free_port); READY_PORT2=$(free_port)
+
+# ⚠️ DISTINCTNESS IS NOT GUARANTEED BY THE KERNEL, so it is checked. Each
+# free_port is a SEPARATE python3 process that binds a port and immediately
+# releases it; nothing stops the ephemeral cursor handing the same number to
+# two of them. Two equal ports would put DNS and health — or the old and new
+# health — on one socket, CoreDNS would refuse to start, and the run would
+# fail for a reason that has nothing to do with the role. This test gets ONE
+# operator run; it does not get to fail confusingly.
+# (enforced: tests/dns-harness-integrity.yml "the six disposable ports are
+#  proved distinct", mutation "allowing two disposable ports to collide")
+if [ "$(printf '%s\n' "$DNS_PORT" "$HEALTH_PORT" "$READY_PORT" \
+                      "$DNS_PORT2" "$HEALTH_PORT2" "$READY_PORT2" \
+        | sort -u | wc -l | tr -d ' ')" != 6 ]; then
+  bad "the six disposable ports are distinct" \
+      "got $DNS_PORT $HEALTH_PORT $READY_PORT / $DNS_PORT2 $HEALTH_PORT2 $READY_PORT2 — re-run"
+  early_abort
+fi
 
 echo "Disposable identity for this run:"
 echo "  root   $ROOT"
@@ -103,6 +135,35 @@ LIVE_ANSWER_BEFORE=$(dig +short +time=3 +tries=1 @127.0.0.1 keel-dev.dc1.lan A 2
 
 echo "Live daemon recorded: pid=${LIVE_PID_BEFORE:-none} corefile=${LIVE_COREFILE_BEFORE:0:12}…"
 
+# ⚠️ AN EMPTY BASELINE PROVES NOTHING, AND THIS IS THE SAME TRAP AS THE
+# VACUOUS RED. Every non-interference check below is an equality test against
+# these values. If pgrep matched nothing and the fingerprints came back empty,
+# "" = "" would hold after the run and the harness would report six passes
+# while having measured precisely nothing — including on a machine where the
+# live resolver had been stopped, or where it runs under a command line this
+# pattern does not match.
+#
+# So the baseline must be non-empty before anything disposable is created. If
+# the live daemon genuinely is not running, that is a state to report and have
+# the operator resolve, not one to silently call "unchanged".
+# (enforced: tests/dns-harness-integrity.yml "the live baseline is non-empty
+#  before anything disposable starts", mutation "accepting an empty baseline")
+for _probe in "LIVE_PID_BEFORE:$LIVE_PID_BEFORE" \
+              "LIVE_COREFILE_BEFORE:$LIVE_COREFILE_BEFORE" \
+              "LIVE_ZONE_BEFORE:$LIVE_ZONE_BEFORE" \
+              "LIVE_BIN_BEFORE:$LIVE_BIN_BEFORE" \
+              "LIVE_PLIST_BEFORE:$LIVE_PLIST_BEFORE" \
+              "LIVE_ANSWER_BEFORE:$LIVE_ANSWER_BEFORE"; do
+  if [ -z "${_probe#*:}" ]; then
+    bad "the live baseline is non-empty before anything disposable starts" \
+        "${_probe%%:*} is empty — every non-interference check below would compare '' with '' and pass without measuring anything. Is the live CoreDNS running?"
+    echo
+    echo "REFUSING TO RUN — the non-interference baseline could not be established." >&2
+    early_abort
+  fi
+done
+ok "the live baseline is non-empty (pid, binary, Corefile, zone, plist, answer)"
+
 DISPOSABLE_PID=""
 
 # ── RED mode removes the flush from the REAL role, and puts it back ────────
@@ -118,10 +179,23 @@ RED_APPLIED=no
 
 apply_red() {
   cp "$MAIN" "$MAIN_BACKUP"
-  perl -ni -e 'print unless /ansible\.builtin\.meta: flush_handlers/' "$MAIN"
+  # ⚠️ REMOVE THE WHOLE TASK, NAME AND ALL, SPANNING ITS COMMENT BLOCK.
+  # Deleting only the `ansible.builtin.meta: flush_handlers` line leaves an
+  # orphaned `- name:` with no module; Ansible then dies on "no module/action
+  # detected in task" in a fraction of a second, before installing or
+  # reconfiguring anything. The run still "fails" and the old pid is still
+  # alive, so the RED checks below pass TRIVIALLY — a proof that would hold
+  # equally well against a typo. The Linux harness shipped exactly that bug
+  # and CI caught it; this is the same fix.
+  perl -0pi -e 's{- name: Apply every pending restart[^\n]*\n(?:  \#[^\n]*\n|\n)*  ansible\.builtin\.meta: flush_handlers\n}{}' "$MAIN"
   RED_APPLIED=yes
   if grep -q 'flush_handlers' "$MAIN"; then
     bad "RED: the flush was removed" "it is still present in $MAIN"
+    return 1
+  fi
+  if grep -q 'Apply every pending restart' "$MAIN"; then
+    bad "RED: no orphaned task left behind" \
+        "the name survived without its module — the run would die parsing, not verifying"
     return 1
   fi
   echo "  (flush removed from $MAIN for this run; restored in teardown)"
@@ -138,13 +212,27 @@ restore_red() {
   fi
 }
 
+# ⚠️ TEARDOWN MUST NOT BE DEFEATED BY AN EXPIRED SUDO TIMESTAMP. The run can
+# take longer than the sudo grace period, and teardown is where a root-owned
+# launchd daemon and a root-owned prefix get removed. With bare `sudo -n`,
+# every removal would fail silently the moment the timestamp lapsed, and the
+# harness would leave a live disposable daemon behind while printing that it
+# had cleaned up. So: try non-interactively, and if that fails, PROMPT — the
+# operator is at an interactive terminal precisely because this needs sudo.
+tsudo() {
+  if sudo -n true 2>/dev/null; then sudo -n "$@"; else
+    echo "  (sudo timestamp expired — re-authenticating to finish teardown)" >&2
+    sudo "$@"
+  fi
+}
+
 teardown() {
   restore_red
   echo
   echo "── teardown (runs on success, failure and interrupt) ──"
   # 1. Bootout ONLY the unique disposable label.
-  if sudo -n launchctl print "system/${LABEL}" >/dev/null 2>&1; then
-    sudo -n launchctl bootout "system/${LABEL}" >/dev/null 2>&1 \
+  if tsudo launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+    tsudo launchctl bootout "system/${LABEL}" >/dev/null 2>&1 \
       && echo "  booted out ${LABEL}" || echo "  bootout of ${LABEL} returned non-zero"
   else
     echo "  ${LABEL} was not loaded"
@@ -152,14 +240,14 @@ teardown() {
   # 2. Kill ONLY the recorded disposable PID, and only if it is still ours.
   if [ -n "$DISPOSABLE_PID" ] && kill -0 "$DISPOSABLE_PID" 2>/dev/null; then
     if ps -p "$DISPOSABLE_PID" -o command= | grep -q "$ROOT"; then
-      sudo -n kill "$DISPOSABLE_PID" 2>/dev/null && echo "  killed disposable pid $DISPOSABLE_PID"
+      tsudo kill "$DISPOSABLE_PID" 2>/dev/null && echo "  killed disposable pid $DISPOSABLE_PID"
     else
       echo "  pid $DISPOSABLE_PID is no longer ours — NOT killing it"
     fi
   fi
   # 3. Remove ONLY the exact temporary root.
   case "$ROOT" in
-    /*/coredns-disposable.*) sudo -n rm -rf "$ROOT" && echo "  removed $ROOT" ;;
+    /*/coredns-disposable.*) tsudo rm -rf "$ROOT" && echo "  removed $ROOT" ;;
     *) echo "  REFUSING to remove unexpected path: $ROOT" ;;
   esac
 
@@ -191,7 +279,7 @@ teardown() {
   else ok "no disposable plist survives"; fi
   if [ -e "$ROOT" ]; then bad "no disposable prefix survives" "$ROOT still exists"
   else ok "no disposable prefix survives"; fi
-  if sudo -n launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+  if tsudo launchctl print "system/${LABEL}" >/dev/null 2>&1; then
     bad "no disposable launchd label survives" "system/${LABEL} is still loaded"
   else ok "no disposable launchd label survives"; fi
 
@@ -207,13 +295,27 @@ trap teardown EXIT INT TERM
 # ── sudo, cached once; the role uses become for every privileged task ──────
 echo
 echo "This test needs sudo (the role installs a launchd system daemon)."
+# ⚠️ DENIED SUDO IS A FAILURE, NOT A SKIP. This used to `skip` and `exit 0`,
+# which meant teardown found fail=0 and printed "PASS — N checks" after
+# exercising nothing at all. The launchd path is the half of this role that no
+# test has ever executed and where three of the six defects lived; a run that
+# could not reach it has not passed, and must not be reportable as a pass.
+# (enforced: tests/dns-harness-integrity.yml "a run that cannot reach launchd
+#  is a failure, not a pass", mutation "turning denied sudo back into a skip")
 if ! sudo -v; then
-  skip "sudo was not granted; the launchd path cannot be exercised."
-  exit 0
+  bad "sudo was granted, so the launchd path can be exercised" \
+      "sudo was refused — nothing was installed, started or verified, and this run proves nothing"
+  exit 1
 fi
 need_sudo() {
   sudo -n true 2>/dev/null && return 0
-  bad "sudo credential still valid" "the sudo timestamp expired mid-run; re-run the test"
+  # Re-prompt rather than abandon the run: the operator is at an interactive
+  # terminal, the sudo grace period is shorter than three role runs, and
+  # throwing away a run that has already installed a disposable daemon just
+  # because a timestamp lapsed wastes the one window this gate gets.
+  echo "  (sudo timestamp expired — re-authenticating to continue)"
+  sudo -v && return 0
+  bad "sudo credential still valid" "sudo could not be renewed mid-run; re-run the test"
   return 1
 }
 

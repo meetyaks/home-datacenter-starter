@@ -636,6 +636,39 @@ perl -ni -e 'print unless /third run reported changed=0/' "$LAUNCHD"
 expect_red dns-harness-integrity.yml 'changed=0|no-op' \
            "allowing second-run churn is caught"
 
+restore
+# ⚠️ THE VACUOUS NON-INTERFERENCE PROOF. Accepting an empty baseline makes
+# every "unchanged" check compare "" with "" — six passes, nothing measured.
+perl -0pi -e 's{^for _probe in .*?^done\n^ok "the live baseline is non-empty[^\n]*\n}{}ms' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'live baseline is non-empty|REFUSING TO RUN' \
+           "accepting an empty live baseline is caught"
+
+restore
+perl -0pi -e 's{^if \[ "\$\(printf .*?^fi\n}{}ms' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'ports are distinct|sort -u' \
+           "allowing two disposable ports to collide is caught"
+
+restore
+# ⚠️ A REAL FALSE PASS, RESTORED AS A MUTATION. Denied sudo used to skip and
+# exit 0, so teardown printed "PASS" after exercising nothing.
+perl -0pi -e 's{  bad "sudo was granted, so the launchd path can be exercised" \\\n[^\n]*\n  exit 1\n}{  skip "sudo was not granted; the launchd path cannot be exercised."\n  exit 0\n}' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'failure, not a pass|sudo was granted' \
+           "turning denied sudo back into a skip is caught"
+
+restore
+# Revert every teardown call to the bare non-interactive form, which is what
+# silently fails once the sudo grace period lapses.
+perl -pi -e 's{\btsudo }{sudo -n }g' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'expired sudo timestamp|tsudo' \
+           "teardown that fails silently on an expired sudo timestamp is caught"
+
+restore
+# The orphan-name RED bug, re-introduced in the macOS harness.
+perl -0pi -e "s{  perl -0pi -e 's\\{- name: Apply every pending restart.*?\\n}{  perl -ni -e 'print unless /ansible.builtin.meta: flush_handlers/' \"\\\$MAIN\"\n}s" "$LAUNCHD"
+perl -0pi -e 's{  if grep -q .Apply every pending restart. "\$MAIN"; then\n(?:.*?\n)*?  fi\n}{}' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'orphaned task|print unless' \
+           "a RED mutation that leaves an orphaned task is caught"
+
 echo
 echo "── everything is restored ──"
 restore

@@ -150,6 +150,91 @@
           first check the second proves nothing.
         success_msg: "The Linux harness proves dig ownership rather than assuming it."
 
+    - name: The live baseline is non-empty before anything disposable starts
+      # ⚠️ THE VACUOUS-PROOF TRAP, IN ITS MOST DANGEROUS PLACE. Every
+      # non-interference check is an equality test against the recorded
+      # baseline. If pgrep matched nothing and the fingerprints came back
+      # empty, "" = "" would hold afterwards and the harness would report six
+      # passes having measured nothing — on a machine where the live resolver
+      # was stopped, or whose command line the pattern no longer matches.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('the live baseline is non-empty')
+          - launchd is search('REFUSING TO RUN')
+          - launchd is search('LIVE_PID_BEFORE:\$LIVE_PID_BEFORE')
+        fail_msg: >-
+          tests/run-coredns-launchd.sh must refuse to run when any part of the
+          live baseline is empty. Without that, the non-interference proof
+          compares empty strings and passes without measuring anything.
+        success_msg: "An empty live baseline refuses the run instead of faking six passes."
+
+    - name: The six disposable ports are proved distinct
+      # Two equal ports would put DNS and health on one socket; CoreDNS would
+      # refuse to start and the run would fail for a reason unrelated to the
+      # role. This gate gets one operator run.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('the six disposable ports are distinct')
+          - launchd is search('sort -u')
+        fail_msg: >-
+          The six dynamically chosen ports must be checked for distinctness.
+          Each free_port is a separate process; nothing in the kernel promises
+          two of them differ.
+        success_msg: "The six disposable ports are checked for distinctness."
+
+    - name: A run that cannot reach launchd is a failure, not a pass
+      # ⚠️ THIS WAS A REAL FALSE PASS. Denied sudo used to `skip` and exit 0,
+      # so teardown saw fail=0 and printed "PASS — N checks" after exercising
+      # nothing. The launchd path is where three of this rollout's six defects
+      # lived; a run that never reached it has not passed.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('sudo was granted, so the launchd path can be exercised')
+          - not (launchd is search('skip "sudo was not granted'))
+        fail_msg: >-
+          Denied sudo must fail the run, not skip it. A skipped launchd
+          section reported as a pass is exactly the false assurance this
+          harness exists to remove.
+        success_msg: "Denied sudo fails the run rather than reporting a pass."
+
+    - name: Teardown survives an expired sudo timestamp
+      # Teardown is where a root-owned daemon and prefix are removed. With
+      # bare `sudo -n`, every removal fails silently once the grace period
+      # lapses — leaving a live disposable daemon while printing "cleaned up".
+      ansible.builtin.assert:
+        that:
+          - launchd is search('tsudo\(\)')
+          - launchd is search('tsudo launchctl bootout')
+          - launchd is search('tsudo rm -rf "\$ROOT"')
+          - launchd is search('tsudo kill')
+        fail_msg: >-
+          Teardown must re-authenticate if the sudo timestamp has expired.
+          Bare `sudo -n` there fails silently and leaves a root-owned daemon
+          and prefix behind while reporting a clean teardown.
+        success_msg: "Teardown re-authenticates rather than failing silently."
+
+    - name: Neither RED mutation leaves an orphaned task behind
+      # Removing only the `meta:` line leaves a `- name:` with no module;
+      # Ansible dies parsing, in a fraction of a second, and the RED checks
+      # pass trivially because nothing ever started. CI caught this in the
+      # Linux harness; both must carry the fix.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('no orphaned task left behind')
+          - linux is search('no orphaned task left behind')
+          # ⚠️ The pattern deliberately stops before the colon. Written in
+          # full it contains ": ", and an unquoted conditional item holding
+          # ": " is parsed by YAML as a MAPPING — defect 3 of this very
+          # rollout, which this suite exists partly to prevent.
+          - not (launchd is search('print unless /ansible\\.builtin\\.meta'))
+          - not (linux is search('print unless /ansible\\.builtin\\.meta'))
+        fail_msg: >-
+          Both RED mutations must remove the whole flush task and then refuse
+          to continue if the task name survived without its module. Otherwise
+          the RED run proves nothing: it fails at parse time, and "old pid
+          still alive" holds because nothing was ever started.
+        success_msg: "Neither RED mutation can leave an orphaned task behind."
+
     # ── THE PRODUCTION PROPERTIES THE HARNESSES DEPEND ON ──────────────────
 
     - name: The Corefile takes its DNS port from the variable, not a literal
