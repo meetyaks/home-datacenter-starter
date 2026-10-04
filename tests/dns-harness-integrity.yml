@@ -31,6 +31,7 @@
   vars:
     launchd: "{{ lookup('file', '../tests/run-coredns-launchd.sh') }}"
     linux: "{{ lookup('file', '../tests/run-coredns-role.sh') }}"
+    gate: "{{ lookup('file', '../tests/run-dc1-macos-gate.sh') }}"
     corefile: "{{ lookup('file', '../roles/coredns/templates/Corefile.j2') }}"
     configure: "{{ lookup('file', '../roles/coredns/tasks/configure.yml') }}"
     mainyml: "{{ lookup('file', '../roles/coredns/tasks/main.yml') }}"
@@ -196,6 +197,47 @@
           section reported as a pass is exactly the false assurance this
           harness exists to remove.
         success_msg: "Denied sudo fails the run rather than reporting a pass."
+
+    - name: The gate refuses to build a baseline on top of a stray
+      # ⚠️ A STRAY DISPOSABLE DAEMON WAS RECORDED AS LIVE STATE. A gate run
+      # captured 127.0.0.1:50345-50347 into the live listener set; those
+      # belonged to a disposable daemon stranded by an earlier interrupted
+      # run. It compared equal to itself afterwards and raised nothing.
+      #
+      # A pre-existing stray breaks two things at once: the baseline stops
+      # describing the live resolver, and leftovers afterwards cannot be
+      # attributed to this run rather than a previous one.
+      ansible.builtin.assert:
+        that:
+          - gate is search('PRE-EXISTING DISPOSABLE STATE FOUND')
+          - gate is search('would contaminate the baseline')
+          - gate is search('launchctl bootout system/')
+        fail_msg: >-
+          tests/run-dc1-macos-gate.sh must refuse to run when a disposable
+          label, process or prefix already exists, and must print the exact
+          scoped commands to remove them. Otherwise the baseline silently
+          includes test state and reports it as live.
+        success_msg: "A pre-existing stray refuses the run instead of poisoning the baseline."
+
+    - name: Teardown identifies its processes by prefix, not by a stale PID
+      # ⚠️ "pid N is no longer ours" MEANT TWO THINGS, AND ONE LEAKED. The
+      # old check was `kill -0 $PID && ps -p $PID | grep $ROOT`. Between the
+      # two calls the process can exit — launchd has just been told to
+      # bootout — so `ps` returns nothing, the grep fails, and a process that
+      # WAS ours is reported as somebody else's and spared. Indistinguishable
+      # from the daemon having died cleanly.
+      ansible.builtin.assert:
+        that:
+          - launchd is search('for _p in \$\(pgrep -f "\$ROOT/sbin/coredns"')
+          - launchd is search('TEARDOWN DID NOT COMPLETE')
+          - not (launchd is search('is no longer ours — NOT killing it'))
+        fail_msg: >-
+          Teardown must find its processes by this run's prefix rather than a
+          PID captured earlier, and must print exact scoped recovery commands
+          if it could not finish. Teardown needs root, so an interrupt at a
+          password prompt can strand it — the operator must never be left
+          guessing what to remove.
+        success_msg: "Teardown identifies by prefix and states how to finish if it cannot."
 
     - name: No check runs its command once to test and again to report
       # ⚠️ CI PRINTED THE CONTRADICTION ITSELF:

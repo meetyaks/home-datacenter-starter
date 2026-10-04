@@ -29,7 +29,19 @@ STAMP=$(date +%Y%m%dT%H%M%SZ)-$$
 WT="$HOME/dc1-gate-worktree-$STAMP"
 EVID="$HOME/dc1-gate-evidence-$STAMP"
 
-die() { echo; echo "BLOCKED: $*" >&2; echo "Nothing was changed." >&2; exit 2; }
+# A refusal must leave nothing behind either — including the worktree, which
+# is created before several of the checks that can still refuse.
+WT_CREATED=no
+die() {
+  echo; echo "BLOCKED: $*" >&2
+  if [ "$WT_CREATED" = yes ] && [ -e "$WT" ]; then
+    git -C "$CANON" worktree remove --force "$WT" >/dev/null 2>&1 \
+      && { git -C "$CANON" worktree prune; echo "Removed the worktree $WT." >&2; } \
+      || echo "NOTE: could not remove the worktree $WT — remove it yourself." >&2
+  fi
+  echo "The live resolver was not touched." >&2
+  exit 2
+}
 hdr() { echo; echo "═══ $* ═══"; }
 
 
@@ -87,6 +99,7 @@ echo "  MATCH — proceeding with the exact reviewed commit"
 # ── Isolated detached worktree. The canonical checkout is NOT switched. ────
 hdr "PHASE 1  isolated detached worktree"
 git worktree add --quiet --detach "$WT" "$PR_HEAD" || die "could not create the worktree"
+WT_CREATED=yes
 WT_HEAD=$(git -C "$WT" rev-parse HEAD)
 [ "$WT_HEAD" = "$PR_HEAD" ] || die "worktree HEAD $WT_HEAD != $PR_HEAD"
 echo "  worktree        $WT"
@@ -97,6 +110,47 @@ hdr "sudo"
 echo "The baseline reads root-owned listeners and the harness installs a"
 echo "launchd system daemon. You will be prompted now, and possibly again."
 sudo -v || die "sudo was refused; the gate cannot run"
+
+# ── Refuse to build a baseline on top of someone else's leftovers ──────────
+#
+# ⚠️ THIS IS NOT HOUSEKEEPING; IT IS WHAT MAKES THE BASELINE MEAN ANYTHING.
+# A run of this gate recorded the live listener set as
+#
+#   ... TCP 127.0.0.1:50345; TCP 127.0.0.1:50346; TCP 127.0.0.1:50347 ...
+#
+# and reported it "same" afterwards. Those three ports were not the live
+# resolver. They belonged to a DISPOSABLE daemon stranded by an earlier,
+# interrupted run — captured into the baseline as though it were production,
+# compared against itself, and passed.
+#
+# Two separate failures follow from a pre-existing stray: the baseline is no
+# longer a picture of the live resolver, and "leftovers" afterwards cannot be
+# attributed — this run's leak and a previous run's look identical. So the
+# gate refuses to start, and says exactly what to remove.
+hdr "PHASE 4  no disposable state may exist before the baseline"
+
+pre_lbl=$(sudo launchctl list 2>/dev/null | awk '/org\.dc1\.corednsdisposable/{print $3}')
+pre_proc=$(pgrep -fl 'coredns-disposable' 2>/dev/null)
+pre_dir=$(find "${TMPDIR:-/tmp}" /tmp -maxdepth 1 -name 'coredns-disposable.*' 2>/dev/null)
+
+if [ -n "$pre_lbl" ] || [ -n "$pre_proc" ] || [ -n "$pre_dir" ]; then
+  echo "  PRE-EXISTING DISPOSABLE STATE FOUND — refusing to run."
+  echo
+  [ -n "$pre_lbl" ]  && { echo "  loaded label(s):"; printf '%s\n' "$pre_lbl"  | sed 's/^/    /'; }
+  [ -n "$pre_proc" ] && { echo "  running process(es):"; printf '%s\n' "$pre_proc" | sed 's/^/    /'; }
+  [ -n "$pre_dir" ]  && { echo "  prefix/prefixes on disk:"; printf '%s\n' "$pre_dir" | sed 's/^/    /'; }
+  echo
+  echo "  These are leftovers from an earlier harness run, not live state."
+  echo "  Remove them, then re-run this gate. For each label and prefix above:"
+  echo
+  [ -n "$pre_lbl" ] && printf '%s\n' "$pre_lbl" | sed 's|^|    sudo launchctl bootout system/|'
+  [ -n "$pre_dir" ] && printf '%s\n' "$pre_dir" | sed "s|^\\(.*\\)$|    sudo pkill -f '\\1/sbin/coredns'|"
+  [ -n "$pre_dir" ] && printf '%s\n' "$pre_dir" | sed "s|^\\(.*\\)$|    sudo rm -rf '\\1'|"
+  echo
+  echo "  Nothing in the live resolver is involved; do not restart it."
+  die "disposable leftovers would contaminate the baseline"
+fi
+echo "  clean — no disposable label, process or prefix exists"
 
 # ── PHASE 4: live baseline ─────────────────────────────────────────────────
 hdr "PHASE 4  live CoreDNS baseline"

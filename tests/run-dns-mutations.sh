@@ -28,6 +28,7 @@ MAIN_TASKS=roles/coredns/tasks/main.yml
 CONFIGURE=roles/coredns/tasks/configure.yml
 PREREQ=roles/coredns/tasks/verifier-prereq.yml
 ROLE_SH=tests/run-coredns-role.sh
+GATE_SH=tests/run-dc1-macos-gate.sh
 # ⚠️ A TEST SCRIPT MUTATED AS IF IT WERE PRODUCTION CODE. The macOS harness
 # runs a real root daemon beside the live resolver, so its safety properties
 # are load-bearing in exactly the way a role's are, and they get the same
@@ -47,6 +48,7 @@ restore() {
   [ -f "$WORK/configure" ] && cp "$WORK/configure" "$CONFIGURE"
   [ -f "$WORK/prereq" ] && cp "$WORK/prereq" "$PREREQ"
   [ -f "$WORK/role_sh" ] && cp "$WORK/role_sh" "$ROLE_SH"
+  [ -f "$WORK/gate_sh" ] && cp "$WORK/gate_sh" "$GATE_SH"
   [ -f "$WORK/launchd" ] && cp "$WORK/launchd" "$LAUNCHD"
   return 0
 }
@@ -64,6 +66,7 @@ cp "$MAIN_TASKS" "$WORK/main_tasks"
 cp "$CONFIGURE" "$WORK/configure"
 cp "$PREREQ" "$WORK/prereq"
 cp "$ROLE_SH" "$WORK/role_sh"
+cp "$GATE_SH" "$WORK/gate_sh"
 cp "$LAUNCHD" "$WORK/launchd"
 
 pass=0
@@ -661,6 +664,19 @@ restore
 perl -pi -e 's{\btsudo }{sudo -n }g' "$LAUNCHD"
 expect_red dns-harness-integrity.yml 'expired sudo timestamp|tsudo' \
            "teardown that fails silently on an expired sudo timestamp is caught"
+
+restore
+# ⚠️ THE STRAY THAT WAS RECORDED AS LIVE STATE. Without the pre-flight, a
+# disposable daemon left by an interrupted run is folded into the baseline.
+perl -0pi -e 's{^hdr "PHASE 4  no disposable state may exist before the baseline"\n.*?^echo "  clean — no disposable label, process or prefix exists"\n}{}ms' "$GATE_SH"
+expect_red dns-harness-integrity.yml 'PRE-EXISTING DISPOSABLE STATE|contaminate the baseline' \
+           "a gate that builds its baseline on top of a stray is caught"
+
+restore
+# The teardown ownership race that spared a process which was in fact ours.
+perl -0pi -e 's{  for _p in \$\(pgrep -f "\$ROOT/sbin/coredns" 2>/dev/null\); do\n.*?^  \[ -n "\$DISPOSABLE_PID" \][^\n]*\n[^\n]*\n}{  if [ -n "\$DISPOSABLE_PID" ] \&\& kill -0 "\$DISPOSABLE_PID" 2>/dev/null; then\n    if ps -p "\$DISPOSABLE_PID" -o command= | grep -q "\$ROOT"; then\n      tsudo kill "\$DISPOSABLE_PID" 2>/dev/null \&\& echo "  killed disposable pid \$DISPOSABLE_PID"\n    else\n      echo "  pid \$DISPOSABLE_PID is no longer ours — NOT killing it"\n    fi\n  fi\n}ms' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'by prefix, not by a stale PID|no longer ours' \
+           "teardown identifying its process by a stale PID is caught"
 
 restore
 # ⚠️ THE FLAKY-CHECK PATTERN CI CAUGHT: test with one invocation, report with

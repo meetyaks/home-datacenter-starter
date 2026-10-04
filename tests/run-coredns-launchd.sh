@@ -241,14 +241,34 @@ teardown() {
   else
     echo "  ${LABEL} was not loaded"
   fi
-  # 2. Kill ONLY the recorded disposable PID, and only if it is still ours.
-  if [ -n "$DISPOSABLE_PID" ] && kill -0 "$DISPOSABLE_PID" 2>/dev/null; then
-    if ps -p "$DISPOSABLE_PID" -o command= | grep -q "$ROOT"; then
-      tsudo kill "$DISPOSABLE_PID" 2>/dev/null && echo "  killed disposable pid $DISPOSABLE_PID"
-    else
-      echo "  pid $DISPOSABLE_PID is no longer ours — NOT killing it"
-    fi
+  # 2. Kill ONLY processes that are provably ours, identified by this run's
+  #    prefix rather than by a PID recorded earlier.
+  #
+  # ⚠️ "pid N is no longer ours" USED TO MEAN TWO DIFFERENT THINGS, and one
+  # of them leaked a daemon. The check was `kill -0 $PID && ps -p $PID | grep
+  # $ROOT`. Between those two calls the process can exit — launchd has just
+  # been told to bootout — so `ps` returns nothing, the grep fails, and a
+  # process that WAS ours is reported as somebody else's and deliberately
+  # spared. Identical output whether the daemon died (fine) or survived with
+  # a momentarily unreadable command line (a leak).
+  #
+  # Now the prefix is the identity: anything still running out of $ROOT is
+  # ours by construction, and nothing else can match.
+  for _p in $(pgrep -f "$ROOT/sbin/coredns" 2>/dev/null); do
+    tsudo kill "$_p" 2>/dev/null && echo "  killed disposable pid $_p"
+  done
+  # Give launchd and the kill a moment, then say plainly whether it worked.
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f "$ROOT/sbin/coredns" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  _still=$(pgrep -f "$ROOT/sbin/coredns" 2>/dev/null | tr '\n' ' ')
+  if [ -n "$_still" ]; then
+    tsudo kill -9 $_still 2>/dev/null && echo "  force-killed $_still"
   fi
+  [ -n "$DISPOSABLE_PID" ] && kill -0 "$DISPOSABLE_PID" 2>/dev/null \
+    && echo "  note: pid $DISPOSABLE_PID still exists but is not running from $ROOT"
+
   # 3. Remove ONLY the exact temporary root.
   case "$ROOT" in
     /*/coredns-disposable.*) tsudo rm -rf "$ROOT" && echo "  removed $ROOT" ;;
@@ -286,6 +306,32 @@ teardown() {
   if tsudo launchctl print "system/${LABEL}" >/dev/null 2>&1; then
     bad "no disposable launchd label survives" "system/${LABEL} is still loaded"
   else ok "no disposable launchd label survives"; fi
+
+  # ⚠️ TEARDOWN NEEDS ROOT, SO INTERRUPTING A PASSWORD PROMPT CAN STRAND IT.
+  # Ctrl-C during a BECOME prompt fires this trap, which then needs sudo
+  # itself and prompts again; a second Ctrl-C kills teardown midway and
+  # leaves a loaded label, a running daemon and a prefix on disk. That is
+  # how a stray from an aborted run was later found still listening on
+  # 50345-50347 — and, worse, silently folded into the NEXT run's "live"
+  # baseline, where it compared equal to itself and raised nothing.
+  #
+  # Nothing can remove a root-owned launchd daemon without root. What this
+  # can do is never leave the operator guessing what to remove.
+  if [ -e "$ROOT" ] || pgrep -f "$ROOT/sbin/coredns" >/dev/null 2>&1 \
+     || tsudo launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+    echo
+    echo "  ╭─ TEARDOWN DID NOT COMPLETE ─────────────────────────────────"
+    echo "  │ Finish it with exactly these three commands. They name this"
+    echo "  │ run's own label and prefix, and touch nothing else:"
+    echo "  │"
+    echo "  │   sudo launchctl bootout system/${LABEL}"
+    echo "  │   sudo pkill -f '${ROOT}/sbin/coredns'"
+    echo "  │   sudo rm -rf '${ROOT}'"
+    echo "  │"
+    echo "  │ Until then, the next run's baseline would silently include"
+    echo "  │ this stray and report it as live state."
+    echo "  ╰──────────────────────────────────────────────────────────────"
+  fi
 
   echo
   if [ "$fail" -gt 0 ]; then
