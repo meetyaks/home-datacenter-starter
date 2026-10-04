@@ -81,20 +81,42 @@
   # the very last task of the primary, after CoreDNS had been installed and
   # every record had already resolved correctly.
   #
-  # ⚠️ SINGLE-QUOTED YAML WITH DOUBLE QUOTES INSIDE, NOT THE REVERSE. A
-  # double-quoted YAML scalar processes backslash escapes, so `\b` in the
-  # second item would become a literal backspace (0x08) and the word-boundary
-  # anchor would silently stop matching. Single quotes pass the backslashes
-  # through untouched.
+  # ⚠️ AND NEITHER ITEM USES A BACKSLASH ESCAPE, WHICH IS THE SECOND HALF OF
+  # THE SAME LESSON. The `aa` check was written `search("flags:[^;]*\baa\b")`
+  # and failed on the host while the IDENTICAL expression returned True from
+  # a `debug` task against the same captured output. Proven on dc1-arm-1,
+  # four variants in one play:
+  #
+  #   that:  search("...\baa\b")    → FAIL
+  #   debug: search("...\baa\b")    → True
+  #   that:  search("...\\baa\\b")  → pass
+  #   that:  search("... aa[ ;]")   → pass
+  #
+  # Ansible's CONDITIONAL evaluation applies Python string-literal escape
+  # processing; ordinary templating does not. So `\b` becomes a backspace
+  # (0x08) only inside `that:`, and the word-boundary anchors silently match
+  # nothing. The neighbouring `\d`, `\S` and `\.` survive untouched precisely
+  # because Python leaves UNRECOGNISED escapes alone — which is why those
+  # assertions always worked and this one never could.
+  #
+  # Doubling the backslash also works, but it depends on counting how many
+  # layers consume one. This matches the literal text instead: dig prints
+  # `;; flags: qr aa rd;`, so ` aa` followed by a space or the terminating
+  # semicolon is exact, and there is nothing left to escape
+  # (enforced: tests/dns-task-shape.yml "no conditional depends on a
+  # backslash escape").
   ansible.builtin.assert:
     that:
       - 'coredns_reserved.stdout is search("status: NXDOMAIN")'
-      - 'coredns_reserved.stdout is search("flags:[^;]*\baa\b")'
+      - 'coredns_reserved.stdout is search("flags:[^;]* aa[ ;]")'
     fail_msg: >-
       keel.{{ coredns_zone }} did not come back as an AUTHORITATIVE NXDOMAIN.
       Either the reserved production name has been added to the zone, or this
       server is not authoritative for {{ coredns_zone }} and the query was
       forwarded — which would mean internal names are leaving the LAN.
-      Response status line:
-      {{ coredns_reserved.stdout_lines | select('search', 'status:') | join(' ') }}
+      ⚠️ BOTH LINES ARE SHOWN BECAUSE THE ASSERTION IS ABOUT BOTH. An earlier
+      version printed only the status line while failing on the flags check,
+      which sent three rounds of diagnosis after the wrong thing.
+      Status: {{ coredns_reserved.stdout_lines | select('search', 'status:') | join(' ') | default('(no status line)', true) }}
+      Flags: {{ coredns_reserved.stdout_lines | select('search', '^;; flags:') | join(' ') | default('(no flags line)', true) }}
     success_msg: "keel.{{ coredns_zone }} → authoritative NXDOMAIN, as reserved."
