@@ -271,6 +271,39 @@ jobs:
       - name: LAN DNS mutations — every guard is proved to fail
         run: tests/run-dns-mutations.sh
 
+      # ── SEMAPHORE UI ────────────────────────────────────────────────────
+      - name: Semaphore — the pin, the exposure model and Git's authority
+        run: ansible-playbook tests/semaphore-config.yml
+
+      - name: Semaphore — task shape, no_log, flush order
+        run: ansible-playbook tests/semaphore-task-shape.yml
+
+      - name: Semaphore — the end-to-end harnesses are still harnesses
+        run: ansible-playbook tests/semaphore-harness-integrity.yml
+
+      # ⚠️ THIS IS THE ONLY STEP THAT ACTUALLY RUNS THE ROLE. Everything
+      #    above parses YAML; this installs a checksum-verified binary under
+      #    a service account on a throwaway systemd host, migrates SQLite,
+      #    bootstraps an administrator, serves /api/ping on loopback,
+      #    restarts before verification and backs up and restores. It needs
+      #    NATIVE amd64, which this runner is.
+      #
+      #    The macOS launchd half cannot run here — there is no macOS runner
+      #    and it needs sudo for a launchd system daemon — so it is
+      #    operator-run on the management node and is NOT silently counted
+      #    as covered by this lane.
+      - name: Semaphore — the role executed end to end on Linux
+        run: tests/run-semaphore-linux.sh
+
+      # The defect reproduced on every run: without meta flush_handlers the
+      # verification step interrogates the process still running the old
+      # configuration. Exits 0 only when the defect reproduces.
+      - name: Semaphore — RED, the same role WITHOUT the handler flush must fail
+        run: tests/run-semaphore-linux.sh --red
+
+      - name: Semaphore mutations — every guard is proved to fail
+        run: tests/run-semaphore-mutations.sh
+
       # ── The static guard check from the existing preflight suite. Its runtime
       #    half needs a source tree this runner does not have, so only the
       #    static half runs here; the full script stays in run-all.sh.

@@ -1,0 +1,264 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE SHAPE OF THE ROLE'S TASKS: ORDER, no_log, AND CONDITIONALS ANSIBLE WILL
+# ACCEPT.
+#
+#   ansible-playbook tests/semaphore-task-shape.yml
+#
+# ⚠️ THIS PARSES THE TASK FILES AS YAML, so it sees executable structure and
+# is blind to comments — which is the point. Three of the CoreDNS rollout's
+# six production defects were shapes exactly like these, and none of them
+# were visible to a template-rendering test.
+#
+# Controller-only.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The Semaphore role's task shape
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Find every task file in the role
+      ansible.builtin.find:
+        paths: "../roles/semaphore/tasks"
+        patterns: "*.yml"
+      register: role_files
+
+    - name: Load them all
+      ansible.builtin.set_fact:
+        all_tasks: >-
+          {{ all_tasks | default([]) + (lookup('file', item.path) | from_yaml) }}
+      loop: "{{ role_files.files | sort(attribute='path') }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    # ── CONDITIONALS ANSIBLE WILL ACTUALLY ACCEPT ──────────────────────────
+    - name: Collect every conditional expression in the role
+      ansible.builtin.set_fact:
+        conditionals: >-
+          {{ (all_tasks | selectattr('when', 'defined') | map(attribute='when') | list)
+             + (all_tasks | selectattr('ansible.builtin.assert', 'defined') | list
+                | map(attribute='ansible.builtin.assert') | selectattr('that', 'defined')
+                | map(attribute='that') | list) }}
+
+    - name: EVERY CONDITIONAL MUST BE A STRING, NOT A MAPPING
+      # ⚠️ THE DEFECT THAT KILLED A DEPLOYMENT ON ITS LAST TASK. An unquoted
+      # `that:` item containing ": " is parsed by YAML as a MAPPING, and
+      # Ansible then refuses the task with "Conditional expressions must be
+      # strings". Nothing controller-only executed the file it was in, so
+      # nothing had ever looked at it.
+      ansible.builtin.assert:
+        that:
+          # ⚠️ Jinja's `string` test, not `__class__` — Ansible's template
+          # sandbox refuses attribute access on `__class__` outright
+          # ("access to attribute '__class__' ... is unsafe"), which is how
+          # the first version of this check failed.
+          - (conditionals | flatten | reject('string') | list | length) == 0
+        fail_msg: >-
+          A conditional is not a string — almost certainly an unquoted item
+          containing ": ", which YAML turns into a mapping. Quote it.
+          Offenders: {{ conditionals | flatten | reject('string') | list }}
+        success_msg: >-
+          All {{ conditionals | flatten | length }} conditionals are strings,
+          so Ansible will accept every one of them.
+
+    - name: NO CONDITIONAL MAY DEPEND ON A BACKSLASH ESCAPE PYTHON EATS
+      # ⚠️ THE FOURTH CoreDNS DEFECT. Ansible applies PYTHON STRING-LITERAL
+      # escape processing to conditional expressions — ordinary templating
+      # does not. So `\b`, `\n`, `\t`, `\0`, `\x`, `\u` are consumed before
+      # the regex engine sees them, and a word-boundary assertion silently
+      # becomes a backspace. `\d`, `\s`, `\w`, `\.` survive, because they are
+      # invalid Python escapes and are passed through.
+      ansible.builtin.assert:
+        that:
+          - (conditionals | flatten | select('search', '\\\\[abfnrtv0xNuU]')
+             | list | length) == 0
+        fail_msg: >-
+          A conditional contains a backslash escape that Python consumes
+          before the regex engine sees it. Offenders:
+          {{ conditionals | flatten | select('search', '\\\\[abfnrtv0xNuU]') | list }}
+        success_msg: "No conditional depends on an escape Python would eat."
+
+    # ── SECRETS ────────────────────────────────────────────────────────────
+    - name: Reduce every task to its name, JSON and no_log flag
+      # ⚠️ BY SUBSCRIPT AND to_json, NOT selectattr ON A DOTTED KEY. Jinja
+      # reads `ansible.builtin.command` as a nested path, so selectattr on a
+      # dotted module name silently matches nothing and any assertion built
+      # on it passes against an empty list.
+      ansible.builtin.set_fact:
+        secret_task_summary: >-
+          {{ secret_task_summary | default([]) + [ {
+               'name': item.name | default('(unnamed)'),
+               'json': item | to_json,
+               'no_log': item.no_log | default(false)
+             } ] }}
+      loop: "{{ all_tasks }}"
+      loop_control:
+        label: "{{ item.name | default('(unnamed)') }}"
+
+    - name: EVERY TASK TOUCHING A SECRET MUST SET no_log
+      # ⚠️ no_log IS LOAD-BEARING, NOT HYGIENE. Ansible echoes task
+      # arguments on failure and template content on diff; without it the
+      # cookie keys, the access-key encryption key and the administrator
+      # password reach the run log and any CI transcript that captured it.
+      ansible.builtin.assert:
+        that:
+          - (offenders | length) == 0
+        fail_msg: >-
+          These tasks reference a secret variable without no_log:
+          {{ offenders | join('; ') }}.
+          Ansible echoes arguments on failure; without no_log the value
+          lands in the run log.
+        success_msg: >-
+          All {{ secret_handlers | length }} secret-handling tasks set
+          no_log.
+      vars:
+        # ⚠️ A TRAILING BOUNDARY, BECAUSE ONE VARIABLE IS A PREFIX OF
+        # ANOTHER. `semaphore_admin_password_min_length` is a policy number,
+        # not a secret, but it CONTAINS `semaphore_admin_password` — so the
+        # first version of this check flagged a debug task that prints no
+        # secret at all and demanded no_log on it. The negative lookahead
+        # keeps the match to the variable itself.
+        secret_handlers: >-
+          {{ secret_task_summary
+             | selectattr('json', 'search',
+                 '(semaphore_cookie_hash|semaphore_cookie_encryption|semaphore_access_key_encryption|semaphore_admin_password)(?![_A-Za-z0-9])')
+             | list }}
+        offenders: >-
+          {{ secret_handlers | rejectattr('no_log') | map(attribute='name') | list }}
+
+    - name: THE CONFIG TEMPLATE TASK MUST SET no_log AND RENDER 0600
+      # ⚠️ IT HANDLES SECRETS WITHOUT NAMING ONE, which is why the check
+      # above cannot see it. The three keys live in config.json.j2, so the
+      # TASK's arguments mention only `src: config.json.j2` — and a scan for
+      # secret variable names finds nothing. Ansible still echoes rendered
+      # template content on diff and on failure, so this task leaks all
+      # three without no_log, and publishes them to every local account
+      # without 0600. Found by a mutation that stripped both and went
+      # unnoticed.
+      ansible.builtin.assert:
+        that:
+          - (cfg_task | length) == 1
+          - (cfg_task | first).no_log | default(false)
+          - ((cfg_task | first)['ansible.builtin.template']).mode == '0600'
+        fail_msg: >-
+          The task rendering config.json.j2 must set no_log: true and
+          mode: "0600". Found {{ cfg_task | length }} such task(s),
+          no_log={{ (cfg_task | first).no_log | default(false) }},
+          mode={{ ((cfg_task | first)['ansible.builtin.template']).mode
+                  | default('unset') }}.
+        success_msg: "The configuration template task is no_log and 0600."
+      vars:
+        cfg_task: >-
+          {{ (lookup('file', '../roles/semaphore/tasks/configure.yml') | from_yaml)
+             | selectattr('name', 'eq', 'Render the configuration') | list }}
+
+    - name: THE DOWNLOAD MUST VERIFY A CHECKSUM
+      # ⚠️ get_url COMPARES BEFORE THE FILE IS USABLE, which is the only
+      # thing standing between a substituted artifact and a binary that runs
+      # as a service account and executes playbooks. Without the checksum
+      # argument the download still "works", which is exactly why this has
+      # to be asserted rather than assumed.
+      ansible.builtin.assert:
+        that:
+          - install_raw is search('ansible\.builtin\.get_url')
+          - install_raw is search('checksum')
+          - install_raw is search('semaphore_checksums\[semaphore_platform\]')
+        fail_msg: >-
+          The artifact download in install.yml must pass a checksum derived
+          from semaphore_checksums. Without it, any artifact served at that
+          URL would be installed and run.
+        success_msg: "The download verifies the pinned SHA-256."
+      vars:
+        install_raw: "{{ lookup('file', '../roles/semaphore/tasks/install.yml') }}"
+
+    - name: THE PREFLIGHT MUST STILL CHECK ALL FOUR SECRETS
+      # A preflight that has quietly lost its non-empty check lets a run
+      # without the vault proceed and build a service around empty keys.
+      ansible.builtin.assert:
+        that:
+          - preflight_raw is search('vault_semaphore_cookie_hash')
+          - preflight_raw is search('vault_semaphore_cookie_encryption')
+          - preflight_raw is search('vault_semaphore_access_key_encryption')
+          - preflight_raw is search('vault_semaphore_admin_password')
+          - preflight_raw is search('present and non-empty')
+        fail_msg: >-
+          preflight-secrets.yml must still assert that all four vault
+          secrets are present and non-empty. Without it a run with no vault
+          installs a service whose encryption key is the empty string.
+        success_msg: "The preflight still checks all four secrets for presence."
+      vars:
+        preflight_raw: "{{ lookup('file', '../roles/semaphore/tasks/preflight-secrets.yml') }}"
+
+    # ── ORDER ──────────────────────────────────────────────────────────────
+    - name: Summarise roles/semaphore/tasks/main.yml, in order
+      # ⚠️ `ansible.builtin.meta` CANNOT BE REACHED WITH selectattr — Jinja
+      # reads the dots as a nested path. Each task is reduced to its index,
+      # name and JSON, and the ordering assertions ask questions of those.
+      ansible.builtin.set_fact:
+        main_summary: >-
+          {{ main_summary | default([]) + [ {
+               'idx': i,
+               'name': item.name | default(''),
+               'json': item | to_json
+             } ] }}
+      loop: "{{ lookup('file', '../roles/semaphore/tasks/main.yml') | from_yaml }}"
+      loop_control:
+        index_var: i
+        label: "{{ item.name | default('(unnamed)') }}"
+
+    - name: HANDLERS ARE FLUSHED AFTER THE SERVICE AND BEFORE VERIFICATION
+      # ⚠️ THE SIXTH CoreDNS DEFECT, AS A STATIC CHECK. Ansible runs notified
+      # handlers at the END of the play, so without this the verify step
+      # interrogates the process still running the old configuration — and
+      # passes. Order is the whole property: a flush after verification, or
+      # none at all, reproduces the defect exactly.
+      ansible.builtin.assert:
+        that:
+          - (flush_idx | length) == 1
+          - (verify_idx | length) == 1
+          - (service_idx | length) == 1
+          - (flush_idx | first) < (verify_idx | first)
+          - (flush_idx | first) > (service_idx | first)
+        fail_msg: >-
+          main.yml must flush handlers exactly once, AFTER the service is
+          defined and BEFORE verify.yml. Found flush at {{ flush_idx }},
+          service at {{ service_idx }}, verify at {{ verify_idx }}.
+        success_msg: >-
+          flush_handlers sits between the service definition and
+          verification.
+      vars:
+        flush_idx: "{{ main_summary | selectattr('json', 'search', 'flush_handlers') | map(attribute='idx') | list }}"
+        service_idx: "{{ main_summary | selectattr('name', 'search', 'Define the service') | map(attribute='idx') | list }}"
+        verify_idx: "{{ main_summary | selectattr('name', 'search', 'Verify it answers') | map(attribute='idx') | list }}"
+
+    - name: SECRETS ARE CHECKED BEFORE ANYTHING IS CREATED
+      # ⚠️ A RUN WITHOUT THE VAULT MUST STOP WHILE THE HOST IS UNTOUCHED.
+      # If the preflight ran after the account or the install, a missing
+      # secret would leave a half-built service for somebody to unpick.
+      ansible.builtin.assert:
+        that:
+          - (preflight_idx | length) == 1
+          - (account_idx | length) == 1
+          - (install_idx | length) == 1
+          - (preflight_idx | first) < (account_idx | first)
+          - (preflight_idx | first) < (install_idx | first)
+        fail_msg: >-
+          preflight-secrets.yml must run before the service account and
+          before the install. Found preflight at {{ preflight_idx }},
+          account at {{ account_idx }}, install at {{ install_idx }}.
+        success_msg: >-
+          Secrets are validated before the first mutation.
+      vars:
+        preflight_idx: "{{ main_summary | selectattr('json', 'search', 'preflight-secrets') | map(attribute='idx') | list }}"
+        account_idx: "{{ main_summary | selectattr('json', 'search', 'account\\.yml') | map(attribute='idx') | list }}"
+        install_idx: "{{ main_summary | selectattr('json', 'search', 'install\\.yml') | map(attribute='idx') | list }}"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          {{ role_files.files | length }} task files,
+          {{ all_tasks | length }} tasks,
+          {{ conditionals | flatten | length }} conditionals — all strings,
+          every secret-handling task sets no_log, and the order holds.

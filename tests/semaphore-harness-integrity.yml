@@ -1,0 +1,180 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE SEMAPHORE HARNESSES MUST STAY HARNESSES.
+#
+#   ansible-playbook tests/semaphore-harness-integrity.yml
+#
+# ⚠️ A BROKEN HARNESS PASSES. The macOS harness runs a real launchd daemon on
+# the management node beside the LAN's live resolver. Its safety rests on
+# properties that are invisible once written and that running it would never
+# reveal as missing: a unique label, a confined prefix, teardown that always
+# runs and can re-authenticate, and assertions that can tell a restarted
+# daemon from a stale one.
+#
+# Every lesson encoded here was paid for during the CoreDNS rollout.
+#
+# Controller-only: reads files, runs nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: The Semaphore end-to-end harnesses
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    macos: "{{ lookup('file', '../tests/run-semaphore-launchd.sh') }}"
+    linux: "{{ lookup('file', '../tests/run-semaphore-linux.sh') }}"
+    backup: "{{ lookup('file', '../roles/semaphore/templates/semaphore-backup.sh.j2') }}"
+
+  tasks:
+    - name: The disposable launchd label is unique and never the production one
+      # ⚠️ THE PRODUCTION LABEL IS org.dc1.semaphore. A harness using it would
+      # bootout the real controller UI and then remove its prefix.
+      ansible.builtin.assert:
+        that:
+          - macos is search('LABEL="org\.dc1\.semaphoredisposable\$\{STAMP\}"')
+          - not (macos is search('LABEL="org\.dc1\.semaphore"'))
+          - macos is search('STAMP=\$\$-\$\(date')
+        fail_msg: >-
+          tests/run-semaphore-launchd.sh must build a per-run unique label
+          and must never use the production label org.dc1.semaphore.
+        success_msg: "The disposable label is unique and distinct from production."
+
+    - name: Teardown is trapped on success, failure AND interrupt
+      ansible.builtin.assert:
+        that:
+          - macos is search('trap teardown EXIT INT TERM')
+          - linux is search('trap cleanup EXIT INT TERM')
+        fail_msg: >-
+          Both harnesses must trap teardown on EXIT, INT and TERM. Without
+          it an interrupted run leaves a launchd daemon loaded, a prefix on
+          disk, or the handler flush removed from the role.
+        success_msg: "Teardown is trapped on success, failure and interrupt."
+
+    - name: Teardown re-authenticates rather than failing silently
+      # ⚠️ Teardown removes a root-owned daemon and prefix. With bare
+      # `sudo -n`, every removal fails silently once the grace period lapses
+      # — leaving a live disposable daemon while printing a clean teardown.
+      ansible.builtin.assert:
+        that:
+          - macos is search('tsudo\(\)')
+          - macos is search('tsudo launchctl bootout')
+          - macos is search('tsudo rm -rf "\$ROOT"')
+          - macos is search('TEARDOWN DID NOT COMPLETE')
+        fail_msg: >-
+          macOS teardown must re-authenticate if the sudo timestamp expired,
+          and must print exact scoped recovery commands if it could not
+          finish.
+        success_msg: "Teardown re-authenticates and states how to finish if it cannot."
+
+    - name: Teardown identifies its processes by prefix, not by a stale PID
+      # ⚠️ "no longer ours" USED TO MEAN TWO THINGS, AND ONE LEAKED A DAEMON.
+      # Between a `kill -0` and a `ps` the process can exit, so a process
+      # that WAS ours reads as somebody else's and is deliberately spared.
+      ansible.builtin.assert:
+        that:
+          - macos is search('for _p in \$\(pgrep -f "\$ROOT/sbin/semaphore"')
+          - macos is search('/\*/semaphore-disposable\.\*\)')
+          - macos is search('REFUSING to remove unexpected path')
+        fail_msg: >-
+          Teardown must find its processes by this run's prefix rather than
+          a PID captured earlier, and must refuse any path that is not its
+          own mktemp prefix.
+        success_msg: "Teardown identifies by prefix and refuses foreign paths."
+
+    - name: The live baseline must be non-empty before anything disposable starts
+      # ⚠️ THE VACUOUS-PROOF TRAP. Every non-interference check is an
+      # equality test; an empty baseline makes "" = "" hold afterwards and
+      # the harness reports passes having measured nothing.
+      ansible.builtin.assert:
+        that:
+          - macos is search('the live baseline is non-empty')
+          - macos is search('REFUSING TO RUN')
+          - macos is search('LIVE_PID_BEFORE')
+        fail_msg: >-
+          The macOS harness must refuse to run when any part of the live
+          baseline is empty.
+        success_msg: "An empty live baseline refuses the run."
+
+    - name: A run that cannot reach launchd is a failure, not a pass
+      ansible.builtin.assert:
+        that:
+          - macos is search('sudo was granted, so the launchd path can be exercised')
+          - not (macos is search('skip "sudo was not granted'))
+        fail_msg: >-
+          Denied sudo must fail the run, not skip it. The launchd path is
+          the half of this role no other test can reach.
+        success_msg: "Denied sudo fails the run rather than reporting a pass."
+
+    - name: Both harnesses prove the PID changed after a config change
+      ansible.builtin.assert:
+        that:
+          - macos is search('the daemon was RESTARTED before verification')
+          - linux is search('the service RESTARTED before verification')
+        fail_msg: >-
+          Both harnesses must assert the PID CHANGED after a configuration
+          change. Without it they cannot distinguish a restarted daemon from
+          the stale one the flush exists to prevent.
+        success_msg: "Both harnesses require a PID change after reconfiguration."
+
+    - name: Both harnesses require a genuine no-op on an unchanged rerun
+      ansible.builtin.assert:
+        that:
+          - macos is search('third run reported changed=0')
+          - linux is search('third run reported changed=0')
+          - macos is search('no restart on the no-op run')
+          - linux is search('no restart on the no-op run')
+        fail_msg: >-
+          Both harnesses must assert changed=0 AND no restart on an
+          unchanged rerun.
+        success_msg: "Both harnesses require changed=0 and no restart on rerun."
+
+    - name: Neither RED mutation leaves an orphaned task behind
+      # Removing only the `meta:` line leaves a `- name:` with no module;
+      # Ansible dies parsing and the RED checks pass trivially.
+      ansible.builtin.assert:
+        that:
+          - macos is search('no orphaned task left behind')
+          - linux is search('no orphaned task left behind')
+          - not (macos is search('print unless /ansible\\.builtin\\.meta'))
+          - not (linux is search('print unless /ansible\\.builtin\\.meta'))
+        fail_msg: >-
+          Both RED mutations must remove the whole flush task and refuse to
+          continue if the task name survived without its module.
+        success_msg: "Neither RED mutation can leave an orphaned task behind."
+
+    - name: The Linux harness starts from a host with nothing of ours on it
+      ansible.builtin.assert:
+        that:
+          - linux is search('no semaphore binary in the image')
+          - linux is search('no _semaphore account')
+          - linux is search('never on a command line')
+        fail_msg: >-
+          The Linux harness must assert the image ships no semaphore binary
+          and no service account before the role runs, and must deliver its
+          throwaway secrets through a file rather than a command line.
+        success_msg: "The Linux harness proves it starts from a clean host."
+
+    - name: The backup uses a WAL-safe mechanism, never a live file copy
+      # ⚠️ SQLITE RUNS IN WAL MODE — verified against the real binary, which
+      # leaves -wal and -shm sidecars. Copying the main file alone yields a
+      # backup silently missing recent writes.
+      ansible.builtin.assert:
+        that:
+          - backup is search('VACUUM INTO')
+          - backup is search('integrity_check')
+          - not (backup_code is search('^cp '))
+        fail_msg: >-
+          The backup must use SQLite's VACUUM INTO and verify the result,
+          never copy a live WAL database with cp.
+        success_msg: "Backup uses VACUUM INTO and checks its own integrity."
+      vars:
+        backup_code: >-
+          {{ backup | regex_replace('(?m)^\s*#.*$', '') }}
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Both harnesses are disposable, trapped, confined, re-authenticating
+          and assert the properties that make them meaningful; the backup is
+          WAL-safe.
