@@ -23,6 +23,7 @@ ZONE=roles/coredns/templates/db.zone.j2
 HOSTS=inventory/hosts.yml
 INSTALL=roles/coredns/tasks/install.yml
 VERIFY=roles/coredns/tasks/verify.yml
+SHAPE=tests/dns-task-shape.yml
 
 WORK=$(mktemp -d -t dns-mutations.XXXXXX)
 restore() {
@@ -32,6 +33,7 @@ restore() {
   [ -f "$WORK/hosts" ] && cp "$WORK/hosts" "$HOSTS"
   [ -f "$WORK/install" ] && cp "$WORK/install" "$INSTALL"
   [ -f "$WORK/verify" ] && cp "$WORK/verify" "$VERIFY"
+  [ -f "$WORK/shape" ] && cp "$WORK/shape" "$SHAPE"
 }
 cleanup() { restore; rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
@@ -42,6 +44,7 @@ cp "$ZONE" "$WORK/zone"
 cp "$HOSTS" "$WORK/hosts"
 cp "$INSTALL" "$WORK/install"
 cp "$VERIFY" "$WORK/verify"
+cp "$SHAPE" "$WORK/shape"
 
 pass=0
 fail=0
@@ -439,6 +442,69 @@ else
       "the guard rejected an escape Python does NOT consume; it is over-broad"
   grep -E "fatal|msg" "$WORK/out" | head -2 | sed 's/^/           /'
 fi
+restore
+
+echo
+echo "── the health/ready ports, and the host they share ──"
+# ⚠️ THE FIFTH dc1-arm-1/dc1-x86 FAILURE, AND THE FIRST CAUSED BY THIS
+# REPOSITORY COLLIDING WITH ITSELF. CoreDNS's health endpoint was
+# 127.0.0.1:8080; roles/keel publishes its web console on the same loopback
+# port via docker-proxy; dc1-x86 runs BOTH roles. CoreDNS crash-looped 173
+# times with "listen tcp 127.0.0.1:8080: bind: address already in use" and
+# reported it as a timeout on 10.0.0.3:53 — a port that was never involved.
+restore
+
+# 1. The collision itself, restored.
+edit 's{^coredns_health_address: "127\.0\.0\.1:8653"}{coredns_health_address: "127.0.0.1:8080"}' "$DEFAULTS"
+expect_red dns-zone.yml "must not use Keel's web console port|web console" \
+           "reusing Keel's console port for health is caught"
+
+# 2. The same collision on the readiness endpoint.
+restore
+edit 's{^coredns_ready_address: "127\.0\.0\.1:8654"}{coredns_ready_address: "127.0.0.1:8080"}' "$DEFAULTS"
+expect_red dns-zone.yml "must not use Keel's web console port|web console" \
+           "reusing Keel's console port for readiness is caught"
+
+# 3. Health and readiness on the SAME port — the second one to bind dies, and
+#    CoreDNS dies before :53 either way.
+restore
+edit 's{^coredns_ready_address: "127\.0\.0\.1:8654"}{coredns_ready_address: "127.0.0.1:8653"}' "$DEFAULTS"
+expect_red dns-zone.yml "same port as each other|must not use" \
+           "health and readiness sharing one port is caught"
+
+# 4. Health moved off loopback, exposing an HTTP endpoint to every LAN client.
+restore
+edit 's{^coredns_health_address: "127\.0\.0\.1:8653"}{coredns_health_address: "0.0.0.0:8653"}' "$DEFAULTS"
+expect_red dns-zone.yml "must bind 127\.0\.0\.1|loopback" \
+           "a health endpoint off loopback is caught"
+
+# 5. The rescue deleted from the bind wait, so a bind failure once again
+#    reports the wrong port and says nothing about why.
+restore
+perl -0pi -e 's{\n  rescue:\n(?:.*\n)*?          do not stop the other service to make room for this one\.\n}{\n}' "$VERIFY"
+# Either guard may fire first and both are correct: removing the rescue also
+# removes the rescue-only task that proves block expansion reaches it.
+expect_red dns-task-shape.yml 'rescue that reads the service log|candidate block|Ask the service why|rescue-only task' \
+           "deleting the bind-wait rescue is caught"
+
+# 6. The block flattening removed from the shape suite, which would silently
+#    stop checking every conditional inside a block.
+restore
+# ⚠️ LINE-BASED, NOT A SLURPED PATTERN. The first version used a multi-line
+# `-0pi` regex that a scripted edit had mangled — the `+`, `|` and `(` lost
+# their escapes and became regex metacharacters, so it matched nothing, the
+# file was untouched, and the runner reported "still PASSED". Correct verdict
+# for a mutation that never landed; a one-line delete cannot be mangled.
+perl -ni -e "print unless /selectattr\(.rescue., .defined.\)/" "$SHAPE"
+if ansible-playbook tests/dns-task-shape.yml >"$WORK/out" 2>&1; then
+  bad "dropping rescue expansion is caught" "tests/dns-task-shape.yml still PASSED"
+elif grep -qE 'did not reach the nested tasks|rescue-only task' "$WORK/out"; then
+  ok "dropping rescue expansion is caught"
+else
+  bad "dropping rescue expansion is caught" "failed for another reason"
+  grep -E "fatal|msg" "$WORK/out" | head -2 | sed 's/^/           /'
+fi
+
 restore
 
 echo

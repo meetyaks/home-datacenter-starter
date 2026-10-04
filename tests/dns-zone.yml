@@ -47,6 +47,64 @@
       ansible.builtin.include_vars:
         file: ../roles/coredns/defaults/main.yml
 
+    # ── THE PORT THIS ROLE SHARES A HOST WITH ───────────────────────────────
+
+    - name: Read the Keel role's loopback port, from its own defaults
+      # ⚠️ READ, NOT RESTATED. The number lives in roles/keel; a copy here
+      # would be a second hand-maintained value and would drift silently —
+      # which is exactly how this collision would come back.
+      ansible.builtin.include_vars:
+        file: ../roles/keel/defaults/main.yml
+        name: keelvars
+
+    - name: THE HEALTH PORTS CANNOT COLLIDE WITH KEEL'S WEB CONSOLE
+      # ⚠️ dc1-x86 RUNS BOTH ROLES, AND THAT IS THE WHOLE POINT. It is the
+      # Keel DEV runtime AND the CoreDNS secondary. CoreDNS's health endpoint
+      # was 127.0.0.1:8080 and Keel's web console is published on the same
+      # loopback port by docker-proxy — so the first Linux deployment
+      # crash-looped 173 times with
+      #
+      #   listen tcp 127.0.0.1:8080: bind: address already in use
+      #
+      # and reported it as "Timeout when waiting for 10.0.0.3:53", a port
+      # that was never involved.
+      #
+      # Two roles in one repository allocated the same loopback port on the
+      # same host, and nothing noticed until a deployment did. This is the
+      # check that would have.
+      ansible.builtin.assert:
+        that:
+          - (coredns_health_address | regex_replace('^.*:', '') | int)
+            != (keelvars.keel_web_loopback_port | int)
+          - (coredns_ready_address | regex_replace('^.*:', '') | int)
+            != (keelvars.keel_web_loopback_port | int)
+          - (coredns_health_address | regex_replace('^.*:', ''))
+            != (coredns_ready_address | regex_replace('^.*:', ''))
+        fail_msg: >-
+          CoreDNS health={{ coredns_health_address }} and
+          ready={{ coredns_ready_address }} must not use Keel's web console
+          port ({{ keelvars.keel_web_loopback_port }}), and must not use the
+          same port as each other. dc1-x86 is both the Keel DEV runtime and
+          the CoreDNS secondary, so a shared loopback port means whichever
+          service starts second dies — and CoreDNS dies before it ever binds
+          :53, reporting a timeout on a port that is not the problem.
+        success_msg: >-
+          CoreDNS health/ready ({{ coredns_health_address | regex_replace('^.*:', '') }}/{{
+          coredns_ready_address | regex_replace('^.*:', '') }}) avoid Keel's
+          console port ({{ keelvars.keel_web_loopback_port }}).
+
+    - name: And they stay on loopback, where only this host can reach them
+      ansible.builtin.assert:
+        that:
+          - coredns_health_address is match('^127\.0\.0\.1:')
+          - coredns_ready_address is match('^127\.0\.0\.1:')
+        fail_msg: >-
+          health={{ coredns_health_address }} ready={{ coredns_ready_address }}
+          — both must bind 127.0.0.1. An HTTP endpoint reachable from every
+          LAN client is surface this service does not need.
+        success_msg: "Health and readiness are loopback-only."
+
+
     # ── THE ZONE CONTENT ────────────────────────────────────────────────────
 
     - name: The zone serves EXACTLY the three records this LAN needs
@@ -344,8 +402,8 @@
       ansible.builtin.assert:
         that:
           - core_text is search('(?m)^\s*cache ')
-          - core_text is search('health 127\.0\.0\.1:8080')
-          - core_text is search('ready 127\.0\.0\.1:8181')
+          - core_text is search('health 127\.0\.0\.1:8653')
+          - core_text is search('ready 127\.0\.0\.1:8654')
         fail_msg: >-
           {{ item.name }} must enable cache, health and readiness, with the
           HTTP endpoints on loopback — they are for the node and the
