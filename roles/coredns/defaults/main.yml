@@ -112,8 +112,29 @@ coredns_bind_addresses: []
 # ⚠️ HEALTH AND READINESS ON LOOPBACK. They are for the node itself and for
 # the deployment's own verification, not for the LAN — an HTTP endpoint
 # reachable from every client is surface this service does not need.
-coredns_health_address: "127.0.0.1:8080"
-coredns_ready_address: "127.0.0.1:8181"
+# ⚠️ NOT 8080, AND THAT IS NOT A PREFERENCE. These were 127.0.0.1:8080 and
+# :8181, and the first Linux deployment crash-looped 173 times before anyone
+# saw why:
+#
+#   listen tcp 127.0.0.1:8080: bind: address already in use
+#
+# CoreDNS died binding its HEALTH endpoint and never reached port 53 at all,
+# so the failure surfaced 30 seconds later as "Timeout when waiting for
+# 10.0.0.3:53" — a message about the wrong port entirely.
+#
+# ⚠️ AND THE OCCUPANT WAS THIS REPOSITORY. `docker-proxy` held 127.0.0.1:8080
+# because roles/keel sets `keel_web_loopback_port: 8080` for the Keel web
+# console, and dc1-x86 is BOTH the Keel DEV runtime AND the CoreDNS
+# secondary. Two roles here were allocated the same loopback port on the same
+# host; 8080 is also the most commonly published container port there is, so
+# it was the worst available choice for a service expected to coexist.
+#
+# 8653/8654 are adjacent, unregistered, and verified free on dc1-x86 — as
+# were 8753/8754 and 9253/9254, so there is room to move again if needed
+# (enforced: tests/dns-zone.yml "the health ports cannot collide with Keel's
+# web console").
+coredns_health_address: "127.0.0.1:8653"
+coredns_ready_address: "127.0.0.1:8654"
 
 # ── WHERE THINGS LIVE ───────────────────────────────────────────────────────
 #

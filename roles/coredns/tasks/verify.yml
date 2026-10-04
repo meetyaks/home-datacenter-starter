@@ -9,11 +9,64 @@
 # This is the same rule the Keel role follows after a deploy: a success
 # message is not evidence.
 
+# ⚠️ THE BIND WAIT CARRIES ITS OWN DIAGNOSIS, BECAUSE WITHOUT IT THIS TASK
+# REPORTS THE WRONG PORT. The first Linux deployment failed here with
+#
+#   Timeout when waiting for 10.0.0.3:53
+#
+# while the actual cause, visible only in the service's own log, was
+#
+#   listen tcp 127.0.0.1:8080: bind: address already in use
+#
+# CoreDNS had died binding its HEALTH endpoint and never reached :53 — so the
+# message named a port that was never the problem, and the service had
+# crash-looped 173 times by the time anyone looked. Three round trips of
+# diagnosis for something the daemon had been saying all along.
+#
+# The rescue costs nothing when the wait succeeds and turns a mystery into a
+# one-step answer when it does not
+# (enforced: tests/dns-task-shape.yml "the bind wait surfaces the service log
+# when it fails").
 - name: Give the daemon a moment to bind
-  ansible.builtin.wait_for:
-    host: "{{ coredns_bind_addresses | reject('match', '127\\.') | first | default('127.0.0.1') }}"
-    port: 53
-    timeout: 30
+  block:
+    - name: Wait for the resolver to listen on port 53
+      ansible.builtin.wait_for:
+        host: "{{ coredns_bind_addresses | reject('match', '127\\.') | first | default('127.0.0.1') }}"
+        port: 53
+        timeout: 30
+
+  rescue:
+    - name: Ask the service why it is not listening
+      # ⚠️ `failed_when: false` — this runs in a rescue and must not replace
+      # the real failure with one of its own. The same reasoning as
+      # roles/keel_reconcile's evidence collector, which once did exactly
+      # that.
+      ansible.builtin.command:
+        argv: "{{ ['journalctl', '-u', coredns_service_name, '--no-pager', '-n', '25']
+                  if not coredns_is_darwin
+                  else ['tail', '-n', '25', coredns_log_dir ~ '/coredns.err'] }}"
+      register: coredns_why
+      changed_when: false
+      failed_when: false
+
+    - name: Report what it said, then fail
+      ansible.builtin.fail:
+        msg: >-
+          CoreDNS is not listening on port 53 after 30s. The daemon's own log
+          says why — read THIS, not the port number above, because a failure
+          to bind ANY configured address (including the health endpoint on
+          {{ coredns_health_address }} or readiness on
+          {{ coredns_ready_address }}) kills the process before :53 is ever
+          reached:
+          ----- {{ 'journalctl -u ' ~ coredns_service_name if not coredns_is_darwin else coredns_log_dir ~ '/coredns.err' }} -----
+          {{ (coredns_why.stdout | default('(no output)', true)) }}
+          {{ (coredns_why.stderr | default('', true)) }}
+          -----
+          If it says "address already in use", something else on this host
+          holds that address. Find it with
+          {{ 'ss -lntup' if not coredns_is_darwin else 'lsof -nP -iTCP -sTCP:LISTEN' }}
+          and change the colliding value in roles/coredns/defaults/main.yml —
+          do not stop the other service to make room for this one.
 
 - name: Readiness, as the resolver reports it
   ansible.builtin.uri:

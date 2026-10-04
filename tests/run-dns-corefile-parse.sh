@@ -121,8 +121,8 @@ sed -e '/^    bind 10\.0\.0\.[0-9]*$/d' \
     -e "s/^dc1\.lan:53 {/dc1.lan:${PORT} {/" \
     -e "s/^\.:53 {/.:${PORT} {/" \
     -e "s|file .*db\.dc1\.lan|file ${WORK}/db.dc1.lan|" \
-    -e "s/health 127\.0\.0\.1:8080/health 127.0.0.1:${HEALTH_PORT}/" \
-    -e "s/ready 127\.0\.0\.1:8181/ready 127.0.0.1:${READY_PORT}/" \
+    -e "s/health 127\.0\.0\.1:8653/health 127.0.0.1:${HEALTH_PORT}/" \
+    -e "s/ready 127\.0\.0\.1:8654/ready 127.0.0.1:${READY_PORT}/" \
     "$RENDER/dc1-arm-1/Corefile" > "$WORK/Corefile"
 
 # ── Start it. THIS is the check the regexes cannot be. ───────────────────

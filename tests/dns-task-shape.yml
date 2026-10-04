@@ -112,6 +112,46 @@
               starting with "{{ '{{' }}" — both need quoting. Underlying error:
               {{ ansible_failed_result.msg | default('(none)') }}
 
+    - name: Expand block / rescue / always, one level
+      # ⚠️ WITHOUT THIS THE SCAN MISSES EVERYTHING INSIDE A BLOCK, and
+      # verify.yml now has one: the bind wait carries a rescue that reads the
+      # service log. A `block:` task is a single entry whose nested tasks live
+      # under `block`, `rescue` and `always` — so a mapping conditional or a
+      # consumed escape in there would have been invisible to every assertion
+      # below, which is exactly the blind spot this suite exists to remove.
+      ansible.builtin.set_fact:
+        all_tasks: >-
+          {{ all_tasks
+             + (all_tasks | selectattr('block', 'defined') | map(attribute='block') | flatten)
+             + (all_tasks | selectattr('rescue', 'defined') | map(attribute='rescue') | flatten)
+             + (all_tasks | selectattr('always', 'defined') | map(attribute='always') | flatten) }}
+        top_level_count: "{{ all_tasks | length }}"
+
+    - name: The expansion reached nested tasks, INCLUDING rescue tasks
+      # ⚠️ A COUNT ALONE IS NOT ENOUGH, AND A MUTATION PROVED IT. Dropping the
+      # `rescue` expansion while keeping `block` and `always` still grows the
+      # list, so a count-only check passed while every conditional inside a
+      # rescue went unchecked again. This names a task that exists ONLY inside
+      # a rescue: remove rescue expansion and it disappears.
+      ansible.builtin.assert:
+        that:
+          - (all_tasks | length) > (top_level_count | int)
+          - (all_tasks | selectattr('name', 'defined')
+             | selectattr('name', 'search', 'Ask the service why')
+             | list | length) == 1
+        fail_msg: >-
+          Expanding block/rescue/always did not reach the nested tasks:
+          {{ top_level_count }} before, {{ all_tasks | length }} after, and
+          {{ all_tasks | selectattr('name', 'defined')
+             | selectattr('name', 'search', 'Ask the service why')
+             | list | length }} rescue-only task(s) found (expected 1).
+          roles/coredns has a block with a rescue — verify.yml's bind wait —
+          so either it was removed or this expansion no longer covers
+          `rescue`, and either way the conditionals inside it go unchecked.
+        success_msg: >-
+          {{ top_level_count }} top-level tasks expanded to
+          {{ all_tasks | length }}, reaching nested block AND rescue tasks.
+
     - name: Collect every conditional expression they contain
       # ⚠️ `that` IS A MODULE PARAMETER, NOT A TASK KEY, so it is reached by
       # subscript under the assert module. `when`, `failed_when` and
@@ -245,6 +285,42 @@
           Some entry in roles/coredns' task files is not a task mapping:
           {{ all_tasks | reject('mapping') | list | map('to_json') | join('  ') }}
         success_msg: "{{ all_tasks | length }} tasks, all well-formed."
+
+    - name: THE BIND WAIT SURFACES THE SERVICE LOG WHEN IT FAILS
+      # ⚠️ A FAILURE THAT NAMES THE WRONG PORT IS WORSE THAN A BARE ONE,
+      # because it sends the diagnosis somewhere else entirely. The first
+      # Linux deployment reported
+      #
+      #   Timeout when waiting for 10.0.0.3:53
+      #
+      # while the daemon's own log said
+      #
+      #   listen tcp 127.0.0.1:8080: bind: address already in use
+      #
+      # CoreDNS had died binding its HEALTH endpoint and never reached :53. It
+      # had crash-looped 173 times, and finding out cost three round trips for
+      # something the service had been saying from the first second.
+      ansible.builtin.assert:
+        that:
+          - (bind_blocks | length) == 1
+          - bind_blocks[0].rescue is defined
+          - (bind_blocks[0].rescue | length) >= 2
+          - (bind_blocks[0] | to_json) is search('journalctl')
+          - (bind_blocks[0] | to_json) is search('coredns_log_dir')
+          - (bind_blocks[0] | to_json) is search('address already in use')
+        fail_msg: >-
+          The port-53 bind wait must be a block whose rescue reads the service
+          log (journalctl on Linux, the .err file on macOS) and fails with it
+          included, naming "address already in use" as the likeliest cause.
+          Found {{ bind_blocks | length }} candidate block(s).
+        success_msg: >-
+          The bind wait carries a rescue that reports the daemon's own reason.
+      vars:
+        bind_blocks: >-
+          {{ (lookup('file', '../roles/coredns/tasks/verify.yml') | from_yaml)
+             | selectattr('block', 'defined')
+             | selectattr('name', 'search', 'bind')
+             | list }}
 
     - name: Done
       ansible.builtin.debug:
