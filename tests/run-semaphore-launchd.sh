@@ -257,6 +257,7 @@ run_role() {   # run_role <port> <logfile>
     -e semaphore_log_dir="$ROOT/log" \
     -e semaphore_launchd_label="$LABEL" \
     -e semaphore_launchd_plist="$PLIST" \
+    -e semaphore_manage_account=false \
     -e semaphore_user="$(id -un)" \
     -e semaphore_group="$(id -gn)" \
     -e semaphore_port="$1" \

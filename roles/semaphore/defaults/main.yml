@@ -88,6 +88,14 @@ semaphore_user_realname: "Semaphore UI Service"
 # account of this name already exists with a different shape, rather than
 # adopting someone else's.
 
+# ⚠️ PRODUCTION MANAGES THE ACCOUNT; THE DISPOSABLE TEST DOES NOT. The
+# macOS harness runs as the invoking user and sets this false, because
+# creating and deleting a real hidden dscl account on a workstation is the
+# permanent change a disposable test must not make. The default is true and
+# tests/semaphore-config.yml fails if it changes, so skipping account
+# management must be asked for explicitly, per run.
+semaphore_manage_account: true
+
 # ── FILESYSTEM ───────────────────────────────────────────────────────────────
 #
 # Versioned binary + stable symlink: the running service always starts from

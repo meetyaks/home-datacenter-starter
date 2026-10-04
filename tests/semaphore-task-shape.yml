@@ -154,6 +154,34 @@
           {{ (lookup('file', '../roles/semaphore/tasks/configure.yml') | from_yaml)
              | selectattr('name', 'eq', 'Render the configuration') | list }}
 
+    - name: NO TASK MAY USE A MODULE macOS CANNOT RUN
+      # ⚠️ THE DEFECT THAT FAILED THE FIRST CONTROLLER GATE RUN.
+      # `ansible.builtin.getent` needs a `getent` BINARY, and macOS does not
+      # have one — it uses Directory Services. The role converged in the
+      # Linux container and died on the controller:
+      #
+      #   Failed to find required executable "getent" in paths: ...
+      #
+      # The production platform for this role is macOS, so a Linux-only
+      # module is not a portability nicety; it is a guaranteed failure on
+      # the only host that matters. Account lookup is platform-split
+      # instead: `id` for existence, `dscl`/passwd for the home directory.
+      ansible.builtin.assert:
+        that:
+          - not (role_code is search('ansible\.builtin\.getent'))
+          - not (role_code is search('ansible\.builtin\.service_facts'))
+        fail_msg: >-
+          A task uses a module that cannot run on macOS. getent and
+          service_facts both require Linux-only tooling; this role's
+          production platform is Darwin. Split the task by platform
+          instead.
+        success_msg: "No task depends on a module macOS cannot run."
+      vars:
+        # The PARSED tasks, serialised — so comments are already excluded
+        # and the explanation above cannot trip its own check, which has
+        # happened five times in this repository with raw-text scans.
+        role_code: "{{ all_tasks | to_json }}"
+
     - name: THE DOWNLOAD MUST VERIFY A CHECKSUM
       # ⚠️ get_url COMPARES BEFORE THE FILE IS USABLE, which is the only
       # thing standing between a substituted artifact and a binary that runs

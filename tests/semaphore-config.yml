@@ -128,6 +128,23 @@
           it runs.
         success_msg: "Runs as {{ semaphore_user }}:{{ semaphore_group }}."
 
+    - name: PRODUCTION ALWAYS MANAGES THE DEDICATED ACCOUNT
+      # ⚠️ THE ESCAPE HATCH MUST STAY AN ESCAPE HATCH. The disposable macOS
+      # harness sets semaphore_manage_account=false so it creates no real
+      # account on a workstation. If that ever became the default, the
+      # controller would quietly run Semaphore as whoever applied the
+      # playbook — most likely the operator, with their SSH keys — and no
+      # other check would notice.
+      ansible.builtin.assert:
+        that:
+          - semaphore_manage_account | bool
+        fail_msg: >-
+          semaphore_manage_account must default to true. Running as an
+          existing account is a disposable-test override, not a deployment
+          mode; as a default it would hand every Semaphore job the
+          privileges of whoever ran the playbook.
+        success_msg: "Production manages the dedicated service account."
+
     # ── SECRETS ────────────────────────────────────────────────────────────
     - name: No secret has a usable default
       # ⚠️ EVERY ONE RESOLVES TO EMPTY WITHOUT THE VAULT, and empty is

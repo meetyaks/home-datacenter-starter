@@ -276,10 +276,7 @@ value than bad syntax. Check `semaphore.err`.
 
 ### What the macOS harness does not cover
 
-It overrides `semaphore_user` to the invoking account and **creates no
-service account**, because creating and deleting a real hidden `dscl`
-account on a workstation is exactly the permanent change a disposable test
-must not make.
+It sets `semaphore_manage_account: false` and overrides `semaphore_user` to the invoking account, so it **creates no service account** — creating and deleting a real hidden `dscl` account on a workstation is exactly the permanent change a disposable test must not make. The default is `true` and `tests/semaphore-config.yml` fails if that changes, so the override cannot become the shipped behaviour.
 
 So the `dscl` account path is exercised on Linux (where the container is
 discarded) and on the real controller during the watched deployment — never

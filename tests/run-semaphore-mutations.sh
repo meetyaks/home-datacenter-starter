@@ -136,6 +136,21 @@ perl -pi -e 's{<string>\{\{ semaphore_user \}\}</string>}{<string>root</string>}
 expect_red semaphore-config.yml 'dedicated|root' \
            "a plist that runs the daemon as root is caught"
 
+restore
+# ⚠️ THE DISPOSABLE-TEST ESCAPE HATCH MUST NOT BECOME THE DEFAULT. As a
+# default it would run Semaphore as whoever applied the playbook.
+edit 's{^semaphore_manage_account: true$}{semaphore_manage_account: false}' "$DEFAULTS"
+expect_red semaphore-config.yml 'manage_account|dedicated service account' \
+           "defaulting to not managing the service account is caught"
+
+restore
+# ⚠️ getent DOES NOT EXIST ON macOS. The module requires the binary, so a
+# getent-based lookup converges in the Linux container and dies on the
+# controller — which is exactly what happened on the first real gate run.
+perl -0pi -e 's{    - name: Look for an existing service account\n      ansible\.builtin\.command:\n        cmd: "id -u \{\{ semaphore_user \}\}"\n}{    - name: Look for an existing service account\n      ansible.builtin.getent:\n        database: passwd\n        key: "\{\{ semaphore_user \}\}"\n}' "$ACCOUNT"
+expect_red semaphore-task-shape.yml 'getent|macOS' \
+           "a getent-based account lookup that cannot work on macOS is caught"
+
 echo
 echo "── secrets ──"
 restore
