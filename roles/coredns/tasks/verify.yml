@@ -29,10 +29,10 @@
 # when it fails").
 - name: Give the daemon a moment to bind
   block:
-    - name: Wait for the resolver to listen on port 53
+    - name: Wait for the resolver to listen on its DNS port
       ansible.builtin.wait_for:
         host: "{{ coredns_bind_addresses | reject('match', '127\\.') | first | default('127.0.0.1') }}"
-        port: 53
+        port: "{{ coredns_dns_port }}"
         timeout: 30
 
   rescue:
@@ -52,7 +52,8 @@
     - name: Report what it said, then fail
       ansible.builtin.fail:
         msg: >-
-          CoreDNS is not listening on port 53 after 30s. The daemon's own log
+          CoreDNS is not listening on port {{ coredns_dns_port }} after 30s.
+          The daemon's own log
           says why — read THIS, not the port number above, because a failure
           to bind ANY configured address (including the health endpoint on
           {{ coredns_health_address }} or readiness on
@@ -86,7 +87,7 @@
   # UDP, against this node's own LAN address — the path a client uses.
   ansible.builtin.command:
     cmd: >-
-      dig +short +time=3 +tries=1
+      dig +short +time=3 +tries=1 -p {{ coredns_dns_port }}
       @{{ coredns_bind_addresses | reject('match', '127\\.') | first }}
       {{ item.name }}.{{ coredns_zone }} A
   register: coredns_resolved
@@ -115,7 +116,7 @@
   # is worse, because it means internal names are leaving the LAN.
   ansible.builtin.command:
     cmd: >-
-      dig +time=3 +tries=1
+      dig +time=3 +tries=1 -p {{ coredns_dns_port }}
       @{{ coredns_bind_addresses | reject('match', '127\\.') | first }}
       keel.{{ coredns_zone }} A
   register: coredns_reserved

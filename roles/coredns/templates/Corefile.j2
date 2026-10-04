@@ -16,7 +16,7 @@
 # NEVER forwards it. An unknown name under {{ coredns_zone }} must come back
 # as an authoritative NXDOMAIN rather than being asked of a public resolver,
 # which would leak internal names and could return somebody else's answer.
-{{ coredns_zone }}:53 {
+{{ coredns_zone }}:{{ coredns_dns_port }} {
 {% for addr in coredns_bind_addresses %}
     bind {{ addr }}
 {% endfor %}
@@ -58,7 +58,7 @@
 # every structural check passed on a file the daemon would not load. It was
 # caught by starting the real binary against the rendered config, which is
 # why tests/run-dns-corefile-parse.sh exists.
-.:53 {
+.:{{ coredns_dns_port }} {
 {% for addr in coredns_bind_addresses %}
     bind {{ addr }}
 {% endfor %}

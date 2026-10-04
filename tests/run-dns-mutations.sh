@@ -24,6 +24,16 @@ HOSTS=inventory/hosts.yml
 INSTALL=roles/coredns/tasks/install.yml
 VERIFY=roles/coredns/tasks/verify.yml
 SHAPE=tests/dns-task-shape.yml
+MAIN_TASKS=roles/coredns/tasks/main.yml
+CONFIGURE=roles/coredns/tasks/configure.yml
+PREREQ=roles/coredns/tasks/verifier-prereq.yml
+ROLE_SH=tests/run-coredns-role.sh
+GATE_SH=tests/run-dc1-macos-gate.sh
+# ⚠️ A TEST SCRIPT MUTATED AS IF IT WERE PRODUCTION CODE. The macOS harness
+# runs a real root daemon beside the live resolver, so its safety properties
+# are load-bearing in exactly the way a role's are, and they get the same
+# treatment: break one, require tests/dns-harness-integrity.yml to notice.
+LAUNCHD=tests/run-coredns-launchd.sh
 
 WORK=$(mktemp -d -t dns-mutations.XXXXXX)
 restore() {
@@ -34,6 +44,13 @@ restore() {
   [ -f "$WORK/install" ] && cp "$WORK/install" "$INSTALL"
   [ -f "$WORK/verify" ] && cp "$WORK/verify" "$VERIFY"
   [ -f "$WORK/shape" ] && cp "$WORK/shape" "$SHAPE"
+  [ -f "$WORK/main_tasks" ] && cp "$WORK/main_tasks" "$MAIN_TASKS"
+  [ -f "$WORK/configure" ] && cp "$WORK/configure" "$CONFIGURE"
+  [ -f "$WORK/prereq" ] && cp "$WORK/prereq" "$PREREQ"
+  [ -f "$WORK/role_sh" ] && cp "$WORK/role_sh" "$ROLE_SH"
+  [ -f "$WORK/gate_sh" ] && cp "$WORK/gate_sh" "$GATE_SH"
+  [ -f "$WORK/launchd" ] && cp "$WORK/launchd" "$LAUNCHD"
+  return 0
 }
 cleanup() { restore; rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
@@ -45,6 +62,12 @@ cp "$HOSTS" "$WORK/hosts"
 cp "$INSTALL" "$WORK/install"
 cp "$VERIFY" "$WORK/verify"
 cp "$SHAPE" "$WORK/shape"
+cp "$MAIN_TASKS" "$WORK/main_tasks"
+cp "$CONFIGURE" "$WORK/configure"
+cp "$PREREQ" "$WORK/prereq"
+cp "$ROLE_SH" "$WORK/role_sh"
+cp "$GATE_SH" "$WORK/gate_sh"
+cp "$LAUNCHD" "$WORK/launchd"
 
 pass=0
 fail=0
@@ -112,7 +135,7 @@ fi
 
 echo
 echo "── the suites are green before anything is broken ──"
-for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape; do
+for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape dns-harness-integrity; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
     ok "tests/${s}.yml is green"
   else
@@ -508,11 +531,193 @@ fi
 restore
 
 echo
+echo "── the handler flush, the port seam, and the harnesses themselves ──"
+# ⚠️ THE SIXTH DEFECT AND THE SEAM THAT MADE IT TESTABLE. Without the flush,
+# Ansible runs the restart at the END of the play, so verify.yml interrogates
+# the process still running the old configuration — observed on dc1-arm-1 as
+# PID 35119 serving 8181 while the Corefile on disk said 8654.
+restore
+
+# 1. The regression itself: no flush at all.
+perl -ni -e 'print unless /ansible\.builtin\.meta: flush_handlers/' "$MAIN_TASKS"
+expect_red dns-task-shape.yml 'flush handlers exactly once|Found\s+flush at \[\]' \
+           "removing the handler flush is caught"
+
+# 2. Flushed, but AFTER verification — which prevents nothing.
+restore
+perl -0pi -e 's{(- name: Apply every pending restart.*?\n  ansible\.builtin\.meta: flush_handlers\n)}{}s;
+              s{(- name: Verify it answers\n  ansible\.builtin\.include_tasks: verify\.yml\n)}{$1\n- name: Apply every pending restart BEFORE anything verifies the service\n  ansible.builtin.meta: flush_handlers\n}s' "$MAIN_TASKS"
+expect_red dns-task-shape.yml 'BEFORE verify\.yml runs|Found\s+flush at' \
+           "flushing AFTER verification is caught"
+
+# 3. Flushed BEFORE the configuration is even written, so nothing is pending.
+restore
+perl -0pi -e 's{(- name: Apply every pending restart.*?\n  ansible\.builtin\.meta: flush_handlers\n)}{}s;
+              s{(- name: Install the pinned binary\n)}{- name: Apply every pending restart BEFORE anything verifies the service\n  ansible.builtin.meta: flush_handlers\n\n$1}s' "$MAIN_TASKS"
+expect_red dns-task-shape.yml 'AFTER the service is defined|Found\s+flush at' \
+           "flushing before the configuration changes is caught"
+
+# 4. The restart notification dropped from the Corefile template, so no
+#    handler is ever pending and a config change never reaches the daemon.
+restore
+perl -0pi -e 's{(src: Corefile\.j2\n(?:.*\n)*?)  notify: Restart CoreDNS\n}{$1}' "$CONFIGURE"
+expect_red dns-harness-integrity.yml 'notifies a restart|Corefile template must notify' \
+           "dropping the Corefile restart notification is caught"
+
+echo
+echo "── the DNS port seam must not drift in production ──"
+restore
+edit 's{^coredns_dns_port: 53$}{coredns_dns_port: 5353}' "$DEFAULTS"
+expect_red dns-zone.yml 'must be exactly 53|defaults to 53' \
+           "changing the production DNS port default is caught"
+
+restore
+edit 's{^coredns_dns_port: 53$}{coredns_dns_port: 70000}' "$DEFAULTS"
+expect_red dns-zone.yml 'must be exactly 53|defaults to 53' \
+           "an out-of-range DNS port is caught"
+
+restore
+edit 's{^coredns_dns_port: 53$}{coredns_dns_port: 8653}' "$DEFAULTS"
+expect_red dns-zone.yml 'must be exactly 53|defaults to 53|same port as each other' \
+           "a DNS port colliding with the health port is caught"
+
+restore
+edit 's{^\{\{ coredns_zone \}\}:\{\{ coredns_dns_port \}\} \{$}{\{\{ coredns_zone \}\}:53 \{}' "$COREFILE"
+expect_red dns-harness-integrity.yml 'hardcodes the DNS port|coredns_dns_port' \
+           "one hardcoded :53 server block is caught"
+
+echo
+echo "── the verifier prerequisite the role now owns ──"
+restore
+perl -0pi -e 's{- name: Make sure this node can verify a resolver before it installs one\n(?:.*\n)*?  ansible\.builtin\.include_tasks: verifier-prereq\.yml\n}{}' "$MAIN_TASKS"
+expect_red dns-harness-integrity.yml 'verifier-prereq|dig' \
+           "removing dig ownership from the role is caught"
+
+restore
+# ⚠️ THE DEFECT THE FIRST NATIVE CI RUN FOUND. cache_valid_time compares a
+# timestamp instead of asking whether the lists are usable, so a host whose
+# lists were cleaned skips the refresh and cannot find the package.
+perl -0pi -e 's{(    state: present\n    update_cache: true\n)}{$1    cache_valid_time: 3600\n}' "$PREREQ"
+expect_red dns-task-shape.yml 'cache_valid_time|refreshed' \
+           "re-adding cache_valid_time to the dig install is caught"
+
+restore
+perl -ni -e 'print unless /^    update_cache: true$/' "$PREREQ"
+expect_red dns-task-shape.yml 'update_cache|refreshed' \
+           "dropping update_cache from the dig install is caught"
+
+restore
+# ⚠️ A CHECK THAT WAS GREEN ONLY WHILE THE INSTALL WAS BROKEN. Grepping the
+# run log for the package name passes when Ansible quotes it in an ERROR and
+# fails on the run where the install finally works. Backwards is worse than
+# absent, so re-introducing it must be caught.
+perl -pi -e "s{^inx 'dpkg-query -s bind9-dnsutils' .*\$}{grep -q 'bind9-dnsutils' /tmp/coredns-linux-1.log \\\\}" "$ROLE_SH"
+expect_red dns-harness-integrity.yml 'dpkg-query|run log' \
+           "proving an install by grepping the run log is caught"
+
+echo
+echo "── the disposable macOS harness must stay disposable ──"
+restore
+# A harness that pointed at the live prefix or label would destroy the very
+# thing it is supposed to leave untouched.
+perl -pi -e 's{^LABEL="org\.dc1\.corednsdisposable\$\{STAMP\}"$}{LABEL="org.coredns.coredns"}' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'unique disposable label|org\.coredns\.coredns' \
+           "a macOS harness reusing the LIVE launchd label is caught"
+
+restore
+perl -ni -e 'print unless /^trap teardown EXIT INT TERM$/' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'teardown on success, failure and interrupt|trap' \
+           "omitting the macOS teardown trap is caught"
+
+restore
+perl -ni -e 'print unless /the daemon was RESTARTED before verification/' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'prove the pid changed|RESTARTED before verification' \
+           "treating a still-running old PID as success is caught"
+
+restore
+perl -ni -e 'print unless /third run reported changed=0/' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'changed=0|no-op' \
+           "allowing second-run churn is caught"
+
+restore
+# ⚠️ THE VACUOUS NON-INTERFERENCE PROOF. Accepting an empty baseline makes
+# every "unchanged" check compare "" with "" — six passes, nothing measured.
+perl -0pi -e 's{^for _probe in .*?^done\n^ok "the live baseline is non-empty[^\n]*\n}{}ms' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'live baseline is non-empty|REFUSING TO RUN' \
+           "accepting an empty live baseline is caught"
+
+restore
+perl -0pi -e 's{^if \[ "\$\(printf .*?^fi\n}{}ms' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'ports are distinct|sort -u' \
+           "allowing two disposable ports to collide is caught"
+
+restore
+# ⚠️ A REAL FALSE PASS, RESTORED AS A MUTATION. Denied sudo used to skip and
+# exit 0, so teardown printed "PASS" after exercising nothing.
+perl -0pi -e 's{  bad "sudo was granted, so the launchd path can be exercised" \\\n[^\n]*\n  exit 1\n}{  skip "sudo was not granted; the launchd path cannot be exercised."\n  exit 0\n}' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'failure, not a pass|sudo was granted' \
+           "turning denied sudo back into a skip is caught"
+
+restore
+# Revert every teardown call to the bare non-interactive form, which is what
+# silently fails once the sudo grace period lapses.
+perl -pi -e 's{\btsudo }{sudo -n }g' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'expired sudo timestamp|tsudo' \
+           "teardown that fails silently on an expired sudo timestamp is caught"
+
+restore
+# ⚠️ THE STRAY THAT WAS RECORDED AS LIVE STATE. Without the pre-flight, a
+# disposable daemon left by an interrupted run is folded into the baseline.
+perl -0pi -e 's{^hdr "PHASE 4  no disposable state may exist before the baseline"\n.*?^echo "  clean — no disposable label, process or prefix exists"\n}{}ms' "$GATE_SH"
+expect_red dns-harness-integrity.yml 'PRE-EXISTING DISPOSABLE STATE|contaminate the baseline' \
+           "a gate that builds its baseline on top of a stray is caught"
+
+restore
+# The lsof selection that reported every TCP-only port as closed.
+perl -0pi -e 's{    if sudo lsof -nP -iTCP:"\$p" -sTCP:LISTEN >/dev/null 2>&1 \\\n       \|\| sudo lsof -nP -iUDP:"\$p" >/dev/null 2>&1; then\n}{    if sudo lsof -nP -iTCP:"\$p" -sTCP:LISTEN -iUDP:"\$p" >/dev/null 2>&1; then\n}' "$GATE_SH"
+expect_red dns-harness-integrity.yml 'TCP and UDP separately|TCP-only port' \
+           "a port probe that reports TCP-only ports as closed is caught"
+
+restore
+# The teardown ownership race that spared a process which was in fact ours.
+perl -0pi -e 's{  for _p in \$\(pgrep -f "\$ROOT/sbin/coredns" 2>/dev/null\); do\n.*?^  \[ -n "\$DISPOSABLE_PID" \][^\n]*\n[^\n]*\n}{  if [ -n "\$DISPOSABLE_PID" ] \&\& kill -0 "\$DISPOSABLE_PID" 2>/dev/null; then\n    if ps -p "\$DISPOSABLE_PID" -o command= | grep -q "\$ROOT"; then\n      tsudo kill "\$DISPOSABLE_PID" 2>/dev/null \&\& echo "  killed disposable pid \$DISPOSABLE_PID"\n    else\n      echo "  pid \$DISPOSABLE_PID is no longer ours — NOT killing it"\n    fi\n  fi\n}ms' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'by prefix, not by a stale PID|no longer ours' \
+           "teardown identifying its process by a stale PID is caught"
+
+restore
+# ⚠️ THE FLAKY-CHECK PATTERN CI CAUGHT: test with one invocation, report with
+# another, and the message ends up quoting the string the test called absent.
+perl -0pi -e 's{ver_out=\$\(inx .*?\n.*?\n  && ok "it reports CoreDNS-1\.14\.7" \\\n  \|\| bad "version 1\.14\.7" "reported: \$\(printf [^\n]*\n}{inx \x27/usr/local/sbin/coredns --version\x27 2>/dev/null | grep -q \x27CoreDNS-1.14.7\x27 \\\n  && ok "it reports CoreDNS-1.14.7" || bad "version 1.14.7" "\$(inx \x27/usr/local/sbin/coredns --version\x27 2>&1 | head -1)"\n}s' "$ROLE_SH"
+expect_red dns-harness-integrity.yml 'capture|once to test' \
+           "a check that runs its command twice is caught"
+
+restore
+# ⚠️ THE DEFECT THE FIRST REAL dc1-arm-1 RUN FOUND. Dropping
+# --ask-become-pass leaves the harness relying on the tty-scoped sudo ticket
+# that Ansible's pipe-wired subprocess cannot see.
+perl -pi -e 's{ansible-playbook --ask-become-pass }{ansible-playbook }' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'ask-become-pass|cached ticket' \
+           "relying on a cached sudo ticket instead of --ask-become-pass is caught"
+
+restore
+# A password supplied as an argument is visible in ps to every local user.
+perl -pi -e 's{ansible-playbook --ask-become-pass }{ansible-playbook -e ansible_become_password=hunter2 }' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'ask-become-pass|ansible_become_password|command line' \
+           "passing a become password on the command line is caught"
+
+restore
+# The orphan-name RED bug, re-introduced in the macOS harness.
+perl -0pi -e "s{  perl -0pi -e 's\\{- name: Apply every pending restart.*?\\n}{  perl -ni -e 'print unless /ansible.builtin.meta: flush_handlers/' \"\\\$MAIN\"\n}s" "$LAUNCHD"
+perl -0pi -e 's{  if grep -q .Apply every pending restart. "\$MAIN"; then\n(?:.*?\n)*?  fi\n}{}' "$LAUNCHD"
+expect_red dns-harness-integrity.yml 'orphaned task|print unless' \
+           "a RED mutation that leaves an orphaned task is caught"
+
+echo
 echo "── everything is restored ──"
 restore
 cp "$WORK/plist" "$PLIST"
 cp "$WORK/unit" "$UNIT"
-for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape; do
+for s in dns-zone dns-services dns-inventory dns-install-platform dns-task-shape dns-harness-integrity; do
   if ansible-playbook "tests/${s}.yml" >"$WORK/out" 2>&1; then
     ok "tests/${s}.yml is green again"
   else
@@ -527,6 +732,8 @@ if [ "$fail" -gt 0 ]; then
   exit 1
 fi
 echo "PASS — $pass checks: every essential record, both checksums, the"
-echo "forwarding loop, LAN-only access, both service definitions and the"
-echo "macOS/Linux extraction split and the install directories are proved to"
+echo "forwarding loop, LAN-only access, both service definitions, the"
+echo "macOS/Linux extraction split, the install directories, the handler"
+echo "flush, the production DNS port, the role's ownership of dig, and the"
+echo "disposable macOS harness's own safety properties are proved to"
 echo "FAIL when broken, each for its own reason."

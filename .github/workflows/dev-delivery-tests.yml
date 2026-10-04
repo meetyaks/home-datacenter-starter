@@ -202,6 +202,16 @@ jobs:
       - name: LAN DNS — task shape, conditionals Ansible will accept
         run: ansible-playbook tests/dns-task-shape.yml
 
+      # ⚠️ A BROKEN HARNESS PASSES, SO CI CHECKS THE HARNESSES TOO. The macOS
+      #    end-to-end test runs a real root daemon on the management node
+      #    beside the LAN's primary resolver; it is operator-run and CI can
+      #    never execute it. What CI can do is refuse to let it lose its
+      #    unique label, its confined prefix, its teardown trap, or the
+      #    PID comparison that is the only reason it catches the stale-process
+      #    defect at all.
+      - name: LAN DNS — the end-to-end harnesses are still harnesses
+        run: ansible-playbook tests/dns-harness-integrity.yml
+
       - name: LAN DNS — the macOS/Linux extraction split
         run: ansible-playbook tests/dns-install-platform.yml
 
@@ -219,6 +229,45 @@ jobs:
       #    network, like run-remote-image-check.sh, which lives in run-all.sh
       #    for the same reason. It runs on the console, which is also where the
       #    Corefile will actually be loaded.
+      # ⚠️ THE ONE SUITE THAT EXECUTES THE ROLE, AND THE REASON THIS RUNNER IS
+      #    THE RIGHT PLACE FOR IT. Six defects reached a production node in
+      #    this rollout; four lived in files no test ran. This builds a
+      #    throwaway systemd container, runs roles/coredns against it for
+      #    real — service account, checksum-verified download, Linux
+      #    unarchive, unit, bind on :53, verify.yml — then proves a
+      #    configuration change restarts the daemon BEFORE verification and
+      #    that an unchanged rerun is a genuine no-op.
+      #
+      #    ⚠️ It needs NATIVE amd64, which this runner is. The role pins
+      #    linux_amd64 only, and `dig` segfaults under qemu on an arm64
+      #    workstation, where the suite skips loudly instead.
+      #
+      #    The macOS launchd half cannot run here — there is no macOS runner
+      #    and it needs sudo for a launchd system daemon — so it is
+      #    operator-run on the management node and is NOT silently counted
+      #    as covered by this lane.
+      - name: LAN DNS — the role executed end to end on Linux
+        run: tests/run-coredns-role.sh
+
+      # ⚠️ THE DEFECT ITSELF, REPRODUCED ON EVERY RUN. The sixth and final
+      #    defect of this rollout was that Ansible defers notified handlers to
+      #    the end of the play, so verify.yml interrogated the process still
+      #    running the OLD configuration — observed on dc1-arm-1 as PID 35119
+      #    answering on 8181 while the Corefile on disk said 8654.
+      #
+      #    This removes `meta: flush_handlers` from the role inside the
+      #    disposable container and REQUIRES the run to fail, with the old PID
+      #    still alive, the old health port still listening and the new one
+      #    absent. It exits 0 when the defect reproduces and non-zero if the
+      #    role somehow converges without the flush — so the fix cannot be
+      #    quietly reverted, and the harness cannot stop detecting it.
+      #
+      #    The flush is restored from a byte-for-byte copy by the script's
+      #    EXIT/INT/TERM trap, and the step after this one re-runs every suite
+      #    against the restored tree.
+      - name: LAN DNS — RED, the same role WITHOUT the handler flush must fail
+        run: tests/run-coredns-role.sh --red
+
       - name: LAN DNS mutations — every guard is proved to fail
         run: tests/run-dns-mutations.sh
 

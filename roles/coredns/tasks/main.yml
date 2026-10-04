@@ -23,10 +23,21 @@
   # is the one thing a pinned checksum exists to prevent. Adding a platform
   # means recording its published checksum, not relaxing this.
   ansible.builtin.assert:
+    #
+    # ⚠️ `.get(...)` RATHER THAN `[...]`, BECAUSE `that:` EVALUATES EVERY
+    # CONDITION. A subscript on a platform with no pin raises inside Jinja
+    # before the membership test can report anything, so the refusal arrived
+    # as
+    #
+    #   'dict object' has no attribute 'linux_arm64'
+    #
+    # instead of the message written just below it. The guard worked; it
+    # simply could not say why. Found by tests/run-coredns-role.sh the first
+    # time it ran on an arm64 container.
     that:
       - coredns_platform in coredns_checksums
-      - coredns_checksums[coredns_platform] | length == 64
-      - coredns_checksums[coredns_platform] is match('^[0-9a-f]{64}$')
+      - (coredns_checksums.get(coredns_platform, '')) | length == 64
+      - (coredns_checksums.get(coredns_platform, '')) is match('^[0-9a-f]{64}$')
     fail_msg: >-
       This node is {{ coredns_platform }}, for which roles/coredns has no
       recorded SHA-256. Pinned platforms are
@@ -39,6 +50,13 @@
       {{ coredns_checksums[coredns_platform][:12] }}… for
       CoreDNS {{ coredns_version }}.
 
+- name: Make sure this node can verify a resolver before it installs one
+  # ⚠️ BEFORE ANYTHING IS CHANGED, DELIBERATELY. verify.yml shells out to
+  # `dig`, and the role never owned that prerequisite — it worked on dc1-x86
+  # only because dig happened to be installed there. A role that installs a
+  # service it cannot then verify is worse than one that refuses up front.
+  ansible.builtin.include_tasks: verifier-prereq.yml
+
 - name: Install the pinned binary
   ansible.builtin.include_tasks: install.yml
 
@@ -47,6 +65,30 @@
 
 - name: Define the service for this operating system
   ansible.builtin.include_tasks: "service-{{ 'launchd' if coredns_is_darwin else 'systemd' }}.yml"
+
+- name: Apply every pending restart BEFORE anything verifies the service
+  # ⚠️ THE SIXTH DEFECT OF THIS ROLLOUT, AND THE ONE THIS REPOSITORY HAD
+  # ALREADY LEARNED ONCE. Ansible runs notified handlers at the END of a play.
+  # Without this flush, the template above rewrites the Corefile, notifies
+  # `Restart CoreDNS`, and verify.yml then interrogates the process that is
+  # STILL RUNNING THE OLD CONFIGURATION.
+  #
+  # Observed on dc1-arm-1: the Corefile moved health/ready to 8653/8654
+  # (fingerprint 919e70da → 64c6e7ef) while PID 35119, started 01:02:43, kept
+  # serving 8080/8181. Verification polled 8654, got connection refused six
+  # times, and failed — and because the play failed, the pending handler never
+  # ran at all, leaving disk and process permanently disagreeing. The port-53
+  # wait passed throughout, because that same stale process still held :53.
+  #
+  # roles/caddy/tasks/reload-and-verify.yml carries the identical fix for the
+  # identical reason; tests/run-caddy-handler-order.sh is its regression.
+  #
+  # ⚠️ THE FLUSH CAN ONLY RUN `Restart CoreDNS`. playbooks/dns.yml declares
+  # exactly one role, so no other handler is pending in this play — flushing
+  # here cannot have a side effect on anything else
+  # (enforced: tests/dns-task-shape.yml "handlers are flushed before
+  # verification", and the RED/GREEN pair in tests/run-coredns-launchd.sh).
+  ansible.builtin.meta: flush_handlers
 
 - name: Verify it answers
   ansible.builtin.include_tasks: verify.yml

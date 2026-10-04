@@ -78,6 +78,32 @@ coredns_soa_expire: 1209600
 coredns_soa_minimum: 300
 coredns_record_ttl: 300
 
+# ── THE DNS PORT, WHICH EXISTS SO THE ROLE CAN BE TESTED ────────────────────
+#
+# ⚠️ 53 IN PRODUCTION, ALWAYS. This is a TESTABILITY SEAM, not a tuning knob:
+# no inventory overrides it and nothing should
+# (enforced: tests/dns-zone.yml "production still renders :53").
+#
+# It exists because the role could not be exercised end to end on macOS, and
+# that is how four of the six defects in this rollout reached a production
+# node. The Corefile's server-block headers had the port written into them:
+#
+#   dc1.lan:53 {      and      .:53 {
+#
+# A disposable CoreDNS on the management node therefore had nowhere to listen.
+# The live daemon already holds 127.0.0.1:53, and macOS — unlike Linux —
+# REFUSES to bind another address in 127/8 without an explicit `ifconfig lo0
+# alias`, which is a host network change no test should make:
+#
+#   listen tcp 127.0.0.2:18653: bind: can't assign requested address
+#
+# So neither another port nor another address was available, and the launchd
+# half of this role had no way to run outside production. One variable fixes
+# that: the disposable test picks a free high port on 127.0.0.1 and exercises
+# the real lifecycle — render, notify, flush, restart, verify — against the
+# real templates.
+coredns_dns_port: 53
+
 # ── WHO MAY ASK, AND WHERE QUERIES GO ───────────────────────────────────────
 #
 # LAN and loopback only. The `acl` plugin blocks everything else, so a
