@@ -663,6 +663,13 @@ expect_red dns-harness-integrity.yml 'expired sudo timestamp|tsudo' \
            "teardown that fails silently on an expired sudo timestamp is caught"
 
 restore
+# ⚠️ THE FLAKY-CHECK PATTERN CI CAUGHT: test with one invocation, report with
+# another, and the message ends up quoting the string the test called absent.
+perl -0pi -e 's{ver_out=\$\(inx .*?\n.*?\n  && ok "it reports CoreDNS-1\.14\.7" \\\n  \|\| bad "version 1\.14\.7" "reported: \$\(printf [^\n]*\n}{inx \x27/usr/local/sbin/coredns --version\x27 2>/dev/null | grep -q \x27CoreDNS-1.14.7\x27 \\\n  && ok "it reports CoreDNS-1.14.7" || bad "version 1.14.7" "\$(inx \x27/usr/local/sbin/coredns --version\x27 2>&1 | head -1)"\n}s' "$ROLE_SH"
+expect_red dns-harness-integrity.yml 'capture|once to test' \
+           "a check that runs its command twice is caught"
+
+restore
 # ⚠️ THE DEFECT THE FIRST REAL dc1-arm-1 RUN FOUND. Dropping
 # --ask-become-pass leaves the harness relying on the tty-scoped sudo ticket
 # that Ansible's pipe-wired subprocess cannot see.

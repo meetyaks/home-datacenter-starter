@@ -197,6 +197,29 @@
           harness exists to remove.
         success_msg: "Denied sudo fails the run rather than reporting a pass."
 
+    - name: No check runs its command once to test and again to report
+      # ⚠️ CI PRINTED THE CONTRADICTION ITSELF:
+      #
+      #   FAIL  version 1.14.7
+      #         CoreDNS-1.14.7
+      #
+      # The pass path ran `coredns --version` with 2>/dev/null and the fail
+      # path ran it again with 2>&1, so the message quoted the exact string
+      # the test had just reported missing. A check whose two paths execute
+      # different commands cannot be believed in either direction.
+      ansible.builtin.assert:
+        that:
+          - linux is search('svc_state=\$\(inx')
+          - linux is search('ver_out=\$\(inx')
+          - not (linux is search('bad "version 1\.14\.7" "\$\(inx'))
+          - not (linux is search('bad "coredns\.service is active" "\$\(inx'))
+        fail_msg: >-
+          tests/run-coredns-role.sh must capture a command's output once and
+          then test the captured value. Re-running the command to build the
+          failure message produced a FAIL whose own message contained the
+          string it claimed was absent.
+        success_msg: "Checks capture once and test the captured value."
+
     - name: The role is run with --ask-become-pass, never a cached ticket
       # ⚠️ THE FIRST REAL RUN ON dc1-arm-1 DIED ON THIS. The harness primed
       # sudo with `sudo -v` and the ticket was valid in its own shell — but

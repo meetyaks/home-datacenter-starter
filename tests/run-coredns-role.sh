@@ -190,15 +190,30 @@ grep -q 'Unpack it (Linux)' /tmp/coredns-linux-1.log \
 
 echo
 echo "── 2. the service is real, and answers ──"
-inx 'systemctl is-active coredns' 2>/dev/null | grep -qx active \
-  && ok "coredns.service is active" \
-  || bad "coredns.service is active" "$(inx 'systemctl is-active coredns' 2>&1 | head -1)"
+# ⚠️ CAPTURE ONCE, THEN TEST — DO NOT RUN THE COMMAND TWICE. These two
+# checks used to execute the container command once for the test and AGAIN
+# to build the failure message, with different stderr handling each time
+# (`2>/dev/null` for the test, `2>&1` for the message). CI then produced the
+# contradiction that makes the pattern indefensible:
+#
+#   FAIL  version 1.14.7
+#         CoreDNS-1.14.7
+#
+# — the failure message printed the exact string the test had just claimed
+# was absent, because the two invocations did not see the same output. A
+# check whose pass and fail paths run different commands is not a check; it
+# cannot be trusted in either direction, and it wastes a CI run to say so.
+svc_state=$(inx 'systemctl is-active coredns' 2>&1 | tr -d '\r' | head -1)
+[ "$svc_state" = active ] && ok "coredns.service is active" \
+  || bad "coredns.service is active" "systemctl is-active said '$svc_state'"
 inx 'id coredns' >/dev/null 2>&1 && ok "the coredns service account exists" \
   || bad "service account exists" "id coredns failed"
 inx 'test -x /usr/local/sbin/coredns' && ok "the binary is installed" \
   || bad "binary installed" "/usr/local/sbin/coredns missing"
-inx '/usr/local/sbin/coredns --version' 2>/dev/null | grep -q 'CoreDNS-1.14.7' \
-  && ok "it reports CoreDNS-1.14.7" || bad "version 1.14.7" "$(inx '/usr/local/sbin/coredns --version' 2>&1 | head -1)"
+ver_out=$(inx '/usr/local/sbin/coredns --version' 2>&1 | tr -d '\r')
+printf '%s' "$ver_out" | grep -q 'CoreDNS-1.14.7' \
+  && ok "it reports CoreDNS-1.14.7" \
+  || bad "version 1.14.7" "reported: $(printf '%s' "$ver_out" | head -1)"
 
 for rec in "dc1-arm-1.dc1.lan 10.0.0.22" "dc1-x86.dc1.lan 10.0.0.3" "keel-dev.dc1.lan 10.0.0.3"; do
   n=${rec%% *}; want=${rec##* }
