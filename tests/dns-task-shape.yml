@@ -370,6 +370,45 @@
         service_idx: "{{ main_summary | selectattr('name', 'search', 'Define the service') | map(attribute='idx') | list }}"
         verify_idx: "{{ main_summary | selectattr('name', 'search', 'Verify it answers') | map(attribute='idx') | list }}"
 
+    - name: Collect the apt tasks in verifier-prereq.yml
+      # ⚠️ SUBSCRIPT, NOT selectattr('ansible.builtin.apt', 'defined') —
+      # Jinja reads the dots as a nested path (task['ansible']['builtin']
+      # ['apt']) and the filter silently matches nothing, which would make
+      # the assertion below pass against an empty list. Same trap as the
+      # meta: flush_handlers summary above.
+      ansible.builtin.set_fact:
+        prereq_apt: "{{ prereq_apt | default([]) + [ item['ansible.builtin.apt'] ] }}"
+      loop: "{{ lookup('file', '../roles/coredns/tasks/verifier-prereq.yml') | from_yaml }}"
+      when: item['ansible.builtin.apt'] is defined
+      loop_control:
+        label: "{{ item.name | default('(unnamed)') }}"
+
+    - name: THE dig INSTALL REFRESHES THE PACKAGE LISTS UNCONDITIONALLY
+      # ⚠️ FOUND BY THE FIRST NATIVE CI RUN OF THE NEW HARNESS, which is the
+      # whole reason the harness exists. `cache_valid_time` does not ask
+      # whether the package lists are USABLE — it compares a timestamp and
+      # skips the refresh when the stamp looks recent. The disposable image's
+      # stamp was minutes old and its lists had been deleted, so Ansible
+      # skipped the update and the install died on:
+      #
+      #   No package matching 'bind9-dnsutils' is available
+      #
+      # `apt-get clean`, a disk-pressure cleanup or any trimmed base image
+      # leaves a real host in exactly that state, and the role would then
+      # refuse to install the verifier for a resolver it is about to deploy.
+      ansible.builtin.assert:
+        that:
+          - (prereq_apt | default([]) | length) == 1
+          - (prereq_apt | first).get('update_cache') | bool
+          - "'cache_valid_time' not in (prereq_apt | first)"
+        fail_msg: >-
+          The apt task in roles/coredns/tasks/verifier-prereq.yml must set
+          update_cache and must NOT set cache_valid_time. A fresh-looking
+          timestamp over emptied lists makes the refresh get skipped and the
+          package unfindable on a host that is otherwise healthy.
+        success_msg: >-
+          dig is installed against package lists that were actually refreshed.
+
     - name: Done
       ansible.builtin.debug:
         msg: >-

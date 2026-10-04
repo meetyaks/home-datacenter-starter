@@ -26,6 +26,7 @@ VERIFY=roles/coredns/tasks/verify.yml
 SHAPE=tests/dns-task-shape.yml
 MAIN_TASKS=roles/coredns/tasks/main.yml
 CONFIGURE=roles/coredns/tasks/configure.yml
+PREREQ=roles/coredns/tasks/verifier-prereq.yml
 # ⚠️ A TEST SCRIPT MUTATED AS IF IT WERE PRODUCTION CODE. The macOS harness
 # runs a real root daemon beside the live resolver, so its safety properties
 # are load-bearing in exactly the way a role's are, and they get the same
@@ -43,6 +44,7 @@ restore() {
   [ -f "$WORK/shape" ] && cp "$WORK/shape" "$SHAPE"
   [ -f "$WORK/main_tasks" ] && cp "$WORK/main_tasks" "$MAIN_TASKS"
   [ -f "$WORK/configure" ] && cp "$WORK/configure" "$CONFIGURE"
+  [ -f "$WORK/prereq" ] && cp "$WORK/prereq" "$PREREQ"
   [ -f "$WORK/launchd" ] && cp "$WORK/launchd" "$LAUNCHD"
   return 0
 }
@@ -58,6 +60,7 @@ cp "$VERIFY" "$WORK/verify"
 cp "$SHAPE" "$WORK/shape"
 cp "$MAIN_TASKS" "$WORK/main_tasks"
 cp "$CONFIGURE" "$WORK/configure"
+cp "$PREREQ" "$WORK/prereq"
 cp "$LAUNCHD" "$WORK/launchd"
 
 pass=0
@@ -583,6 +586,19 @@ restore
 perl -0pi -e 's{- name: Make sure this node can verify a resolver before it installs one\n(?:.*\n)*?  ansible\.builtin\.include_tasks: verifier-prereq\.yml\n}{}' "$MAIN_TASKS"
 expect_red dns-harness-integrity.yml 'verifier-prereq|dig' \
            "removing dig ownership from the role is caught"
+
+restore
+# ⚠️ THE DEFECT THE FIRST NATIVE CI RUN FOUND. cache_valid_time compares a
+# timestamp instead of asking whether the lists are usable, so a host whose
+# lists were cleaned skips the refresh and cannot find the package.
+perl -0pi -e 's{(    state: present\n    update_cache: true\n)}{$1    cache_valid_time: 3600\n}' "$PREREQ"
+expect_red dns-task-shape.yml 'cache_valid_time|refreshed' \
+           "re-adding cache_valid_time to the dig install is caught"
+
+restore
+perl -ni -e 'print unless /^    update_cache: true$/' "$PREREQ"
+expect_red dns-task-shape.yml 'update_cache|refreshed' \
+           "dropping update_cache from the dig install is caught"
 
 echo
 echo "── the disposable macOS harness must stay disposable ──"

@@ -54,11 +54,26 @@
   # naming the real one keeps working when the transitional package is
   # eventually dropped. Both Ubuntu 26.04 (dc1-x86) and Debian bookworm (the
   # disposable test container) provide it.
+  #
+  # ⚠️ NO cache_valid_time, AND THE FIRST NATIVE CI RUN IS WHY. That setting
+  # does not ask whether the package lists are USABLE — it compares a
+  # timestamp, and skips the refresh when the stamp looks recent. A host whose
+  # lists were cleaned has a fresh stamp and no lists, so Ansible skipped the
+  # update and the install died on:
+  #
+  #   No package matching 'bind9-dnsutils' is available
+  #
+  # That is not a container quirk. `apt-get clean`, a disk-pressure cleanup or
+  # any image build that trims /var/lib/apt/lists leaves exactly this state,
+  # and the role would refuse to install the resolver's own verifier on a host
+  # that is otherwise perfectly healthy. One apt refresh, on a role that runs
+  # rarely, is the cheaper side of that trade.
+  # (enforced: tests/dns-task-shape.yml "THE dig INSTALL REFRESHES THE
+  # PACKAGE LISTS UNCONDITIONALLY", mutation "re-adding cache_valid_time")
   ansible.builtin.apt:
     name: bind9-dnsutils
     state: present
     update_cache: true
-    cache_valid_time: 3600
   become: true
   when:
     - not (coredns_is_darwin | bool)
