@@ -182,6 +182,58 @@
           Use single quotes around conditionals that contain regex escapes.
         success_msg: "No conditional carries a mangled escape."
 
+    - name: Find conditionals that depend on a backslash escape Python consumes
+      # ⚠️ COMPUTED IN set_fact, NOT IN THE ASSERTION ITSELF. This check is
+      # about escape processing in conditionals, so writing its own pattern
+      # inside a `that:` would subject it to the very thing it is testing.
+      # `set_fact` goes through ordinary templating, which leaves backslashes
+      # alone; the assertion below only compares a length.
+      ansible.builtin.set_fact:
+        escape_conditionals: >-
+          {{ conditionals | flatten | select('string')
+             | select('search', '\\[abfnrtv0xNuU]') | list }}
+
+    - name: NO CONDITIONAL DEPENDS ON A BACKSLASH ESCAPE
+      # ⚠️ PROVEN ON THE HOST, NOT REASONED ABOUT. The fourth watched
+      # deployment failed on `search("flags:[^;]*\baa\b")` inside a `that:`
+      # while the IDENTICAL expression returned True from a `debug` task
+      # against the same captured output. Four variants, one play, on
+      # dc1-arm-1:
+      #
+      #   that:  search("...\baa\b")    → FAIL
+      #   debug: search("...\baa\b")    → True
+      #   that:  search("...\\baa\\b")  → pass
+      #   that:  search("... aa[ ;]")   → pass
+      #
+      # Ansible's conditional evaluation applies Python string-literal escape
+      # processing; ordinary templating does not.
+      #
+      # ⚠️ ONLY THE ESCAPES PYTHON RECOGNISES ARE REFUSED. `\d`, `\s`, `\S`,
+      # `\w` and `\.` are INVALID Python escapes, so Python leaves them
+      # untouched and they reach the regex engine intact — which is exactly
+      # why the neighbouring record assertions in verify.yml always worked.
+      # Refusing those too would be wrong and would force pointless
+      # rewrites. The dangerous set is the one Python actually interprets:
+      # \a \b \f \n \r \t \v \0 \x \N \u \U.
+      #
+      # The fix is never "add another backslash" — that depends on counting
+      # how many layers consume one. Write the pattern without escapes.
+      ansible.builtin.assert:
+        that:
+          - (escape_conditionals | length) == 0
+        fail_msg: >-
+          {{ escape_conditionals | length }} conditional(s) in roles/coredns
+          depend on a backslash escape that Python's string-literal
+          processing CONSUMES before the regex engine sees it:
+          {{ escape_conditionals | map('to_json') | join('  ') }}
+          Inside `that:` and `when:`, \a \b \f \n \r \t \v \0 \x \N \u \U are
+          interpreted and silently disappear — the expression then matches
+          nothing while looking correct. Rewrite without the escape
+          (e.g. "[^;]* aa[ ;]" instead of "\baa\b"). \d, \s, \S, \w and \.
+          are fine: Python leaves unrecognised escapes alone.
+        success_msg: >-
+          No conditional depends on an escape Python would consume.
+
     - name: Every task file is a list of tasks Ansible can read
       # A file that parses as something other than a list of mappings is not a
       # task file, however valid its YAML.

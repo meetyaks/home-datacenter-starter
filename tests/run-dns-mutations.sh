@@ -376,7 +376,13 @@ expect_red dns-task-shape.yml 'parse as MAPPINGS rather than strings|must be quo
 #    escapes and the word-boundary anchors become literal backspaces. The file
 #    parses, the task runs, and the assertion silently matches nothing.
 restore
-perl -0pi -e "s{- 'coredns_reserved\.stdout is search\(\"flags:\[\^;\]\*\\\\baa\\\\b\"\)'}{- \"coredns_reserved.stdout is search('flags:[^;]*\\\\baa\\\\b')\"}" "$VERIFY"
+# ⚠️ RE-TARGETED WHEN THE \b FORM WAS REMOVED. This originally rewrote the
+# `search("flags:[^;]*\baa\b")` line; once that was replaced by the
+# escape-free form the substitution matched nothing, the file was left
+# untouched, and the runner reported "the mutation went unnoticed" — the
+# correct verdict for a mutation that never landed, and the reason this was
+# noticed at all rather than quietly degrading into a no-op.
+perl -0pi -e "s{- 'coredns_reserved\.stdout is search\(\"flags:\[\^;\]\* aa\[ ;\]\"\)'}{- \"coredns_reserved.stdout is search('flags:[^;]*\\\\baa\\\\b')\"}" "$VERIFY"
 expect_red dns-task-shape.yml 'non-printable character|eaten by a double-quoted' \
            "a double-quoted conditional whose escapes are eaten is caught"
 
@@ -396,6 +402,44 @@ restore
 perl -0pi -e 's{(- name: Give the daemon a moment to bind\n)}{$1  when: coredns_zone is search(\x27dc1: lan\x27)\n}' "$VERIFY"
 expect_red dns-task-shape.yml 'not valid YAML and Ansible could not read it' \
            "an unparseable task file is reported by name, not as a template error"
+
+echo
+echo "── conditionals that depend on a backslash escape ──"
+# ⚠️ THE FOURTH dc1-arm-1 FAILURE, AND THE SUBTLEST SO FAR. The assertion
+# `search("flags:[^;]*\baa\b")` failed inside a `that:` while the IDENTICAL
+# expression returned True from a `debug` task against the same captured
+# output. Ansible's conditional evaluation applies Python string-literal
+# escape processing; ordinary templating does not. `\b` became a backspace
+# and the expression matched nothing while looking perfectly correct.
+restore
+
+# 1. The regression itself.
+perl -0pi -e 's{- .coredns_reserved\.stdout is search\("flags:\[\^;\]\* aa\[ ;\]"\).}{- \x27coredns_reserved.stdout is search("flags:[^;]*\\baa\\b")\x27}' "$VERIFY"
+expect_red dns-task-shape.yml 'depend on a backslash escape|CONSUMES before the regex' \
+           "a conditional relying on \\b is caught"
+
+# 2. A different consumed escape, to prove the guard is not hard-coded to \b.
+restore
+perl -0pi -e 's{- .coredns_reserved\.stdout is search\("status: NXDOMAIN"\).}{- \x27coredns_reserved.stdout is search("status:\\nNXDOMAIN")\x27}' "$VERIFY"
+expect_red dns-task-shape.yml 'depend on a backslash escape|CONSUMES before the regex' \
+           "a conditional relying on \\n is caught"
+
+# 3. ⚠️ THE NEGATIVE CASE, AND IT MATTERS AS MUCH AS THE OTHERS. `\d`, `\s`,
+#    `\S`, `\w` and `\.` are INVALID Python escapes, so Python leaves them
+#    alone and they reach the regex engine intact — which is why the record
+#    assertions in this very file have always worked. A guard that refused
+#    them too would be wrong and would force pointless rewrites of working
+#    code. This adds one and requires the suite to stay GREEN.
+restore
+perl -0pi -e 's{(      - .coredns_reserved\.stdout is search\("status: NXDOMAIN"\).\n)}{$1      - \x27coredns_reserved.stdout is search("id: \\d+")\x27\n}' "$VERIFY"
+if ansible-playbook tests/dns-task-shape.yml >"$WORK/out" 2>&1; then
+  ok "a conditional using \\d is correctly ALLOWED (not a false positive)"
+else
+  bad "a conditional using \\d is correctly allowed" \
+      "the guard rejected an escape Python does NOT consume; it is over-broad"
+  grep -E "fatal|msg" "$WORK/out" | head -2 | sed 's/^/           /'
+fi
+restore
 
 echo
 echo "── everything is restored ──"
