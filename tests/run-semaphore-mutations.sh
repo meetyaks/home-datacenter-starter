@@ -413,6 +413,13 @@ expect_red semaphore-harness-integrity.yml '_semt account survives|sweeps for st
            "a gate that does not sweep for stray identities is caught"
 
 restore
+# ⚠️ THE ELLIPSIS THAT KILLED A CONTROLLER RUN. bash absorbed the first
+# byte of U+2026 into the identifier and set -u aborted mid-bootstrap.
+perl -pi -e 's{as \$\{SVC_USER\}}{as \$SVC_USER}' "$BOOTSTRAP_TPL"
+expect_red semaphore-harness-integrity.yml 'non-ASCII|unbound' \\
+           "a bare \$VAR touching a non-ASCII character is caught"
+
+restore
 # ⚠️ EIGHT FAILURES FROM ONE CAUSE: unprivileged reads of service-owned
 # paths report "missing" for files that are present and correct.
 perl -pi -e 's{tsudo test -x "\$ROOT/sbin/semaphore-bootstrap-admin"}{test -x "\$ROOT/sbin/semaphore-bootstrap-admin"}' "$MACOS_SH"

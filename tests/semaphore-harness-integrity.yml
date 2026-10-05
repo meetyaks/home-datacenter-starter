@@ -222,6 +222,42 @@
           role behaviour.
         success_msg: "Both harnesses implement the full two-stage flow."
 
+    - name: NO BARE $VAR MAY TOUCH A NON-ASCII CHARACTER
+      # ⚠️ THIS KILLED A CONTROLLER RUN MID-BOOTSTRAP. The helper printed
+      #
+      #   echo "  running the supported setup, as $SVC_USER…"
+      #
+      # with U+2026 immediately after the name. bash took the first byte of
+      # the multibyte character as part of the identifier and `set -u`
+      # aborted:
+      #
+      #   line 192: SVC_USER\xe2: unbound variable
+      #
+      # Every Linux run passed, shellcheck passed, and the files are full
+      # of typographic punctuation — so this is a standing hazard rather
+      # than a one-off typo. Braces make the boundary explicit.
+      ansible.builtin.assert:
+        that:
+          - (shell_sources | regex_findall('\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]') | length) == 0
+        fail_msg: >-
+          A bare $VAR is immediately followed by a non-ASCII character:
+          {{ shell_sources | regex_findall('\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]') }}.
+          bash may absorb the first byte into the identifier, and `set -u`
+          then aborts at runtime. Use ${VAR}.
+        success_msg: "No bare variable abuts a non-ASCII character."
+      vars:
+        # ⚠️ COMMENT-STRIPPED. The comment explaining this hazard QUOTES the
+        # offending form, so scanning the raw text flags the very file that
+        # documents the fix — the seventh time a text search in this
+        # repository has matched prose instead of code.
+        shell_sources: >-
+          {{ (lookup('file', '../roles/semaphore/templates/semaphore-bootstrap-admin.sh.j2')
+              ~ lookup('file', '../roles/semaphore/templates/semaphore-backup.sh.j2')
+              ~ lookup('file', '../tests/run-semaphore-launchd.sh')
+              ~ lookup('file', '../tests/run-semaphore-linux.sh')
+              ~ lookup('file', '../tests/run-dc1-semaphore-gate.sh'))
+             | regex_replace('(?m)^\s*#.*$', '') }}
+
     - name: SERVICE-OWNED PATHS ARE READ WITH PRIVILEGE, NOT AS THE OPERATOR
       # ⚠️ EIGHT FAILURES FROM ONE CAUSE. In account mode the harness runs
       # as the operator, but the helper is root:<group> 0750 and the state

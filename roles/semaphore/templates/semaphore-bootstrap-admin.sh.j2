@@ -206,7 +206,17 @@ echo "  temporary setup directory created 0700, owned by $SVC_USER"
 TMPCFG="$SETUPDIR/config.json"
 
 echo
-echo "  running the supported setup, as $SVC_USER…"
+# ⚠️ BRACED, BECAUSE A TYPOGRAPHIC ELLIPSIS FOLLOWED THE BARE VARIABLE.
+# `$SVC_USER…` — U+2026 immediately after the name — made bash take the
+# first byte of the multibyte character as part of the identifier, and
+# `set -u` then killed the run mid-bootstrap:
+#
+#   line 192: SVC_USER\xe2: unbound variable
+#
+# It survived every Linux run and every shellcheck pass. Braces make the
+# boundary explicit; tests/semaphore-harness-integrity.yml now refuses any
+# bare $VAR touching a non-ASCII character anywhere in these scripts.
+echo "  running the supported setup, as ${SVC_USER}…"
 
 # ⚠️ EVERY ANSWER IS FED ON STDIN, INCLUDING THE PASSWORD. printf is a shell
 # BUILTIN, so no process is forked with these values in its argv. The prompt
