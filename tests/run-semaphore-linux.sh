@@ -202,9 +202,19 @@ rcb=$?
 [ $rcb -eq 0 ] && ok "the interactive bootstrap succeeded" \
   || { bad "interactive bootstrap" "exit $rcb"; tail -25 /tmp/semaphore-bootstrap.log | sed 's/^/           /'; }
 
-samples=$(inx 'grep -c . /run/ps-samples.txt' 2>/dev/null | tr -d '\r\n')
-[ "${samples:-0}" -gt 50 ] && ok "the process table was sampled $samples times during setup" \
-  || bad "process table sampled" "only ${samples:-0} lines captured"
+# ⚠️ A LOW FLOOR, AND THE CONTROL BELOW IS THE REAL PROOF. The first version
+# demanded >50 captured LINES, a threshold tuned on an emulated arm64 host
+# where the bootstrap takes many seconds. Natively it finishes in under one,
+# so CI took far fewer samples and the check failed on a perfectly good run —
+# a speed-dependent assertion, not a correctness one.
+#
+# What actually matters is that sampling ran at all and that the password was
+# never in another process's argv. The next check proves sampling works by
+# requiring the password to appear in the driver's OWN argv; if that holds
+# and no other process shows it, the evidence stands regardless of count.
+samples=$(grep -oE '[0-9]+ process-table samples' /tmp/semaphore-bootstrap.log | head -1 | awk '{print $1}')
+[ "${samples:-0}" -ge 3 ] && ok "the process table was sampled ${samples} times during setup" \
+  || bad "process table sampled" "only ${samples:-0} samples taken"
 
 # ⚠️ THE CONTROL AND THE TEST, TOGETHER. The password MUST appear in the
 # driver's own argv — that is how we know the sampling actually worked — and
