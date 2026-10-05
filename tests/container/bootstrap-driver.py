@@ -35,6 +35,46 @@ samples = []
 stop = threading.Event()
 # Records one entry per password prompt whose ECHO bit was observed clear.
 echo_off_confirmed = []
+# One line per observation of the live temporary setup directory: its mode,
+# and whether an unrelated unprivileged account could read the config.
+setup_dir_observations = []
+
+
+def probe_setup_dir():
+    """While setup runs, prove its temporary directory is unreachable.
+
+    ⚠️ CHECKED WHILE IT EXISTS, NOT AFTERWARDS. `semaphore setup` writes its
+    config 0644 — the binary cannot be told otherwise — so the only thing
+    protecting the generated encryption key is the 0700 parent. That has to
+    be observed during the window when the file is actually on disk;
+    checking after cleanup proves nothing at all.
+
+    Records the directory mode and the result of an unprivileged read
+    attempt by an account that is neither root nor the service identity.
+    """
+    state = os.environ.get("SEMAPHORE_STATE_DIR", "")
+    if not state:
+        return
+    while not stop.is_set():
+        try:
+            for name in os.listdir(state):
+                if not name.startswith(".setup."):
+                    continue
+                path = os.path.join(state, name)
+                mode = oct(os.stat(path).st_mode & 0o777)
+                # An unrelated unprivileged account must not be able to
+                # traverse the directory or read the config inside it.
+                probe = subprocess.run(
+                    ["runuser", "-u", "nobody", "--",
+                     "cat", os.path.join(path, "config.json")],
+                    capture_output=True, text=True, timeout=5,
+                )
+                setup_dir_observations.append(
+                    f"dir={name} mode={mode} nobody_read_rc={probe.returncode}"
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.05)
 
 
 def sample_processes():
@@ -52,6 +92,8 @@ def sample_processes():
 
 sampler = threading.Thread(target=sample_processes, daemon=True)
 sampler.start()
+prober = threading.Thread(target=probe_setup_dir, daemon=True)
+prober.start()
 
 pid, fd = pty.fork()
 if pid == 0:
@@ -124,6 +166,7 @@ except ChildProcessError:
 
 stop.set()
 sampler.join(timeout=2)
+prober.join(timeout=2)
 
 with open(ps_out, "w") as fh:
     fh.write("".join(samples))
@@ -136,6 +179,8 @@ print(f"DRIVER: helper exit {rc}")
 # harness could see that something was wrong and nothing about what. The
 # transcript cannot contain the password: echo is off for both prompts, and
 # the harness asserts that separately.
+for _o in dict.fromkeys(setup_dir_observations):
+    print(f"DRIVER: setup-dir {_o}")
 print(f"DRIVER: echo-off confirmed at {len(echo_off_confirmed)} password prompt(s)")
 print("DRIVER: ---- helper transcript ----")
 sys.stdout.write(full.decode("utf-8", "replace"))

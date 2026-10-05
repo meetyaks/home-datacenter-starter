@@ -229,6 +229,19 @@ expect_red semaphore-config.yml 'already|unsafe precondition' \
            "a helper that can be run twice is caught"
 
 restore
+# ⚠️ 4A: setup WRITES ITS CONFIG 0644 AND THE BINARY CANNOT BE TOLD
+# OTHERWISE, so the 0700 parent is the only thing keeping its generated
+# encryption key out of reach while it exists on disk.
+perl -pi -e 's{mkdir -m 0700 "\$SETUPDIR"}{mkdir -m 0755 "\$SETUPDIR"}' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml '0700|unsafe precondition' \
+           "a world-traversable temporary setup directory is caught"
+
+restore
+perl -ni -e 'print unless /temporary setup path already exists/' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'already exists|unsafe precondition' \
+           "a setup directory that may be pre-planted is caught"
+
+restore
 perl -pi -e 's{<key>PATH</key>}{<key>SEMAPHORE_ACCESS_KEY_ENCRYPTION</key>\n    <string>{{ semaphore_access_key_encryption }}</string>\n    <key>PATH</key>}' "$PLIST_TPL"
 expect_red semaphore-config.yml 'plist|secret' \
            "a secret embedded in the world-readable plist is caught"

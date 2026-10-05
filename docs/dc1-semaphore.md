@@ -218,17 +218,74 @@ and verifies it.
 
 ## First login and mandatory TOTP
 
-1. Open the tunnel and go to `http://127.0.0.1:3000`.
-2. Log in as `dc1admin` with the vaulted password.
-3. **Immediately enrol TOTP** — User settings → two-factor authentication.
+v2.19.12 has **no setting that centrally forces TOTP enrolment**. This is
+therefore an operator acceptance control, not an automated enforcement
+claim, and the deployment is not complete until the sequence below has been
+performed and the second factor observed.
 
-v2.19.12 has no central setting that forces TOTP on all users, so this is a
-blocking acceptance step of the watched deployment rather than something the
-role can enforce. A deployment where step 3 has not been completed is not
-finished.
+1. Open the tunnel — there is no LAN listener:
+   `ssh -L 3000:127.0.0.1:3000 dc1-arm-1@10.0.0.22`
+2. Confirm the listener is still loopback only:
+   `sudo lsof -nP -iTCP:3000 -sTCP:LISTEN` shows `127.0.0.1:3000` and
+   nothing on `0.0.0.0`.
+3. Log in as `dc1admin` with the password set during bootstrap.
+4. Enrol TOTP in user settings.
+5. Capture the recovery codes if any are offered.
+6. Store that recovery material **outside Git and outside the controller** —
+   a password manager or a printed copy. On the controller it would be
+   protected by exactly the thing it is meant to recover.
+7. Log out.
+8. Log in again.
+9. **Prove the second factor is requested.** A password-only login must not
+   succeed.
+10. Only then is the deployment complete.
 
-Only one account is created. There is no anonymous access and no default
-password at any point.
+## The first project, created by hand
+
+⚠️ **Semaphore's project objects are database state, configured manually,
+and are NOT declaratively managed.** Creating them through the API would
+require an administrative token handled in automation, which is the same
+class of exposure the argv bootstrap was rejected for. A later milestone may
+manage them through a scoped token once that security model has been
+designed; until then, what is in the UI is not described by Git, and that
+is a known, accepted gap rather than an oversight.
+
+After deployment, first login and TOTP enrolment, create exactly:
+
+| | |
+|---|---|
+| Project | `DC1 Control Plane` |
+| Repository | `https://github.com/meetyaks/home-datacenter-starter.git` |
+| Branch | `main` |
+| Inventory | the repository-backed `inventory/hosts.yml` |
+
+The inventory must be the **repository-backed file**, never an independently
+edited static copy pasted into the UI. A host list maintained in Semaphore's
+database is a second source of truth that drifts silently from Git.
+
+The first task template is a controller-local, read-only validation — a
+syntax or inventory check that mutates nothing:
+
+```
+ansible-playbook --syntax-check playbooks/semaphore.yml
+```
+
+With all of the following **absent**:
+
+- no SSH credential
+- no vault credential
+- no sudo / become credential
+- no schedule
+- no webhook
+- no arbitrary shell command
+- no branch override
+- no unrestricted extra-vars or survey variables
+- no mutating playbook, no deployment
+- no DNS reconciliation task
+- no Keel reconciliation task
+
+Semaphore has no deployment authority in this milestone. Changing
+infrastructure remains a reviewed Git change.
 
 ## Backup and restore
 

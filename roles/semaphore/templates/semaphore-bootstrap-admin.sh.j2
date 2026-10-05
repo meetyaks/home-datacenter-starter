@@ -56,13 +56,22 @@ ADMIN_EMAIL="{{ semaphore_admin_email }}"
 die() { echo; echo "REFUSING: $*" >&2; exit 2; }
 
 TMPCFG=""
+SETUPDIR=""
 cleanup() {
-  # ⚠️ THE TEMPORARY CONFIG GOES, ON SUCCESS AND ON FAILURE. It holds
-  # setup's throwaway encryption material, and setup writes it 0644 —
-  # world-readable. Leaving it behind would publish key material that the
-  # real configuration has already replaced.
-  if [ -n "$TMPCFG" ] && [ -e "$TMPCFG" ]; then
-    rm -f "$TMPCFG" && echo "  removed the temporary setup configuration"
+  # ⚠️ THE WHOLE TEMPORARY DIRECTORY GOES, ON SUCCESS, FAILURE AND
+  # INTERRUPT. It holds setup's throwaway encryption material, and setup
+  # writes its config 0644 — world-readable. Deleting the file afterwards is
+  # not enough on its own, which is why the file only ever exists inside a
+  # 0700 directory; this removes both.
+  if [ -n "$SETUPDIR" ] && [ -d "$SETUPDIR" ]; then
+    case "$SETUPDIR" in
+      */.setup.*)
+        rm -rf "$SETUPDIR" && echo "  removed the temporary setup directory"
+        ;;
+      *)
+        echo "  REFUSING to remove unexpected path: $SETUPDIR" >&2
+        ;;
+    esac
   fi
 }
 trap cleanup EXIT INT TERM
@@ -160,9 +169,41 @@ fi
 PW2=""
 
 # ── Run setup against a TEMPORARY configuration ────────────────────────────
-TMPCFG=$(mktemp "${STATE}/.setup-config.XXXXXX.json") || die "cannot create a temporary config."
-chown "$SVC_USER:$SVC_GROUP" "$TMPCFG"
-chmod 600 "$TMPCFG"
+# ⚠️ A 0700 PARENT, BECAUSE THE BINARY'S OWN FILE MODE CANNOT BE CHANGED.
+# `semaphore setup` writes its config 0644 — verified — and patching or
+# forking the binary to change that is not acceptable. So the file is only
+# ever created inside a directory no other account can read or even traverse:
+# the 0644 config is unreachable because its parent denies x and r to
+# everyone but its owner.
+#
+# `mkdir -m 0700` sets the mode in the syscall, so a permissive umask in the
+# caller's environment cannot widen it. The name is unpredictable, the path
+# must not already exist, and it must be a real directory rather than a
+# symlink someone pre-planted to redirect the write.
+SETUPDIR="${STATE}/.setup.$(openssl rand -hex 12)"
+[ -e "$SETUPDIR" ] && die "temporary setup path already exists: $SETUPDIR"
+mkdir -m 0700 "$SETUPDIR" || die "cannot create the temporary setup directory."
+[ -L "$SETUPDIR" ] && die "$SETUPDIR is a symlink; refusing to write through it."
+[ -d "$SETUPDIR" ] || die "$SETUPDIR is not a directory."
+chown "$SVC_USER:$SVC_GROUP" "$SETUPDIR"
+# Re-asserted after chown, and verified rather than assumed.
+chmod 0700 "$SETUPDIR"
+# ⚠️ THE RIGHT stat FOR THE PLATFORM, CHOSEN AT TEMPLATE TIME. `stat -f` is
+# the BSD "format" flag but the GNU "filesystem status" flag — so a
+# `-f || -c` fallback SUCCEEDS on Linux and returns filesystem statistics
+# instead of a mode. The first version did exactly that and compared "700"
+# against several lines of overlayfs block counts.
+{% if semaphore_is_darwin | default(true) %}
+SETUPMODE=$(stat -f '%Lp' "$SETUPDIR")
+{% else %}
+SETUPMODE=$(stat -c '%a' "$SETUPDIR")
+{% endif %}
+[ "$SETUPMODE" = "700" ] || die "the temporary setup directory is mode $SETUPMODE, not 700.
+  setup writes its config 0644, so only a 0700 parent keeps the generated
+  encryption key out of reach of other local accounts."
+echo "  temporary setup directory created 0700, owned by $SVC_USER"
+
+TMPCFG="$SETUPDIR/config.json"
 
 echo
 echo "  running the supported setup, as $SVC_USER…"
@@ -177,10 +218,10 @@ echo "  running the supported setup, as $SVC_USER…"
 if ! printf '4\n%s\n%s\n\nno\nno\nno\nno\nno\nno\n%s\n%s\n%s\n%s\n' \
       "$DB" "{{ semaphore_tmp_path }}" \
       "$ADMIN_LOGIN" "$ADMIN_EMAIL" "$ADMIN_NAME" "$PW" \
-     | sudo -u "$SVC_USER" "$BIN" setup --config "$TMPCFG" > "${STATE}/.bootstrap.log" 2>&1; then
+     | sudo -u "$SVC_USER" "$BIN" setup --config "$TMPCFG" > "${SETUPDIR}/bootstrap.log" 2>&1; then
   PW=""
-  chmod 600 "${STATE}/.bootstrap.log" 2>/dev/null
-  die "setup failed. Its output is in ${STATE}/.bootstrap.log
+  chmod 600 "${SETUPDIR}/bootstrap.log" 2>/dev/null
+  die "setup failed. Its output is in ${SETUPDIR}/bootstrap.log
   (checked for secrets below). Nothing was committed."
 fi
 PW=""
@@ -190,7 +231,7 @@ PW=""
 # ⚠️ CHECKED, NOT ASSUMED — and the log is removed either way. setup writes
 # its config 0644, which is one of the reasons it is discarded rather than
 # kept.
-LOGFILE="${STATE}/.bootstrap.log"
+LOGFILE="${SETUPDIR}/bootstrap.log"
 chmod 600 "$LOGFILE" 2>/dev/null
 
 USERS=$(sudo -u "$SVC_USER" sqlite3 "$DB" 'SELECT count(*) FROM user;' 2>/dev/null || echo "?")

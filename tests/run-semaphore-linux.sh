@@ -195,7 +195,8 @@ echo "── 2. the interactive bootstrap, on a real pty ──"
 # pipe would exercise neither.
 BOOTSTRAP_PW="Disposable-Bootstrap-$(openssl rand -hex 10)"
 inx 'cp /work/tests/container/bootstrap-driver.py /run/bootstrap-driver.py && chmod 700 /run/bootstrap-driver.py'
-docker exec "$CNAME" python3 /run/bootstrap-driver.py \
+docker exec -e SEMAPHORE_STATE_DIR=/usr/local/var/lib/semaphore "$CNAME" \
+  python3 /run/bootstrap-driver.py \
   /usr/local/sbin/semaphore-bootstrap-admin "$BOOTSTRAP_PW" /run/ps-samples.txt \
   > /tmp/semaphore-bootstrap.log 2>&1
 rcb=$?
@@ -238,7 +239,27 @@ done
 if grep -qa "$BOOTSTRAP_PW" /tmp/semaphore-bootstrap.log 2>/dev/null; then
   bad "the password is absent from the bootstrap output" "it was echoed to the terminal"
 else ok "the password is absent from the bootstrap output (echo was off)"; fi
-inx 'ls /usr/local/var/lib/semaphore/.setup-config.* 2>/dev/null' >/dev/null 2>&1 \
+# ⚠️ 4A: THE 0700 PARENT IS THE PROTECTION, OBSERVED WHILE IT EXISTS.
+# setup writes its config 0644 and the binary cannot be told otherwise, so
+# the only thing keeping its generated encryption key private is the
+# directory above it. The driver watches for that directory during setup,
+# records its mode, and tries to read the config as `nobody`.
+obs=$(grep -c "DRIVER: setup-dir" /tmp/semaphore-bootstrap.log || echo 0)
+[ "${obs:-0}" -ge 1 ] \
+  && ok "the live temporary setup directory was observed $obs time(s)" \
+  || bad "temporary setup directory observed" "the driver never saw it — the check proves nothing"
+if grep -q "DRIVER: setup-dir.*mode=0o700" /tmp/semaphore-bootstrap.log; then
+  ok "it was mode 0700 while setup was running"
+else
+  bad "temporary setup directory is 0700" "$(grep -m1 'DRIVER: setup-dir' /tmp/semaphore-bootstrap.log)"
+fi
+if grep -q "DRIVER: setup-dir.*nobody_read_rc=0" /tmp/semaphore-bootstrap.log; then
+  bad "an unrelated account CANNOT read the temporary config" "nobody read it successfully"
+else
+  ok "an unrelated account could not read the temporary config"
+fi
+
+inx 'ls -d /usr/local/var/lib/semaphore/.setup.* 2>/dev/null' >/dev/null 2>&1 \
   && bad "no temporary setup config survives" "one is still on disk" \
   || ok "no temporary setup config survives"
 inx 'test -e /usr/local/var/lib/semaphore/.admin-bootstrapped' \

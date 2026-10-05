@@ -288,7 +288,17 @@
           # The temporary config goes, on success AND on failure — setup
           # writes it 0644, with its throwaway key material in it.
           - helper is search('trap cleanup EXIT INT TERM')
-          - helper is search('removed the temporary setup configuration')
+          - helper is search('removed the temporary setup directory')
+          # ⚠️ setup WRITES ITS CONFIG 0644 AND THE BINARY CANNOT BE TOLD
+          # OTHERWISE — patching it is not acceptable. So the file only ever
+          # exists inside a 0700 directory whose mode is set in the mkdir
+          # syscall (a permissive caller umask cannot widen it), whose name
+          # is unpredictable, which must not already exist, and which must
+          # not be a symlink.
+          - helper is search('mkdir -m 0700 "\$SETUPDIR"')
+          - helper is search('openssl rand -hex 12')
+          - helper is search('temporary setup path already exists')
+          - helper is search('refusing to write through it')
         fail_msg: >-
           The bootstrap helper must refuse when a user exists, when any Key
           Store credential exists, when the service is running, or when it
