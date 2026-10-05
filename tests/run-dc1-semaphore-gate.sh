@@ -104,7 +104,7 @@ sudo -v || die "sudo was refused; the gate cannot run"
 hdr "PHASE 2  no disposable state may exist before the baseline"
 pre_lbl=$(sudo launchctl list 2>/dev/null | awk '/org\.dc1\.semaphoredisposable/{print $3}')
 pre_proc=$(pgrep -fl 'semaphore-disposable' 2>/dev/null)
-pre_dir=$(find "${TMPDIR:-/tmp}" /tmp -maxdepth 1 -name 'semaphore-disposable.*' 2>/dev/null)
+pre_dir=$(find /private/tmp "${TMPDIR:-/tmp}" -maxdepth 1 -name 'semaphore-disposable.*' 2>/dev/null | sort -u)
 if [ -n "$pre_lbl" ] || [ -n "$pre_proc" ] || [ -n "$pre_dir" ]; then
   echo "  PRE-EXISTING DISPOSABLE STATE FOUND — refusing to run."
   [ -n "$pre_lbl" ]  && printf '%s\n' "$pre_lbl"  | sed 's/^/    label:   /'
@@ -222,7 +222,7 @@ check_clean "no disposable launchd label" \
   "$(sudo launchctl list 2>/dev/null | awk '/org\.dc1\.semaphoredisposable/{print $3}')"
 check_clean "no disposable semaphore process" "$(pgrep -fl 'semaphore-disposable' 2>/dev/null)"
 check_clean "no disposable prefix on disk" \
-  "$(find "${TMPDIR:-/tmp}" /tmp -maxdepth 1 -name 'semaphore-disposable.*' 2>/dev/null)"
+  "$(find /private/tmp "${TMPDIR:-/tmp}" -maxdepth 1 -name 'semaphore-disposable.*' 2>/dev/null | sort -u)"
 check_clean "no disposable plist in /Library/LaunchDaemons" \
   "$(find /Library/LaunchDaemons -maxdepth 1 -name 'org.dc1.semaphoredisposable*' 2>/dev/null)"
 # ⚠️ THE PRODUCTION LABEL MUST NOT HAVE APPEARED. This milestone does not

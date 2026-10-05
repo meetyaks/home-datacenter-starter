@@ -412,6 +412,18 @@ perl -ni -e 'print unless /no disposable _semt account survives/' "$GATE_SH"
 expect_red semaphore-harness-integrity.yml '_semt account survives|sweeps for strays' \
            "a gate that does not sweep for stray identities is caught"
 
+restore
+# ⚠️ FOUND BY THE CONTROLLER GATE. $TMPDIR is drwx------ and per-user on
+# macOS, so a service account cannot traverse it to reach the binary.
+perl -pi -e 's{mktemp -d /private/tmp/semaphore-disposable\.XXXXXX}{mktemp -d -t semaphore-disposable.XXXXXX}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml '/private/tmp|traversable|TMPDIR' \
+           "a disposable prefix under \$TMPDIR the service account cannot reach is caught"
+
+restore
+perl -ni -e 'print unless /^chmod 0711 "\$ROOT"$/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml '0711|traversable' \
+           "a disposable prefix left untraversable is caught"
+
 echo
 echo "── everything is restored ──"
 restore

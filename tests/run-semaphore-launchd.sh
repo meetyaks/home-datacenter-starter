@@ -52,7 +52,27 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 STAMP=$$-$(date +%s)
-ROOT=$(mktemp -d -t semaphore-disposable.XXXXXX)
+
+# ⚠️ /private/tmp, NOT $TMPDIR — AND THE CONTROLLER GATE PROVED WHY.
+# `mktemp -d -t` puts the prefix under $TMPDIR, which on macOS is
+#
+#   drwx------  <operator>  /var/folders/<xx>/<yyy>/T/
+#
+# a PER-USER directory. The disposable service account cannot traverse it,
+# so the role installed the binary fine and then died running it:
+#
+#   Run migrations
+#   Permission denied: .../semaphore-disposable.XXXXXX.i60lPremyk/sbin/semaphore
+#
+# No mode on the prefix fixes that; the parent is what denies access. The
+# Linux container never showed it because its paths are world-traversable.
+#
+# /private/tmp is drwxrwxrwt, so the prefix is reachable. It is then 0711:
+# the service account can traverse to the binary but cannot list the
+# directory, and everything sensitive inside carries its own mode anyway
+# (config 0600, database 0600, state 0750, all service-owned).
+ROOT=$(mktemp -d /private/tmp/semaphore-disposable.XXXXXX)
+chmod 0711 "$ROOT"
 LABEL="org.dc1.semaphoredisposable${STAMP}"
 
 # ── THE DISPOSABLE SERVICE IDENTITY ────────────────────────────────────────

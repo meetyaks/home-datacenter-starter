@@ -192,6 +192,29 @@
           residue this test can leave.
         success_msg: "The disposable identity is generated, validated and never _semaphore."
 
+    - name: THE DISPOSABLE PREFIX IS REACHABLE BY THE SERVICE ACCOUNT
+      # ⚠️ THE CONTROLLER GATE FOUND THIS. `mktemp -d -t` puts the prefix
+      # under $TMPDIR, which on macOS is drwx------ and owned by the
+      # operator. The disposable service account cannot traverse it, so the
+      # role installed the binary and then died running it:
+      #
+      #   Permission denied: .../semaphore-disposable.XXXXXX/sbin/semaphore
+      #
+      # No mode on the prefix helps — the PARENT denies access. The Linux
+      # container never exposed it because its paths are world-traversable,
+      # which is the same Linux/macOS asymmetry that produced the ss/lsof
+      # and getent defects earlier in this PR.
+      ansible.builtin.assert:
+        that:
+          - macos is search('mktemp -d /private/tmp/semaphore-disposable\.XXXXXX')
+          - macos is search('chmod 0711 "\$ROOT"')
+          - not (macos is search('mktemp -d -t semaphore-disposable'))
+        fail_msg: >-
+          The disposable prefix must be created under /private/tmp and made
+          traversable (0711). $TMPDIR is per-user and drwx------ on macOS,
+          so a service account cannot execute anything beneath it.
+        success_msg: "The disposable prefix is reachable by the service account."
+
     - name: THE ACCOUNT IS MEASURED FROM DIRECTORY SERVICES, NOT INFERRED
       # Greping a task name or a comment would prove the role *says* it
       # creates a hidden non-admin account. Only dscl and dsmemberutil prove
