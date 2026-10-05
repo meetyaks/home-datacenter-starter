@@ -141,28 +141,6 @@ semaphore_admin_login: "dc1admin"
 semaphore_admin_name: "DC1 Operator"
 semaphore_admin_email: "ops@dc1.lan"
 
-# ⚠️ AN UNAVOIDABLE UPSTREAM EXPOSURE, MADE EXPLICIT RATHER THAN HIDDEN.
-# v2.19.12 offers exactly two ways to create a user, and neither is clean:
-#
-#   semaphore users add --password <plaintext>   password lands in argv
-#   semaphore setup                              reads the password from stdin,
-#                                                but calls GenerateSecrets()
-#                                                and rewrites config.json,
-#                                                rotating access_key_encryption
-#                                                on every run — which destroys
-#                                                every stored credential
-#
-# There is no stdin, file or environment path for `users add` in this release
-# (cli/cmd/user_add.go). So bootstrapping the administrator automatically
-# means the password is visible in `ps` for the lifetime of one short command,
-# to other local accounts on the controller.
-#
-# Set this to false to refuse that trade. The role then installs and verifies
-# everything else and FAILS with the exact manual command, which the operator
-# runs themselves. Steady-state runs are unaffected either way: the admin is
-# only ever created when `semaphore users list` shows it absent.
-semaphore_admin_bootstrap_enabled: true
-
 # ── SECRETS ──────────────────────────────────────────────────────────────────
 #
 # ⚠️ NO USABLE FALLBACK, ON PURPOSE. Each of these resolves to an undefined
@@ -193,6 +171,13 @@ semaphore_admin_password: "{{ vault_semaphore_admin_password | default('') }}"
 semaphore_admin_password_min_length: 16
 
 # ── LAUNCHD ──────────────────────────────────────────────────────────────────
+# ⚠️ THE CONTROLLER IDENTITY, TEMPLATED SO THE CHECK CAN BE TESTED. The
+# bootstrap helper refuses to run anywhere but the controller. That check
+# has to be exercised, so the value is a variable the disposable harness can
+# point at its own throwaway host — the check itself is never removed, and
+# tests/semaphore-config.yml fails if the default is not dc1-arm-1.
+semaphore_controller_hostname: "dc1-arm-1"
+
 semaphore_launchd_label: "org.dc1.semaphore"
 semaphore_launchd_plist: "/Library/LaunchDaemons/{{ semaphore_launchd_label }}.plist"
 

@@ -149,7 +149,8 @@ run_role() {   # run_role <logfile> [extra ansible args...]
   docker exec "$CNAME" bash -lc \
     "cd /work && ansible-playbook -i localhost, -c local \
        tests/container/semaphore-disposable-play.yml \
-       -e @/run/semaphore-secrets.json $*" \
+       -e @/run/semaphore-secrets.json \
+       -e semaphore_controller_hostname=\$(hostname -s) $*" \
     > "$log" 2>&1
 }
 
@@ -157,15 +158,104 @@ run_role() {   # run_role <logfile> [extra ansible args...]
 inx 'rm -rf /work && cp -a /repo /work' >/dev/null 2>&1
 
 echo
-echo "── 1. first run: the whole role on a clean host ──"
+echo "── 1. STAGE 1: the role must STOP, with no administrator and no service ──"
+# ⚠️ FAILING HERE IS THE CORRECT BEHAVIOUR. The role cannot create a user
+# without putting the password in argv, so it installs everything, migrates
+# the database and stops. Critically it must NOT have started Semaphore: an
+# empty Semaphore left listening is an unauthenticated initialisation
+# surface.
 run_role /tmp/semaphore-linux-1.log
 rc1=$?
-if [ $rc1 -ne 0 ]; then
-  bad "the role converges on a clean host" "exit $rc1"
-  tail -40 /tmp/semaphore-linux-1.log | sed 's/^/           /'
+[ $rc1 -ne 0 ] && ok "stage 1 stopped, as it must without an administrator" \
+  || bad "stage 1 stops without an administrator" "the role converged — did it create a user?"
+# ⚠️ MATCH THE STOP MESSAGE, NOT THE TASK NAME. The first version grepped
+# for "semaphore-bootstrap-admin" and passed against the include line
+# "The database, the backup command and the bootstrap helper" — while the
+# role had actually died earlier and printed no instruction at all.
+grep -q 'has NOT been started' /tmp/semaphore-linux-1.log \
+  && grep -q 'sudo /usr/local/sbin/semaphore-bootstrap-admin' /tmp/semaphore-linux-1.log \
+  && ok "it stops with the exact bootstrap instruction" \
+  || bad "stop message names the helper" "the role did not print its stop instruction"
+inx 'systemctl is-active semaphore' 2>/dev/null | grep -qx active \
+  && bad "NO service is running after stage 1" "semaphore.service is active with no administrator" \
+  || ok "no service is running after stage 1"
+inx 'curl -sS --max-time 3 http://127.0.0.1:3000/api/ping' >/dev/null 2>&1 \
+  && bad "nothing is listening after stage 1" "port 3000 answered" \
+  || ok "nothing is listening after stage 1"
+inx 'test -x /usr/local/sbin/semaphore-bootstrap-admin' \
+  && ok "the bootstrap helper was installed" \
+  || bad "bootstrap helper installed" "/usr/local/sbin/semaphore-bootstrap-admin missing"
+inx 'test -s /usr/local/var/lib/semaphore/semaphore.db' \
+  && ok "the database was initialised" || bad "database initialised" "missing or empty"
+
+echo
+echo "── 2. the interactive bootstrap, on a real pty ──"
+# ⚠️ A pty, NOT A PIPE. The helper refuses without an interactive terminal
+# and uses `read -rs`, which needs one to disable echo. Driving it through a
+# pipe would exercise neither.
+BOOTSTRAP_PW="Disposable-Bootstrap-$(openssl rand -hex 10)"
+inx 'cp /work/tests/container/bootstrap-driver.py /run/bootstrap-driver.py && chmod 700 /run/bootstrap-driver.py'
+docker exec "$CNAME" python3 /run/bootstrap-driver.py \
+  /usr/local/sbin/semaphore-bootstrap-admin "$BOOTSTRAP_PW" /run/ps-samples.txt \
+  > /tmp/semaphore-bootstrap.log 2>&1
+rcb=$?
+[ $rcb -eq 0 ] && ok "the interactive bootstrap succeeded" \
+  || { bad "interactive bootstrap" "exit $rcb"; tail -25 /tmp/semaphore-bootstrap.log | sed 's/^/           /'; }
+
+samples=$(inx 'grep -c . /run/ps-samples.txt' 2>/dev/null | tr -d '\r\n')
+[ "${samples:-0}" -gt 50 ] && ok "the process table was sampled $samples times during setup" \
+  || bad "process table sampled" "only ${samples:-0} lines captured"
+
+# ⚠️ THE CONTROL AND THE TEST, TOGETHER. The password MUST appear in the
+# driver's own argv — that is how we know the sampling actually worked — and
+# MUST NOT appear in any other process's arguments.
+PWRE=$(printf '%s' "$BOOTSTRAP_PW" | sed 's/[.[\*^$/]/\\&/g')
+inx "grep -q 'bootstrap-driver.py.*${PWRE}' /run/ps-samples.txt" \
+  && ok "control: the password IS visible in the driver's own argv (sampling works)" \
+  || bad "sampling control" "the password never appeared even in the driver's argv — the samples prove nothing"
+if inx "grep -E '${PWRE}' /run/ps-samples.txt | grep -vq 'bootstrap-driver.py'"; then
+  bad "the password NEVER reaches another process's argv" \
+      "it appeared in a non-driver process — see /run/ps-samples.txt"
+else
+  ok "the password never reached semaphore's or any other process's argv"
+fi
+
+for f in /usr/local/var/lib/semaphore/semaphore.db /usr/local/etc/semaphore/config.json; do
+  if inx "grep -qa '${PWRE}' $f" 2>/dev/null; then
+    bad "the password is absent from $f" "found in cleartext"
+  else ok "the password is absent from $(basename "$f")"; fi
+done
+if grep -qa "$BOOTSTRAP_PW" /tmp/semaphore-bootstrap.log 2>/dev/null; then
+  bad "the password is absent from the bootstrap output" "it was echoed to the terminal"
+else ok "the password is absent from the bootstrap output (echo was off)"; fi
+inx 'ls /usr/local/var/lib/semaphore/.setup-config.* 2>/dev/null' >/dev/null 2>&1 \
+  && bad "no temporary setup config survives" "one is still on disk" \
+  || ok "no temporary setup config survives"
+inx 'test -e /usr/local/var/lib/semaphore/.admin-bootstrapped' \
+  && ok "a non-secret bootstrap marker was written" || bad "bootstrap marker" "missing"
+
+echo
+echo "── 3. a second bootstrap attempt must be refused ──"
+docker exec "$CNAME" python3 /run/bootstrap-driver.py \
+  /usr/local/sbin/semaphore-bootstrap-admin "Another-Password-123456" /run/ps2.txt \
+  > /tmp/semaphore-bootstrap2.log 2>&1
+rcb2=$?
+[ $rcb2 -ne 0 ] && ok "a second bootstrap is refused" \
+  || bad "second bootstrap refused" "it succeeded a second time"
+grep -qi 'already completed' /tmp/semaphore-bootstrap2.log \
+  && ok "it refuses for the right reason (already bootstrapped)" \
+  || bad "refusal reason" "$(tail -3 /tmp/semaphore-bootstrap2.log | tr '\n' ' ')"
+
+echo
+echo "── 4. STAGE 2: re-run the role, which now converges ──"
+run_role /tmp/semaphore-linux-2nd.log
+rc1b=$?
+if [ $rc1b -ne 0 ]; then
+  bad "stage 2 converges once an administrator exists" "exit $rc1b"
+  tail -40 /tmp/semaphore-linux-2nd.log | sed 's/^/           /'
   exit 1
 fi
-ok "the role converged (exit 0)"
+ok "stage 2 converged (exit 0)"
 
 inx 'id _semaphore' >/dev/null 2>&1 && ok "the service account was created" \
   || bad "service account created" "id _semaphore failed"
@@ -180,7 +270,7 @@ inx 'systemctl is-active semaphore' 2>/dev/null | grep -qx active \
   || bad "service active" "$(inx 'systemctl is-active semaphore' 2>&1 | tr -d '\r\n')"
 
 echo
-echo "── 2. the service is real, and answers ──"
+echo "── 4b. the service is real, and answers ──"
 body=$(inx 'curl -sS --max-time 5 http://127.0.0.1:3000/api/ping' 2>/dev/null | tr -d '\r\n')
 [ "$body" = "pong" ] && ok "/api/ping returns pong" || bad "/api/ping" "got '$body'"
 listener=$(inx 'ss -lntpH sport = :3000' 2>/dev/null | tr -s ' ')
@@ -196,7 +286,7 @@ owner=$(inx "ps -o user= -p \$(pgrep -f 'semaphore server' | head -1)" 2>/dev/nu
   || bad "runs as the service account" "running as '$owner'"
 
 echo
-echo "── 3. secrets are protected ──"
+echo "── 4c. secrets are protected ──"
 cfgmode=$(inx 'stat -c %a /usr/local/etc/semaphore/config.json' 2>/dev/null | tr -d '\r\n')
 [ "$cfgmode" = "600" ] && ok "config.json is 0600" || bad "config.json 0600" "mode $cfgmode"
 dbmode=$(inx 'stat -c %a /usr/local/var/lib/semaphore/semaphore.db' 2>/dev/null | tr -d '\r\n')
@@ -204,18 +294,18 @@ dbmode=$(inx 'stat -c %a /usr/local/var/lib/semaphore/semaphore.db' 2>/dev/null 
 if inx "grep -q '$SEC_ACCESS_ENC' /var/log/semaphore/semaphore.log" 2>/dev/null; then
   bad "no secret in the service log" "the access-key encryption key is in semaphore.log"
 else ok "no secret in the service log"; fi
-if grep -qE "$(printf '%s' "$SEC_ADMIN_PW" | sed 's/[.[\*^$]/\\&/g')" /tmp/semaphore-linux-1.log 2>/dev/null; then
+if grep -qE "$(printf '%s' "$SEC_ADMIN_PW" | sed 's/[.[\*^$]/\\&/g')" /tmp/semaphore-linux-2nd.log 2>/dev/null; then
   bad "no secret in the ansible run log" "the admin password is in the run log — no_log is not working"
 else ok "no secret in the ansible run log"; fi
 
 echo
-echo "── 4. the administrator exists, exactly once ──"
+echo "── 5. the administrator exists, exactly once ──"
 users=$(inx 'sudo -u _semaphore /usr/local/sbin/semaphore users list --config /usr/local/etc/semaphore/config.json' 2>/dev/null | tr -d '\r' | sed '/^$/d')
 [ "$users" = "dc1admin" ] && ok "exactly one administrator: dc1admin" \
   || bad "one administrator" "users list returned: $(printf '%s' "$users" | tr '\n' ' ')"
 
 echo
-echo "── 5. a configuration change must restart BEFORE verification ──"
+echo "── 6. a configuration change must restart BEFORE verification ──"
 PID1=$(inx "pgrep -f 'semaphore server' | head -1" 2>/dev/null | tr -d '\r\n')
 [ -n "$PID1" ] && ok "running pid before the change: $PID1" || bad "a pid before the change" "none"
 
@@ -270,7 +360,7 @@ nb=$(inx 'curl -sS --max-time 5 http://127.0.0.1:3100/api/ping' 2>/dev/null | tr
 [ "$nb" = "pong" ] && ok "the NEW port 3100 answers" || bad "new port answers" "got '$nb'"
 
 echo
-echo "── 6. an unchanged run is a genuine no-op ──"
+echo "── 7. an unchanged run is a genuine no-op ──"
 PID_BEFORE=$(inx "pgrep -f 'semaphore server' | head -1" 2>/dev/null | tr -d '\r\n')
 run_role /tmp/semaphore-linux-3.log -e semaphore_port=3100
 rc3=$?
@@ -286,7 +376,7 @@ grep -q 'already exists' /tmp/semaphore-linux-3.log \
   || bad "admin idempotency" "the run did not report an existing administrator"
 
 echo
-echo "── 7. backup and restore ──"
+echo "── 8. backup and restore ──"
 inx 'sudo -u _semaphore /usr/local/sbin/semaphore-backup' > /tmp/semaphore-backup.log 2>&1
 rcb=$?
 [ $rcb -eq 0 ] && ok "semaphore-backup succeeded" || bad "backup" "exit $rcb: $(tail -2 /tmp/semaphore-backup.log)"

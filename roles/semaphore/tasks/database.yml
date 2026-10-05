@@ -77,6 +77,19 @@
   failed_when: false
   changed_when: false
 
+- name: Install the first-administrator bootstrap helper
+  # ⚠️ INSTALLED, NEVER INVOKED BY THE ROLE. It is interactive by design:
+  # it refuses without a terminal, turns echo off, and hands the password to
+  # `semaphore setup` on stdin. A converging role must not run it — see
+  # tasks/admin.yml for why the role cannot create a user at all.
+  ansible.builtin.template:
+    src: semaphore-bootstrap-admin.sh.j2
+    dest: "{{ semaphore_bin_link | dirname }}/semaphore-bootstrap-admin"
+    owner: root
+    group: "{{ semaphore_group }}"
+    mode: "0750"
+  become: true
+
 - name: Install the backup command
   # Role-owned, but NOT scheduled. Installing a scheduler is a separate,
   # separately-authorised milestone; this just makes a correct backup one

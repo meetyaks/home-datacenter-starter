@@ -21,6 +21,7 @@ DEFAULTS=roles/semaphore/defaults/main.yml
 CONFIG_TPL=roles/semaphore/templates/config.json.j2
 PLIST_TPL=roles/semaphore/templates/launchd.plist.j2
 BACKUP_TPL=roles/semaphore/templates/semaphore-backup.sh.j2
+BOOTSTRAP_TPL=roles/semaphore/templates/semaphore-bootstrap-admin.sh.j2
 MAIN=roles/semaphore/tasks/main.yml
 PREFLIGHT=roles/semaphore/tasks/preflight-secrets.yml
 ACCOUNT=roles/semaphore/tasks/account.yml
@@ -32,7 +33,7 @@ VERIFY=roles/semaphore/tasks/verify.yml
 LINUX_SH=tests/run-semaphore-linux.sh
 MACOS_SH=tests/run-semaphore-launchd.sh
 
-FILES=("$DEFAULTS" "$CONFIG_TPL" "$PLIST_TPL" "$BACKUP_TPL" "$MAIN" "$PREFLIGHT"
+FILES=("$DEFAULTS" "$CONFIG_TPL" "$PLIST_TPL" "$BACKUP_TPL" "$BOOTSTRAP_TPL" "$MAIN" "$PREFLIGHT"
        "$ACCOUNT" "$CONFIGURE" "$DATABASE" "$ADMIN" "$INSTALL" "$VERIFY"
        "$LINUX_SH" "$MACOS_SH")
 
@@ -179,9 +180,53 @@ expect_red semaphore-task-shape.yml 'no_log' \
            "removing no_log from the config template task is caught"
 
 restore
-perl -0pi -e 's{(      - --config\n      - "\{\{ semaphore_config_path \}\}"\n  become: true\n  become_user: "\{\{ semaphore_user \}\}"\n)  no_log: true\n}{$1}' "$ADMIN"
-expect_red semaphore-task-shape.yml 'no_log' \
-           "removing no_log from the administrator task is caught"
+# ── THE FIRST-ADMINISTRATOR BOOTSTRAP CONTRACT ────────────────────────────
+#
+# The role must not be able to create a user at all, and the helper must
+# accept a password from nowhere but a terminal.
+perl -pi -e 's{^  ansible\.builtin\.include_tasks: admin\.yml$}{  ansible.builtin.command: "semaphore users add --admin --password x"}' "$MAIN"
+expect_red semaphore-config.yml 'users add|--password|creates no user' \
+           "reintroducing argv-based user creation in the role is caught"
+
+restore
+perl -pi -e 's{^read -rs PW; echo$}{PW="$1"}; s{^read -rs PW2; echo$}{PW2="$1"}' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'interactive terminal|read -rs' \
+           "a helper that takes the password as an argument is caught"
+
+restore
+perl -pi -e 's{^read -rs PW2; echo$}{PW2="${SEMAPHORE_ADMIN_PASSWORD}"}' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'interactive terminal|environment' \
+           "a helper that takes the password from the environment is caught"
+
+restore
+perl -ni -e 'print unless /\[ -t 0 \] && \[ -t 1 \]/' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'interactive terminal|real terminal|no other source' \
+           "a helper that can run noninteractively is caught"
+
+restore
+perl -ni -e 'print unless /SELECT count\(\*\) FROM user/' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'existing|FROM user|unsafe precondition' \
+           "bootstrap that does not check for an existing user is caught"
+
+restore
+perl -ni -e 'print unless /SELECT count\(\*\) FROM access_key/' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'access_key|Key Store|unsafe precondition' \
+           "bootstrap that ignores existing Key Store credentials is caught"
+
+restore
+perl -ni -e 'print unless /the Semaphore service is/' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'service is|unsafe precondition' \
+           "bootstrap that runs while the service is live is caught"
+
+restore
+perl -ni -e 'print unless /trap cleanup EXIT INT TERM/' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'temporary configuration|unsafe precondition' \
+           "a temporary setup config that survives failure is caught"
+
+restore
+perl -ni -e 'print unless /bootstrap already completed/' "$BOOTSTRAP_TPL"
+expect_red semaphore-config.yml 'already|unsafe precondition' \
+           "a helper that can be run twice is caught"
 
 restore
 perl -pi -e 's{<key>PATH</key>}{<key>SEMAPHORE_ACCESS_KEY_ENCRYPTION</key>\n    <string>{{ semaphore_access_key_encryption }}</string>\n    <key>PATH</key>}' "$PLIST_TPL"

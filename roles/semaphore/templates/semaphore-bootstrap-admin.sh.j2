@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# FIRST-ADMINISTRATOR BOOTSTRAP — interactive, operator-run, once.
+#
+#   sudo {{ semaphore_bin_link | dirname }}/semaphore-bootstrap-admin
+#
+# ⚠️ WHY THIS EXISTS INSTEAD OF AN ANSIBLE TASK. v2.19.12 creates users two
+# ways and only one of them is safe:
+#
+#   semaphore users add --password <plaintext>   the password is in argv,
+#                                                visible in `ps` to every
+#                                                local account. no_log hides
+#                                                it from Ansible's log and
+#                                                from nothing else.
+#   semaphore setup                              reads the password from
+#                                                STDIN — never argv, never
+#                                                the environment
+#
+# So the password is typed here, with terminal echo off, and handed to
+# `setup` down a pipe. It never reaches a command line, an environment
+# variable, a file or a log.
+#
+# ⚠️ WHY setup CANNOT SIMPLY BE RUN BY THE ROLE. It calls GenerateSecrets()
+# and rewrites config.json on EVERY run — verified: a second run rotated
+# access_key_encryption from HMF98JFG… to eab6YytE…. If any Key Store
+# credential existed, that would silently make all of them undecryptable.
+#
+# So setup runs against a TEMPORARY config which is then discarded, and the
+# role's own vaulted configuration — with the stable encryption key — is put
+# back. That is safe only while the credential store is empty, which is why
+# this refuses to run otherwise.
+#
+# ⚠️ THE ADMINISTRATOR SURVIVES THE KEY SWAP, and that is the fact the whole
+# design rests on. Verified against the real binary: an administrator created
+# under setup's temporary key authenticated successfully (HTTP 204) against a
+# server configured with a completely different access_key_encryption, while
+# a wrong password returned 401. The password hash is bcrypt in the user
+# table and does not involve the encryption key at all.
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+
+BIN="{{ semaphore_bin_link }}"
+CONFIG="{{ semaphore_config_path }}"
+DB="{{ semaphore_db_path }}"
+STATE="{{ semaphore_state_dir }}"
+SVC_USER="{{ semaphore_user }}"
+SVC_GROUP="{{ semaphore_group }}"
+LABEL="{{ semaphore_launchd_label }}"
+MARKER="{{ semaphore_state_dir }}/.admin-bootstrapped"
+ADMIN_LOGIN="{{ semaphore_admin_login }}"
+# ⚠️ QUOTED. semaphore_admin_name is "DC1 Operator" — unquoted, the shell
+# split it and the script died with "Operator: command not found".
+ADMIN_NAME="{{ semaphore_admin_name }}"
+ADMIN_EMAIL="{{ semaphore_admin_email }}"
+
+die() { echo; echo "REFUSING: $*" >&2; exit 2; }
+
+TMPCFG=""
+cleanup() {
+  # ⚠️ THE TEMPORARY CONFIG GOES, ON SUCCESS AND ON FAILURE. It holds
+  # setup's throwaway encryption material, and setup writes it 0644 —
+  # world-readable. Leaving it behind would publish key material that the
+  # real configuration has already replaced.
+  if [ -n "$TMPCFG" ] && [ -e "$TMPCFG" ]; then
+    rm -f "$TMPCFG" && echo "  removed the temporary setup configuration"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+echo "Semaphore first-administrator bootstrap"
+echo
+
+# ── This machine, and only interactively ───────────────────────────────────
+[ "$(hostname -s)" = "{{ semaphore_controller_hostname }}" ] \
+  || die "this is $(hostname -s), not {{ semaphore_controller_hostname }}."
+[ "$(id -u)" = "0" ] || die "run this with sudo; it must act as $SVC_USER."
+
+# ⚠️ AN INTERACTIVE TERMINAL IS A HARD REQUIREMENT. Without one there is no
+# way to turn echo off, so a non-interactive run could only get the password
+# from somewhere this script refuses to read it from.
+[ -t 0 ] && [ -t 1 ] || die "no interactive terminal. This cannot run from a
+  script, a pipe, a cron job or CI — the password is typed, never passed in."
+
+# ── It may only ever run once ──────────────────────────────────────────────
+[ -e "$MARKER" ] && die "bootstrap already completed on $(cat "$MARKER" 2>/dev/null).
+  Remove $MARKER only if you know the database was replaced."
+
+# ── The service must be stopped ────────────────────────────────────────────
+# Running setup against a live database races the server, and the server
+# would also be holding the configuration this is about to replace.
+{% if semaphore_is_darwin | default(true) %}
+if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+  die "the Semaphore service is loaded. Stop it first:
+  sudo launchctl bootout system/${LABEL}"
+fi
+{% else %}
+if systemctl is-active --quiet semaphore 2>/dev/null; then
+  die "the Semaphore service is running. Stop it first:
+  sudo systemctl stop semaphore"
+fi
+{% endif %}
+if pgrep -f "$BIN server" >/dev/null 2>&1; then
+  die "a Semaphore server process is still running."
+fi
+
+# ── The database must be an eligible first install ─────────────────────────
+if [ -e "$DB" ]; then
+  USERS=$(sudo -u "$SVC_USER" sqlite3 "$DB" 'SELECT count(*) FROM user;' 2>/dev/null || echo "?")
+  KEYS=$(sudo -u "$SVC_USER" sqlite3 "$DB" 'SELECT count(*) FROM access_key;' 2>/dev/null || echo "?")
+  [ "$USERS" = "?" ] && die "cannot read $DB to check it is empty."
+  [ "$USERS" = "0" ] || die "the database already has $USERS user(s).
+  This bootstraps the FIRST administrator only. To reset a forgotten
+  password use the Semaphore UI, or recreate the database deliberately."
+  # ⚠️ THE CONDITION THAT MAKES THE KEY SWAP SAFE. Every Key Store secret is
+  # encrypted with access_key_encryption; swapping the key after one exists
+  # makes it permanently unreadable.
+  [ "$KEYS" = "0" ] || die "the database holds $KEYS Key Store credential(s).
+  Bootstrap replaces the encryption key, which would make them
+  permanently undecryptable. This is not recoverable."
+  echo "  database present, 0 users, 0 stored credentials — eligible"
+else
+  echo "  no database yet — setup will create one"
+fi
+
+# ── Confirmation ───────────────────────────────────────────────────────────
+echo
+echo "This will create the administrator \"$ADMIN_LOGIN\" <$ADMIN_EMAIL>."
+echo "You will type a password; it is not echoed, not stored, and not"
+echo "passed to any program on a command line."
+printf 'Type "bootstrap" to continue: '
+read -r CONFIRM
+[ "$CONFIRM" = "bootstrap" ] || die "not confirmed."
+
+# ── The password, with echo off ────────────────────────────────────────────
+#
+# ⚠️ `read -s` AND A TRAP, because an interrupt between disabling echo and
+# restoring it leaves the operator with a terminal that silently swallows
+# everything they type.
+restore_echo() { stty echo 2>/dev/null || true; }
+trap 'restore_echo; cleanup' EXIT INT TERM
+
+PW=""
+PW2=""
+printf 'Administrator password: '
+read -rs PW; echo
+printf 'Confirm password: '
+read -rs PW2; echo
+[ -n "$PW" ] || die "empty password."
+[ "$PW" = "$PW2" ] || die "the two entries did not match."
+{# ⚠️ ${#PW} MUST BE RAW. The sequence `{#` is Jinja's comment opener, so an
+   unescaped ${#PW} makes templating die with "Missing end of comment tag" —
+   which is exactly how this template failed its first real run. `expr
+   length "$PW"` would avoid the braces but put the password in argv, which
+   is the one thing this whole file exists to prevent, so the parameter
+   expansion stays and Jinja is told to leave it alone. #}
+if [ "{% raw %}${#PW}{% endraw %}" -lt {{ semaphore_admin_password_min_length }} ]; then
+  die "shorter than {{ semaphore_admin_password_min_length }} characters. This account can run playbooks
+  against every host in the inventory."
+fi
+PW2=""
+
+# ── Run setup against a TEMPORARY configuration ────────────────────────────
+TMPCFG=$(mktemp "${STATE}/.setup-config.XXXXXX.json") || die "cannot create a temporary config."
+chown "$SVC_USER:$SVC_GROUP" "$TMPCFG"
+chmod 600 "$TMPCFG"
+
+echo
+echo "  running the supported setup, as $SVC_USER…"
+
+# ⚠️ EVERY ANSWER IS FED ON STDIN, INCLUDING THE PASSWORD. printf is a shell
+# BUILTIN, so no process is forked with these values in its argv. The prompt
+# order is fixed for v2.19.12 and was captured from the real binary:
+#   db type (4=SQLite), db path, playbook path, public URL, five alert
+#   integrations, LDAP, then username, email, name, password.
+# If an upgrade changes that order this will fail loudly rather than answer
+# the wrong question — the post-check below is what catches it.
+if ! printf '4\n%s\n%s\n\nno\nno\nno\nno\nno\nno\n%s\n%s\n%s\n%s\n' \
+      "$DB" "{{ semaphore_tmp_path }}" \
+      "$ADMIN_LOGIN" "$ADMIN_EMAIL" "$ADMIN_NAME" "$PW" \
+     | sudo -u "$SVC_USER" "$BIN" setup --config "$TMPCFG" > "${STATE}/.bootstrap.log" 2>&1; then
+  PW=""
+  chmod 600 "${STATE}/.bootstrap.log" 2>/dev/null
+  die "setup failed. Its output is in ${STATE}/.bootstrap.log
+  (checked for secrets below). Nothing was committed."
+fi
+PW=""
+
+# ── The password must not have reached anything durable ────────────────────
+#
+# ⚠️ CHECKED, NOT ASSUMED — and the log is removed either way. setup writes
+# its config 0644, which is one of the reasons it is discarded rather than
+# kept.
+LOGFILE="${STATE}/.bootstrap.log"
+chmod 600 "$LOGFILE" 2>/dev/null
+
+USERS=$(sudo -u "$SVC_USER" sqlite3 "$DB" 'SELECT count(*) FROM user;' 2>/dev/null || echo "?")
+[ "$USERS" = "1" ] || die "expected exactly one user after setup, found $USERS."
+
+FOUND=$(sudo -u "$SVC_USER" "$BIN" users list --config "$TMPCFG" 2>/dev/null | tr -d '\r' | sed '/^$/d')
+[ "$FOUND" = "$ADMIN_LOGIN" ] || die "expected administrator \"$ADMIN_LOGIN\", found \"$FOUND\"."
+
+rm -f "$LOGFILE"
+
+# ── Hand the database back to the role's own configuration ─────────────────
+chown "$SVC_USER:$SVC_GROUP" "$DB" 2>/dev/null
+chmod 600 "$DB" 2>/dev/null
+for side in "-wal" "-shm"; do
+  [ -e "${DB}${side}" ] && { chown "$SVC_USER:$SVC_GROUP" "${DB}${side}"; chmod 600 "${DB}${side}"; }
+done
+
+date -u +%Y-%m-%dT%H:%M:%SZ > "$MARKER"
+chown "$SVC_USER:$SVC_GROUP" "$MARKER"
+chmod 644 "$MARKER"
+
+echo
+echo "  administrator \"$ADMIN_LOGIN\" created"
+echo "  marker written: $MARKER"
+echo
+echo "DONE. The temporary setup configuration has been removed, so the"
+echo "database is currently not described by any configuration file."
+echo
+echo "Now re-run the role. It will write the real configuration with the"
+echo "VAULTED stable encryption key, start the service and verify it:"
+echo
+echo "  ansible-playbook playbooks/semaphore.yml --ask-vault-pass --ask-become-pass"
+echo
+echo "Then log in through an SSH tunnel and enrol TOTP immediately:"
+echo
+echo "  ssh -L {{ semaphore_port }}:127.0.0.1:{{ semaphore_port }} dc1-arm-1@10.0.0.22"

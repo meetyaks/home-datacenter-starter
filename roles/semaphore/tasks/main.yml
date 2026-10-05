@@ -1,6 +1,14 @@
 ---
 # Semaphore UI on the controller. Order matters; each include says why it is
 # where it is.
+#
+# ⚠️ THE ROLE CONVERGES IN TWO STAGES, and the break is deliberate.
+# v2.19.12 cannot create an administrator without either putting the
+# password in argv or rotating the encryption key, so the first
+# administrator is created by an interactive operator helper. Until that has
+# happened the role installs everything, initialises the database, and then
+# STOPS — the service is never defined or started, because an empty
+# Semaphore left listening is an unauthenticated initialisation surface.
 
 - name: Identify the platform and the tools the daemon will need
   ansible.builtin.include_tasks: platform.yml
@@ -21,10 +29,16 @@
   ansible.builtin.include_tasks: configure.yml
 
 # After configure.yml, because `migrate` reads the config to find the
-# database; before service.yml, because the daemon will not start against an
-# unmigrated database.
-- name: The database
+# database; before the service, which will not start against an unmigrated
+# one.
+- name: The database, the backup command and the bootstrap helper
   ansible.builtin.include_tasks: database.yml
+
+# ── THE STAGE BOUNDARY ──────────────────────────────────────────────────────
+# Stops with instructions if no administrator exists. Everything below this
+# line runs only once one does.
+- name: The administrator must already exist
+  ansible.builtin.include_tasks: admin.yml
 
 - name: Define the service
   ansible.builtin.include_tasks: service.yml
@@ -33,19 +47,13 @@
 # handlers at the END of the play, so without this the restart is still
 # pending while verify.yml interrogates the process running the OLD
 # configuration — and passes. That defect reached a live deployment in the
-# CoreDNS rollout: a resolver answering on the previous port while the file
-# on disk said otherwise. It is reproduced on demand by
+# CoreDNS rollout. It is reproduced on demand by
 # `tests/run-semaphore-linux.sh --red`, which requires the run to FAIL
 # without this task.
 # (enforced: tests/semaphore-task-shape.yml "handlers are flushed before
 #  anything verifies the service")
 - name: Apply every pending restart BEFORE anything verifies the service
   ansible.builtin.meta: flush_handlers
-
-# The administrator is created against a RUNNING, migrated database, and
-# only when `users list` shows it absent.
-- name: The administrator
-  ansible.builtin.include_tasks: admin.yml
 
 - name: Verify it answers
   ansible.builtin.include_tasks: verify.yml

@@ -164,22 +164,57 @@ try to use a stored SSH key. It must survive upgrades, reinstalls and
 restores. Keep it in the vault, and keep the vault backed up somewhere other
 than the controller.
 
-### The one place the secret rule is not fully honoured
+### The first administrator is created by hand, once
 
-v2.19.12 creates users with `semaphore users add --password <plaintext>`.
-There is no stdin, file or environment alternative — `semaphore setup` does
-read the password from stdin, but it also regenerates the secrets and
-rewrites `config.json`, which would rotate `access_key_encryption` on every
-run and destroy every stored credential.
+v2.19.12 creates users two ways and only one of them is safe:
 
-So during **first bootstrap only**, the password is visible in `ps` for the
-duration of one short command, to other local accounts on the controller. It
-is never logged (`no_log`), never committed, and never written to disk.
-Steady-state runs do not create a user at all.
+| mechanism | password goes | verdict |
+|---|---|---|
+| `semaphore users add --password …` | **argv**, readable by any local account via `ps` | rejected |
+| `semaphore setup` | **stdin** | used |
 
-To refuse that trade, set `semaphore_admin_bootstrap_enabled: false`. The
-role then installs and verifies everything else and stops with the exact
-manual command for you to run once yourself.
+`no_log` hides a password from Ansible's log and from nothing else, so the
+automated path was **removed entirely** rather than left as an opt-in flag —
+a capability that exists can be switched on.
+
+`setup` is not something a converging role can run either: it calls
+`GenerateSecrets()` and rewrites `config.json` on every invocation. Verified
+on 2026-10-04: a second run rotated `access_key_encryption` from `HMF98JFG…`
+to `eab6YytE…`. With any Key Store credential present that would make all of
+them permanently undecryptable.
+
+So the role installs an interactive helper and stops:
+
+```bash
+sudo /usr/local/sbin/semaphore-bootstrap-admin
+```
+
+It refuses unless it is on the controller, run as root, attached to a real
+terminal, the service is stopped, the database has **0 users and 0 stored
+credentials**, and it has never run before. It prompts with echo off, asks
+twice, and hands the password to `setup` on stdin — never argv, never the
+environment, never a file. It then discards setup's temporary configuration
+(which setup writes **0644**, with key material in it) and leaves a
+non-secret marker.
+
+**The administrator survives the key swap**, which is what makes this work.
+Verified against the real binary: an administrator created under setup's
+temporary key authenticated successfully (HTTP 204) against a server
+configured with a completely different `access_key_encryption`, while a wrong
+password returned 401. The password is bcrypt in the `user` table and does
+not involve the encryption key.
+
+### The role converges in two stages
+
+**Stage 1** installs the binary, creates the account and directories, writes
+the configuration, migrates the database — then **stops**, because no
+administrator exists. The service is never defined or started: an empty
+Semaphore left listening is an unauthenticated initialisation surface.
+
+**Operator** runs the helper above.
+
+**Stage 2** re-runs the role. It finds the administrator, starts the service
+and verifies it.
 
 ## First login and mandatory TOTP
 

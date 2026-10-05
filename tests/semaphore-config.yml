@@ -29,6 +29,10 @@
     # naive scan matches that explanation.
     plist_code: "{{ lookup('file', '../roles/semaphore/templates/launchd.plist.j2') | regex_replace('(?s)<!--.*?-->', '') | regex_replace('(?s)\\{#.*?#\\}', '') }}"
     defaults_raw: "{{ lookup('file', '../roles/semaphore/defaults/main.yml') }}"
+    helper: "{{ lookup('file', '../roles/semaphore/templates/semaphore-bootstrap-admin.sh.j2') }}"
+    # Comment-stripped, so the header explaining what must NOT appear
+    # cannot trip a scan looking for exactly those things.
+    helper_code: "{{ lookup('file', '../roles/semaphore/templates/semaphore-bootstrap-admin.sh.j2') | regex_replace('(?m)^\\s*#.*$', '') }}"
 
   tasks:
     # ── THE RELEASE IS PINNED, NOT FLOATING ────────────────────────────────
@@ -211,6 +215,87 @@
           The launchd plist must name the config path, never a secret. It is
           world-readable; anything in it is public to local accounts.
         success_msg: "The plist references the config path and holds no secret."
+
+    # ── THE FIRST-ADMINISTRATOR BOOTSTRAP CONTRACT ─────────────────────────
+    #
+    # ⚠️ THE ROLE MUST NOT BE ABLE TO CREATE A USER AT ALL. v2.19.12's
+    # `users add` takes the password as a command-line flag, where any local
+    # account can read it from `ps`; no_log hides it from Ansible's log and
+    # from nothing else. The capability was removed rather than defaulted
+    # off, because a flag that exists can be switched on.
+    - name: THE ROLE NEVER CREATES A USER, AND NEVER HANDLES A PASSWORD ARGUMENT
+      ansible.builtin.assert:
+        that:
+          - not (role_code is search('users\s+add'))
+          - not (role_code is search('--password'))
+          - not (role_code is search('semaphore_admin_bootstrap_enabled'))
+          # The role installs the helper; it must never execute it.
+          - not (role_code is search('command.*semaphore-bootstrap-admin'))
+        fail_msg: >-
+          A role task references `users add`, `--password`, the removed
+          bootstrap flag, or executes the interactive helper. The role
+          cannot create an administrator: the only supported mechanism puts
+          the password in argv, and the safe one is interactive.
+        success_msg: >-
+          The role creates no user, handles no password argument and never
+          runs the helper.
+      vars:
+        # ⚠️ COMMENT-STRIPPED. admin.yml's header explains at length why
+        # `users add --password` was rejected, so scanning the raw text
+        # matches that explanation and fails on correct code. This is the
+        # sixth time a text search in this repository has matched prose
+        # rather than the thing it forbids.
+        role_code: >-
+          {{ (lookup('file', '../roles/semaphore/tasks/admin.yml')
+              ~ lookup('file', '../roles/semaphore/tasks/main.yml')
+              ~ lookup('file', '../roles/semaphore/tasks/database.yml'))
+             | regex_replace('(?m)^\s*#.*$', '') }}
+
+    - name: THE HELPER TAKES ITS PASSWORD ONLY FROM AN INTERACTIVE TERMINAL
+      ansible.builtin.assert:
+        that:
+          # Typed, with echo off.
+          - helper is search('read -rs PW')
+          - helper is search('read -rs PW2')
+          # Never an argument, never an environment variable.
+          - not (helper_code is search('PW="\$1"'))
+          - not (helper_code is search('PW="\$\{SEMAPHORE'))
+          - not (helper_code is search('\$\{SEMAPHORE_ADMIN_PASSWORD'))
+          # An interactive terminal is required, so it cannot be scripted.
+          - helper is search('\[ -t 0 \] && \[ -t 1 \]')
+          - helper is search('no interactive terminal')
+        fail_msg: >-
+          The bootstrap helper must read the password with `read -rs` from a
+          real terminal, and must accept it from no other source — not an
+          argument, not an environment variable, not a file.
+        success_msg: "The helper accepts a password only from an interactive terminal."
+
+    - name: THE HELPER REFUSES EVERY UNSAFE PRECONDITION
+      ansible.builtin.assert:
+        that:
+          # An existing user: this bootstraps the FIRST administrator only.
+          - helper is search('SELECT count\(\*\) FROM user')
+          - helper is search('already has \$USERS user')
+          # ⚠️ THE CONDITION THAT MAKES THE KEY SWAP SAFE. Every Key Store
+          # secret is encrypted with access_key_encryption; replacing the
+          # key after one exists makes it permanently unreadable.
+          - helper is search('SELECT count\(\*\) FROM access_key')
+          - helper is search('permanently undecryptable')
+          # A running service would race the database and hold the config.
+          - helper is search('the Semaphore service is')
+          # Once only.
+          - helper is search('bootstrap already completed')
+          # The temporary config goes, on success AND on failure — setup
+          # writes it 0644, with its throwaway key material in it.
+          - helper is search('trap cleanup EXIT INT TERM')
+          - helper is search('removed the temporary setup configuration')
+        fail_msg: >-
+          The bootstrap helper must refuse when a user exists, when any Key
+          Store credential exists, when the service is running, or when it
+          has already run — and must remove its temporary configuration on
+          both success and failure.
+        success_msg: "The helper refuses every unsafe precondition."
+      vars: {}
 
     # ── FILESYSTEM ─────────────────────────────────────────────────────────
     - name: Durable state lives outside homes and outside /tmp

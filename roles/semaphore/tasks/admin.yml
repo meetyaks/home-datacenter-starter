@@ -1,127 +1,99 @@
 ---
 # ─────────────────────────────────────────────────────────────────────────────
-# THE ADMINISTRATOR, CREATED ONCE AND NEVER RESET.
+# THE ADMINISTRATOR IS DETECTED HERE, NEVER CREATED HERE.
 #
-# ⚠️ THE GUARD IS MANDATORY, NOT DEFENSIVE. `semaphore users add` on an
-# existing login does not fail politely — it PANICS with a Go stack trace
-# (verified against the real binary on 2026-10-04). So existence is checked
-# first, every run, and creation only happens when the list comes back
-# without this login.
+# ⚠️ THE ROLE DELIBERATELY CANNOT CREATE A USER. v2.19.12 offers
+# `users add --password <plaintext>`, which puts the password in argv where
+# any local account can read it from `ps`. `no_log` hides it from Ansible's
+# log and from nothing else, so an opt-in flag would still be a capability
+# that exists and can be switched on. It was removed rather than defaulted
+# off.
 #
-# ⚠️ AND IT MUST NEVER RESET AN EXISTING PASSWORD. Steady-state runs must
-# leave a working login alone; an operator who has rotated the password in
-# the UI should not find it reverted by the next reconcile.
+# The supported safe path is `semaphore setup`, which reads the password
+# from stdin — but it also regenerates the secrets and rewrites config.json
+# on every run (verified: a second run rotated access_key_encryption), so it
+# cannot be driven by a converging role. It belongs to an interactive
+# one-time helper, which this role installs and the operator runs.
 #
-# ⚠️ THE ONE PLACE THIS ROLE CANNOT FULLY HONOUR ITS OWN SECRET RULE.
-# v2.19.12 takes the password as a command-line flag and offers no stdin,
-# file or environment alternative (cli/cmd/user_add.go). `semaphore setup`
-# does read it from stdin, but it also calls GenerateSecrets() and rewrites
-# config.json, rotating access_key_encryption and destroying every stored
-# credential — so it is not usable for a repeatable bootstrap.
-#
-# The password is therefore visible in `ps` for the duration of one short
-# command, to other local accounts on the controller. It is never written to
-# a log (no_log), never committed, and never passed to anything else. Set
-# semaphore_admin_bootstrap_enabled=false to refuse this trade and perform
-# the one-time creation by hand instead; see docs/dc1-semaphore.md.
+# So the role has two stages:
+#   stage 1   everything up to and including the database, then STOP here
+#             with instructions. The service is never defined or started,
+#             so no unauthenticated UI is ever exposed.
+#   stage 2   re-run after the operator has bootstrapped: the administrator
+#             is found, the service starts, verification runs.
 # ─────────────────────────────────────────────────────────────────────────────
 
-- name: List the users that already exist
+- name: Ask the database how many users it has
+  # ⚠️ ASKED OF SQLITE, NOT OF `users list`. At this point in stage 1 there
+  # may be no usable configuration file at all — the bootstrap helper
+  # discards the temporary one it used — and `users list` needs one. The
+  # database is the authority either way.
   ansible.builtin.command:
-    cmd: "{{ semaphore_bin_link }} users list --config {{ semaphore_config_path }}"
+    cmd: "sqlite3 {{ semaphore_db_path }} 'SELECT count(*) FROM user;'"
   become: true
   become_user: "{{ semaphore_user }}"
-  register: semaphore_users
+  register: semaphore_user_count
   changed_when: false
+  failed_when: false
 
-- name: Decide whether the administrator is already present
+- name: Decide whether an administrator exists
   ansible.builtin.set_fact:
     semaphore_admin_present: >-
-      {{ semaphore_admin_login in
-         (semaphore_users.stdout_lines | map('trim') | list) }}
+      {{ (semaphore_user_count.stdout | default('0') | trim | int) > 0 }}
 
-- name: Report the bootstrap state plainly
-  # First bootstrap and steady state are genuinely different situations and
-  # the operator should be able to tell which one they are looking at.
-  ansible.builtin.debug:
-    msg: >-
-      {{ 'Administrator "' ~ semaphore_admin_login ~ '" already exists — '
-         ~ 'leaving it, and its password, untouched.'
-         if semaphore_admin_present | bool
-         else 'No administrator yet: this is a first bootstrap.' }}
-
-- name: Refuse to continue without an administrator when bootstrap is disabled
+- name: STOP — the first administrator has not been created yet
+  # ⚠️ A STOP, NOT A WARNING, AND THE SERVICE IS NOT STARTED. Starting
+  # Semaphore against a database with no users would publish an
+  # initialisation surface on the controller with nothing in front of it.
+  # It stays stopped until an administrator exists.
   ansible.builtin.fail:
-    msg: >-
-      No administrator exists and semaphore_admin_bootstrap_enabled is false,
-      so this role will not create one. Run it once by hand, as the service
-      account, on the controller:
+    msg: |-
+      Semaphore is installed and its database is initialised, but it has no
+      administrator — so the service has NOT been started. That is
+      deliberate: an empty Semaphore must not be left listening.
 
-        sudo -u {{ semaphore_user }} {{ semaphore_bin_link }} users add \
-          --admin --login {{ semaphore_admin_login }} \
-          --name '{{ semaphore_admin_name }}' \
-          --email {{ semaphore_admin_email }} \
-          --password '<the vaulted password>' \
-          --config {{ semaphore_config_path }}
+      Run the one-time interactive bootstrap on this machine:
 
-      Clear it from your shell history afterwards. Then re-run this
-      playbook, which will find the administrator and continue.
-  when:
-    - not (semaphore_admin_present | bool)
-    - not (semaphore_admin_bootstrap_enabled | bool)
+        sudo {{ semaphore_bin_link | dirname }}/semaphore-bootstrap-admin
 
-- name: Create the administrator
-  # ⚠️ no_log, AND IT IS LOAD-BEARING. Without it the password appears in the
-  # task argument echo, in the run log and in any CI transcript. The argv
-  # exposure described above is bad enough; this at least keeps it out of
-  # everything durable.
-  # (enforced: tests/semaphore-task-shape.yml, mutation "removing no_log
-  #  from the administrator task")
-  ansible.builtin.command:
-    argv:
-      - "{{ semaphore_bin_link }}"
-      - users
-      - add
-      - --admin
-      - --login
-      - "{{ semaphore_admin_login }}"
-      - --name
-      - "{{ semaphore_admin_name }}"
-      - --email
-      - "{{ semaphore_admin_email }}"
-      - --password
-      - "{{ semaphore_admin_password }}"
-      - --config
-      - "{{ semaphore_config_path }}"
-  become: true
-  become_user: "{{ semaphore_user }}"
-  no_log: true
-  register: semaphore_admin_create
-  changed_when: true
-  when:
-    - not (semaphore_admin_present | bool)
-    - semaphore_admin_bootstrap_enabled | bool
+      It prompts for a password with echo off, hands it to the supported
+      `semaphore setup` on stdin — never on a command line, never in the
+      environment, never to disk — and refuses if the database already has
+      a user or any stored credential.
 
-- name: Confirm the administrator exists now
-  ansible.builtin.command:
-    cmd: "{{ semaphore_bin_link }} users list --config {{ semaphore_config_path }}"
-  become: true
-  become_user: "{{ semaphore_user }}"
-  register: semaphore_users_after
-  changed_when: false
+      Then re-run this playbook. It will find the administrator, write the
+      real configuration with the vaulted encryption key, start the service
+      and verify it.
+  when: not (semaphore_admin_present | bool)
 
-- name: The administrator must be present, and must be the only user
-  # ⚠️ "ONLY" MATTERS. This milestone creates exactly one account. A second
-  # one appearing means either a bootstrap ran twice with different values
-  # or somebody added a user outside Git — both worth stopping for.
+- name: Confirm the administrator is the only account
+  # ⚠️ "ONLY" MATTERS. This milestone has exactly one account. A second
+  # appearing means somebody added a user outside Git, which is worth
+  # stopping for.
   ansible.builtin.assert:
     that:
-      - semaphore_admin_login in (semaphore_users_after.stdout_lines | map('trim') | list)
-      - (semaphore_users_after.stdout_lines | select('match', '.') | list | length) == 1
+      - (semaphore_user_count.stdout | trim | int) == 1
     fail_msg: >-
-      Expected exactly one user, "{{ semaphore_admin_login }}", but the
-      database holds:
-      {{ semaphore_users_after.stdout_lines | map('trim') | join(', ') }}.
-    success_msg: >-
-      Administrator "{{ semaphore_admin_login }}" exists and is the only
-      account.
+      The database holds {{ semaphore_user_count.stdout | trim }} users.
+      This milestone creates exactly one administrator; additional accounts
+      are not managed here and were not created by this role.
+    success_msg: "Exactly one administrator account exists."
+
+- name: Record that bootstrap has happened
+  ansible.builtin.stat:
+    path: "{{ semaphore_state_dir }}/.admin-bootstrapped"
+  register: semaphore_bootstrap_marker
+  become: true
+
+- name: Report the bootstrap state plainly
+  # The marker's own contents are the timestamp; there is no need to format
+  # its mtime, and the first attempt to do so had the strftime arguments
+  # backwards ("Invalid value for epoch value (%Y-%m-%d)") — the filter
+  # takes the format on the left and the epoch as its argument.
+  ansible.builtin.debug:
+    msg: >-
+      Administrator present.
+      {{ 'Bootstrap marker found.' if semaphore_bootstrap_marker.stat.exists
+         | default(false) else 'No bootstrap marker — this database was not
+         created by semaphore-bootstrap-admin.' }}
+      The role does not touch the administrator's password.
