@@ -222,6 +222,34 @@
           role behaviour.
         success_msg: "Both harnesses implement the full two-stage flow."
 
+    - name: SERVICE-OWNED PATHS ARE READ WITH PRIVILEGE, NOT AS THE OPERATOR
+      # ⚠️ EIGHT FAILURES FROM ONE CAUSE. In account mode the harness runs
+      # as the operator, but the helper is root:<group> 0750 and the state
+      # directory is <user>:<group> 0750 — so `[ -x ]` and `[ -s ]` reported
+      # "missing" for files that were present and correct, and the driver
+      # exec'd the helper as a user who could not read it (exit 126).
+      #
+      # The helper itself demands root ("run this with sudo"), so the driver
+      # must BE root; sudo strips the environment, so the state directory is
+      # passed through `env` explicitly.
+      ansible.builtin.assert:
+        that:
+          - macos is search('tsudo test -x "\$ROOT/sbin/semaphore-bootstrap-admin"')
+          - macos is search('tsudo test -s "\$ROOT/state/semaphore\.db"')
+          - macos is search('tsudo env SEMAPHORE_STATE_DIR')
+          # ⚠️ ANCHORED AT A LINE START. The first version matched
+          # "\n  python3 …", which is the CONTINUATION of the tsudo command
+          # — so it flagged the correct form. Only an invocation that
+          # begins its own line is an unprivileged one.
+          - not (macos is search('(?m)^python3 tests/container/bootstrap-driver'))
+          - (macos | regex_findall('tsudo env SEMAPHORE_STATE_DIR') | length) == 2
+        fail_msg: >-
+          The macOS harness must read service-owned paths with privilege and
+          must run the bootstrap driver as root. Unprivileged `test -x` on a
+          0750 service-owned file reports "missing" for a file that is
+          present, and the helper refuses to run as anyone but root.
+        success_msg: "Service-owned paths are read with privilege; the driver runs as root."
+
     - name: THE DISPOSABLE PREFIX IS REACHABLE BY THE SERVICE ACCOUNT
       # ⚠️ THE CONTROLLER GATE FOUND THIS. `mktemp -d -t` puts the prefix
       # under $TMPDIR, which on macOS is drwx------ and owned by the

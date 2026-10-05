@@ -482,10 +482,15 @@ else ok "nothing is listening after stage 1"; fi
 if tsudo launchctl print "system/${LABEL}" >/dev/null 2>&1; then
   bad "no launchd job exists after stage 1" "${LABEL} is loaded"
 else ok "no launchd job exists after stage 1"; fi
-[ -x "$ROOT/sbin/semaphore-bootstrap-admin" ] \
+# ⚠️ ASKED WITH PRIVILEGE. In account mode these are owned by the
+# disposable identity — the helper is root:<group> 0750 and the state
+# directory is <user>:<group> 0750 — so the operator running this harness
+# cannot read or even traverse them. Testing them unprivileged reported
+# "missing" for files that were present and correct.
+tsudo test -x "$ROOT/sbin/semaphore-bootstrap-admin" \
   && ok "the bootstrap helper was installed" \
   || bad "bootstrap helper installed" "$ROOT/sbin/semaphore-bootstrap-admin missing"
-[ -s "$ROOT/state/semaphore.db" ] \
+tsudo test -s "$ROOT/state/semaphore.db" \
   && ok "the database was initialised" || bad "database initialised" "missing or empty"
 # ⚠️ NO "is it running" CHECK HERE. Stage 1 deliberately does not start the
 # service, so probing for a process at this point would assert the opposite
@@ -493,9 +498,9 @@ else ok "no launchd job exists after stage 1"; fi
 grep -q 'Unpack it (macOS' /tmp/semaphore-disp-1.log \
   && ok "the macOS bsdtar extraction path executed" \
   || bad "macOS extraction path" "not present in the run log"
-[ -x "$ROOT/libexec/2.19.12/semaphore" ] && ok "the versioned binary is installed" \
+tsudo test -x "$ROOT/libexec/2.19.12/semaphore" && ok "the versioned binary is installed" \
   || bad "versioned binary" "missing under $ROOT/libexec/2.19.12"
-[ -L "$ROOT/sbin/semaphore" ] && ok "the stable link points at the version" \
+tsudo test -L "$ROOT/sbin/semaphore" && ok "the stable link points at the version" \
   || bad "stable link" "$ROOT/sbin/semaphore is not a symlink"
 
 if [ "$WITH_ACCOUNT" = yes ]; then
@@ -591,7 +596,11 @@ echo "── 1c. the interactive bootstrap, on a real pty ──"
 # ⚠️ A pty, NOT A PIPE. The helper refuses without an interactive terminal
 # and uses `read -rs`, which needs one to disable echo.
 BOOTSTRAP_PW="Disposable-Bootstrap-$(openssl rand -hex 10)"
-SEMAPHORE_STATE_DIR="$ROOT/state" \
+# ⚠️ THE DRIVER RUNS AS ROOT, because the helper refuses otherwise
+# ("run this with sudo; it must act as <user>"). Exec'ing it as the
+# operator produced exit 126 and an unreadable helper. sudo strips the
+# environment, so the state directory is passed through `env` explicitly.
+tsudo env SEMAPHORE_STATE_DIR="$ROOT/state" \
   python3 tests/container/bootstrap-driver.py \
   "$ROOT/sbin/semaphore-bootstrap-admin" "$BOOTSTRAP_PW" "$ROOT/ps-samples.txt" \
   > /tmp/semaphore-disp-bootstrap.log 2>&1
@@ -600,10 +609,10 @@ rcb=$?
   || { bad "interactive bootstrap" "exit $rcb"; tail -25 /tmp/semaphore-disp-bootstrap.log | sed 's/^/           /'; }
 
 PWRE=$(printf '%s' "$BOOTSTRAP_PW" | sed 's/[.[\*^$/]/\\&/g')
-grep -q "bootstrap-driver.py.*${PWRE}" "$ROOT/ps-samples.txt" 2>/dev/null \
+tsudo grep -q "bootstrap-driver.py.*${PWRE}" "$ROOT/ps-samples.txt" 2>/dev/null \
   && ok "control: the password IS visible in the driver's own argv (sampling works)" \
   || bad "sampling control" "the password never appeared even in the driver's argv"
-if grep -E "${PWRE}" "$ROOT/ps-samples.txt" 2>/dev/null | grep -vq 'bootstrap-driver.py'; then
+if tsudo grep -E "${PWRE}" "$ROOT/ps-samples.txt" 2>/dev/null | grep -vq 'bootstrap-driver.py'; then
   bad "the password NEVER reaches another process's argv" "it appeared in a non-driver process"
 else
   ok "the password never reached semaphore's or any other process's argv"
@@ -617,18 +626,18 @@ grep -q 'DRIVER: setup-dir.*mode=0o700' /tmp/semaphore-disp-bootstrap.log \
 if grep -q 'DRIVER: setup-dir.*nobody_read_rc=0' /tmp/semaphore-disp-bootstrap.log; then
   bad "an unrelated account CANNOT read the temporary config" "nobody read it"
 else ok "an unrelated account could not read the temporary config"; fi
-if grep -qa "$BOOTSTRAP_PW" "$ROOT/state/semaphore.db" 2>/dev/null; then
+if tsudo grep -qa "$BOOTSTRAP_PW" "$ROOT/state/semaphore.db" 2>/dev/null; then
   bad "the password is absent from the database" "found in cleartext"
 else ok "the password is absent from the database"; fi
-ls -d "$ROOT"/state/.setup.* >/dev/null 2>&1 \
+tsudo sh -c 'ls -d "$1"/state/.setup.* >/dev/null 2>&1' _ "$ROOT" \
   && bad "no temporary setup directory survives" "one is still on disk" \
   || ok "no temporary setup directory survives"
-[ -e "$ROOT/state/.admin-bootstrapped" ] \
+tsudo test -e "$ROOT/state/.admin-bootstrapped" \
   && ok "a non-secret bootstrap marker was written" || bad "bootstrap marker" "missing"
 
 echo
 echo "── 1d. a second bootstrap attempt must be refused ──"
-SEMAPHORE_STATE_DIR="$ROOT/state" \
+tsudo env SEMAPHORE_STATE_DIR="$ROOT/state" \
   python3 tests/container/bootstrap-driver.py \
   "$ROOT/sbin/semaphore-bootstrap-admin" "Another-Password-123456" "$ROOT/ps2.txt" \
   > /tmp/semaphore-disp-bootstrap2.log 2>&1
@@ -652,7 +661,7 @@ ok "stage 2 converged (exit 0)"
 DISPOSABLE_PID=$(disposable_pid)
 [ -n "$DISPOSABLE_PID" ] && ok "a disposable Semaphore is running (pid $DISPOSABLE_PID)" \
   || bad "a disposable Semaphore is running" "no process under $ROOT"
-[ -f "$PLIST" ] && ok "the launchd plist rendered into the prefix" \
+tsudo test -f "$PLIST" && ok "the launchd plist rendered into the prefix" \
   || bad "plist rendered" "$PLIST missing"
 
 if [ "$WITH_ACCOUNT" = yes ]; then
@@ -678,7 +687,7 @@ body=$(curl -sS --max-time 5 "http://127.0.0.1:$PORT1/api/ping" 2>/dev/null | tr
 [ "$body" = "pong" ] && ok "/api/ping returns pong on $PORT1" || bad "/api/ping" "got '$body'"
 lsn=$(lsof -nP -iTCP:"$PORT1" -sTCP:LISTEN 2>/dev/null | tail -1)
 printf '%s' "$lsn" | grep -q '127.0.0.1' && ok "bound to loopback" || bad "loopback bind" "$lsn"
-cfgmode=$(stat -f '%Lp' "$ROOT/etc/config.json" 2>/dev/null)
+cfgmode=$(tsudo stat -f '%Lp' "$ROOT/etc/config.json" 2>/dev/null)
 [ "$cfgmode" = "600" ] && ok "config.json is 0600" || bad "config.json 0600" "mode $cfgmode"
 
 echo

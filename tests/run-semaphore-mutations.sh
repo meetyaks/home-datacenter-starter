@@ -413,6 +413,18 @@ expect_red semaphore-harness-integrity.yml '_semt account survives|sweeps for st
            "a gate that does not sweep for stray identities is caught"
 
 restore
+# ⚠️ EIGHT FAILURES FROM ONE CAUSE: unprivileged reads of service-owned
+# paths report "missing" for files that are present and correct.
+perl -pi -e 's{tsudo test -x "\$ROOT/sbin/semaphore-bootstrap-admin"}{test -x "\$ROOT/sbin/semaphore-bootstrap-admin"}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'with privilege|service-owned' \\
+           "an unprivileged read of a service-owned path is caught"
+
+restore
+perl -pi -e 's{^tsudo env SEMAPHORE_STATE_DIR=}{env SEMAPHORE_STATE_DIR=}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'as root|service-owned' \\
+           "a bootstrap driver that does not run as root is caught"
+
+restore
 # ⚠️ THE DIVERGENCE THAT COST A CONTROLLER RUN: the Linux harness was
 # updated for the two-stage flow and the macOS one was not.
 perl -pi -e 's{stage 1 stopped, as it must without an administrator}{the role converged}' "$MACOS_SH"
