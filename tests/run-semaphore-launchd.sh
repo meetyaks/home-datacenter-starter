@@ -685,8 +685,27 @@ echo
 echo "── 2. it answers, on the disposable port ──"
 body=$(curl -sS --max-time 5 "http://127.0.0.1:$PORT1/api/ping" 2>/dev/null | tr -d '\r\n')
 [ "$body" = "pong" ] && ok "/api/ping returns pong on $PORT1" || bad "/api/ping" "got '$body'"
-lsn=$(lsof -nP -iTCP:"$PORT1" -sTCP:LISTEN 2>/dev/null | tail -1)
-printf '%s' "$lsn" | grep -q '127.0.0.1' && ok "bound to loopback" || bad "loopback bind" "$lsn"
+# ⚠️ tsudo, BECAUSE lsof DOES NOT SHOW ANOTHER USER'S SOCKETS. The harness
+# runs as the operator and the listener belongs to the disposable service
+# account, so an unprivileged lsof returned NOTHING and the check failed
+# with an empty reason — while /api/ping was answering on that very port.
+# Same class as the service-owned file reads, in the one place I missed.
+#
+# ⚠️ AND THE RESULT MUST BE NON-EMPTY BEFORE IT IS JUDGED. Empty output
+# satisfies "does not contain 0.0.0.0" just as well as a correct loopback
+# bind does, so without this an invisible listener would pass the wildcard
+# check instead of failing the loopback one.
+lsn=$(tsudo lsof -nP -iTCP:"$PORT1" -sTCP:LISTEN 2>/dev/null | tail -1)
+if [ -z "$lsn" ]; then
+  bad "the listener is visible to this check" \
+      "lsof returned nothing for port $PORT1 — every bind assertion below would be vacuous"
+else
+  printf '%s' "$lsn" | grep -q '127.0.0.1' && ok "bound to loopback" \
+    || bad "loopback bind" "$lsn"
+  printf '%s' "$lsn" | grep -qE '0\.0\.0\.0|\*:' \
+    && bad "nothing bound on a wildcard address" "$lsn" \
+    || ok "nothing bound on a wildcard address"
+fi
 cfgmode=$(tsudo stat -f '%Lp' "$ROOT/etc/config.json" 2>/dev/null)
 [ "$cfgmode" = "600" ] && ok "config.json is 0600" || bad "config.json 0600" "mode $cfgmode"
 

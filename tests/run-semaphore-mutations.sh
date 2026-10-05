@@ -420,6 +420,13 @@ expect_red semaphore-harness-integrity.yml 'non-ASCII|unbound' \\
            "a bare \$VAR touching a non-ASCII character is caught"
 
 restore
+# ⚠️ AN UNPRIVILEGED lsof SEES NO OTHER USER'S SOCKETS, so it returns
+# nothing and the bind assertions become vacuous.
+perl -pi -e 's{lsn=\$\(tsudo lsof}{lsn=\$(lsof}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'lsof|visible to this check' \\
+           "an unprivileged lsof that cannot see the listener is caught"
+
+restore
 # ⚠️ EIGHT FAILURES FROM ONE CAUSE: unprivileged reads of service-owned
 # paths report "missing" for files that are present and correct.
 perl -pi -e 's{tsudo test -x "\$ROOT/sbin/semaphore-bootstrap-admin"}{test -x "\$ROOT/sbin/semaphore-bootstrap-admin"}' "$MACOS_SH"

@@ -270,6 +270,13 @@
       # passed through `env` explicitly.
       ansible.builtin.assert:
         that:
+          # ⚠️ lsof TOO. It does not show another user's sockets, so an
+          # unprivileged call returned NOTHING while /api/ping was
+          # answering on that very port — and empty output satisfies the
+          # "no wildcard bind" check just as well as a correct loopback
+          # bind does.
+          - macos is search('lsn=\$\(tsudo lsof')
+          - macos is search('the listener is visible to this check')
           - macos is search('tsudo test -x "\$ROOT/sbin/semaphore-bootstrap-admin"')
           - macos is search('tsudo test -s "\$ROOT/state/semaphore\.db"')
           - macos is search('tsudo env SEMAPHORE_STATE_DIR')
