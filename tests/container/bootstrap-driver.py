@@ -23,6 +23,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import subprocess
 import sys
 import termios
@@ -64,9 +65,17 @@ def probe_setup_dir():
                 mode = oct(os.stat(path).st_mode & 0o777)
                 # An unrelated unprivileged account must not be able to
                 # traverse the directory or read the config inside it.
+                # ⚠️ macOS HAS NO `runuser`. Using it unconditionally would
+                # make this probe fail to execute on the controller and
+                # report a non-zero rc for the wrong reason — which reads
+                # exactly like "nobody could not read it", i.e. a pass. The
+                # command is chosen per platform and a missing binary is
+                # reported rather than silently counted as success.
+                drop = (["runuser", "-u", "nobody", "--"]
+                        if shutil.which("runuser")
+                        else ["sudo", "-n", "-u", "nobody"])
                 probe = subprocess.run(
-                    ["runuser", "-u", "nobody", "--",
-                     "cat", os.path.join(path, "config.json")],
+                    drop + ["cat", os.path.join(path, "config.json")],
                     capture_output=True, text=True, timeout=5,
                 )
                 setup_dir_observations.append(

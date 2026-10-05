@@ -192,6 +192,36 @@
           residue this test can leave.
         success_msg: "The disposable identity is generated, validated and never _semaphore."
 
+    - name: BOTH HARNESSES IMPLEMENT THE TWO-STAGE BOOTSTRAP FLOW
+      # ⚠️ THE DIVERGENCE THAT COST A CONTROLLER RUN. When the role was
+      # restructured so stage 1 stops without an administrator, the Linux
+      # harness was updated and the macOS one was not — so the gate failed
+      # on the role behaving exactly as designed (ok=53, changed=13, then
+      # the deliberate stop).
+      #
+      # Neither harness can be updated alone again: both must expect the
+      # stage-1 stop, drive the interactive bootstrap, refuse a second one,
+      # and then converge in stage 2.
+      ansible.builtin.assert:
+        that:
+          - linux is search('stage 1 stopped, as it must without an administrator')
+          - macos is search('stage 1 stopped, as it must without an administrator')
+          - linux is search('stage 2 converged')
+          - macos is search('stage 2 converged')
+          - linux is search('bootstrap-driver\.py')
+          - macos is search('bootstrap-driver\.py')
+          - linux is search('a second bootstrap is refused')
+          - macos is search('a second bootstrap is refused')
+          - linux is search('nothing is listening after stage 1')
+          - macos is search('nothing is listening after stage 1')
+        fail_msg: >-
+          Both harnesses must expect the stage-1 stop, prove nothing is
+          listening at that point, drive the interactive bootstrap on a pty,
+          refuse a second bootstrap, and converge in stage 2. Updating one
+          and not the other is what made the controller gate fail on correct
+          role behaviour.
+        success_msg: "Both harnesses implement the full two-stage flow."
+
     - name: THE DISPOSABLE PREFIX IS REACHABLE BY THE SERVICE ACCOUNT
       # ⚠️ THE CONTROLLER GATE FOUND THIS. `mktemp -d -t` puts the prefix
       # under $TMPDIR, which on macOS is drwx------ and owned by the

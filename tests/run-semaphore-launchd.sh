@@ -458,18 +458,38 @@ run_role() {   # run_role <port> <logfile>
 disposable_pid() { pgrep -f "$ROOT/sbin/semaphore" | head -1; }
 
 echo
-echo "── 1. first run: the whole role against a disposable prefix ──"
+echo "── 1. STAGE 1: the role must STOP, with no administrator and no service ──"
+# ⚠️ FAILING HERE IS THE CORRECT BEHAVIOUR, and this harness did not know
+# that. When the role was restructured into two stages the Linux harness was
+# updated and this one was not, so the controller gate failed on the role
+# behaving exactly as designed — ok=53, changed=13, then the deliberate stop.
+#
+# The role cannot create an administrator without putting the password in
+# argv, so it installs everything, creates the account, migrates the
+# database and stops. It must NOT have started Semaphore: an empty Semaphore
+# left listening is an unauthenticated initialisation surface.
 run_role "$PORT1" /tmp/semaphore-disp-1.log
 rc1=$?
-if [ $rc1 -ne 0 ]; then
-  bad "the role converges on a clean disposable prefix" "exit $rc1; see /tmp/semaphore-disp-1.log"
-  tail -30 /tmp/semaphore-disp-1.log | sed 's/^/           /'
-  exit 1
-fi
-ok "the role converged (exit 0)"
-DISPOSABLE_PID=$(disposable_pid)
-[ -n "$DISPOSABLE_PID" ] && ok "a disposable Semaphore is running (pid $DISPOSABLE_PID)" \
-  || bad "a disposable Semaphore is running" "no process under $ROOT"
+[ $rc1 -ne 0 ] && ok "stage 1 stopped, as it must without an administrator" \
+  || bad "stage 1 stops without an administrator" "the role converged — did it create a user?"
+grep -q 'has NOT been started' /tmp/semaphore-disp-1.log \
+  && grep -q "sudo $ROOT/sbin/semaphore-bootstrap-admin" /tmp/semaphore-disp-1.log \
+  && ok "it stops with the exact bootstrap instruction" \
+  || bad "stop message names the helper" "the role did not print its stop instruction"
+if curl -sS --max-time 3 "http://127.0.0.1:$PORT1/api/ping" >/dev/null 2>&1; then
+  bad "nothing is listening after stage 1" "port $PORT1 answered"
+else ok "nothing is listening after stage 1"; fi
+if tsudo launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+  bad "no launchd job exists after stage 1" "${LABEL} is loaded"
+else ok "no launchd job exists after stage 1"; fi
+[ -x "$ROOT/sbin/semaphore-bootstrap-admin" ] \
+  && ok "the bootstrap helper was installed" \
+  || bad "bootstrap helper installed" "$ROOT/sbin/semaphore-bootstrap-admin missing"
+[ -s "$ROOT/state/semaphore.db" ] \
+  && ok "the database was initialised" || bad "database initialised" "missing or empty"
+# ⚠️ NO "is it running" CHECK HERE. Stage 1 deliberately does not start the
+# service, so probing for a process at this point would assert the opposite
+# of the designed behaviour.
 grep -q 'Unpack it (macOS' /tmp/semaphore-disp-1.log \
   && ok "the macOS bsdtar extraction path executed" \
   || bad "macOS extraction path" "not present in the run log"
@@ -477,8 +497,6 @@ grep -q 'Unpack it (macOS' /tmp/semaphore-disp-1.log \
   || bad "versioned binary" "missing under $ROOT/libexec/2.19.12"
 [ -L "$ROOT/sbin/semaphore" ] && ok "the stable link points at the version" \
   || bad "stable link" "$ROOT/sbin/semaphore is not a symlink"
-[ -f "$PLIST" ] && ok "the launchd plist rendered into the prefix" \
-  || bad "plist rendered" "$PLIST missing"
 
 if [ "$WITH_ACCOUNT" = yes ]; then
   echo
@@ -566,8 +584,81 @@ if [ "$WITH_ACCOUNT" = yes ]; then
   if sudo -n -u "$TEST_USER" test -w "$HOME/Projects/home-datacenter-starter/.git" 2>/dev/null; then
     bad "cannot modify the canonical repository" "the disposable account can write .git"
   else ok "cannot modify the canonical repository"; fi
+fi
 
-  # The running service must actually be this identity.
+echo
+echo "── 1c. the interactive bootstrap, on a real pty ──"
+# ⚠️ A pty, NOT A PIPE. The helper refuses without an interactive terminal
+# and uses `read -rs`, which needs one to disable echo.
+BOOTSTRAP_PW="Disposable-Bootstrap-$(openssl rand -hex 10)"
+SEMAPHORE_STATE_DIR="$ROOT/state" \
+  python3 tests/container/bootstrap-driver.py \
+  "$ROOT/sbin/semaphore-bootstrap-admin" "$BOOTSTRAP_PW" "$ROOT/ps-samples.txt" \
+  > /tmp/semaphore-disp-bootstrap.log 2>&1
+rcb=$?
+[ $rcb -eq 0 ] && ok "the interactive bootstrap succeeded" \
+  || { bad "interactive bootstrap" "exit $rcb"; tail -25 /tmp/semaphore-disp-bootstrap.log | sed 's/^/           /'; }
+
+PWRE=$(printf '%s' "$BOOTSTRAP_PW" | sed 's/[.[\*^$/]/\\&/g')
+grep -q "bootstrap-driver.py.*${PWRE}" "$ROOT/ps-samples.txt" 2>/dev/null \
+  && ok "control: the password IS visible in the driver's own argv (sampling works)" \
+  || bad "sampling control" "the password never appeared even in the driver's argv"
+if grep -E "${PWRE}" "$ROOT/ps-samples.txt" 2>/dev/null | grep -vq 'bootstrap-driver.py'; then
+  bad "the password NEVER reaches another process's argv" "it appeared in a non-driver process"
+else
+  ok "the password never reached semaphore's or any other process's argv"
+fi
+grep -q 'echo-off confirmed at 2 password prompt' /tmp/semaphore-disp-bootstrap.log \
+  && ok "echo was off at both password prompts (termios, not a sleep)" \
+  || bad "echo off" "$(grep -m1 'echo-off' /tmp/semaphore-disp-bootstrap.log)"
+grep -q 'DRIVER: setup-dir.*mode=0o700' /tmp/semaphore-disp-bootstrap.log \
+  && ok "the temporary setup directory was 0700 while setup ran" \
+  || bad "temporary setup dir 0700" "$(grep -m1 'setup-dir' /tmp/semaphore-disp-bootstrap.log)"
+if grep -q 'DRIVER: setup-dir.*nobody_read_rc=0' /tmp/semaphore-disp-bootstrap.log; then
+  bad "an unrelated account CANNOT read the temporary config" "nobody read it"
+else ok "an unrelated account could not read the temporary config"; fi
+if grep -qa "$BOOTSTRAP_PW" "$ROOT/state/semaphore.db" 2>/dev/null; then
+  bad "the password is absent from the database" "found in cleartext"
+else ok "the password is absent from the database"; fi
+ls -d "$ROOT"/state/.setup.* >/dev/null 2>&1 \
+  && bad "no temporary setup directory survives" "one is still on disk" \
+  || ok "no temporary setup directory survives"
+[ -e "$ROOT/state/.admin-bootstrapped" ] \
+  && ok "a non-secret bootstrap marker was written" || bad "bootstrap marker" "missing"
+
+echo
+echo "── 1d. a second bootstrap attempt must be refused ──"
+SEMAPHORE_STATE_DIR="$ROOT/state" \
+  python3 tests/container/bootstrap-driver.py \
+  "$ROOT/sbin/semaphore-bootstrap-admin" "Another-Password-123456" "$ROOT/ps2.txt" \
+  > /tmp/semaphore-disp-bootstrap2.log 2>&1
+rcb2=$?
+[ $rcb2 -ne 0 ] && ok "a second bootstrap is refused" \
+  || bad "second bootstrap refused" "it succeeded a second time"
+grep -qi 'already completed' /tmp/semaphore-disp-bootstrap2.log \
+  && ok "it refuses for the right reason (already bootstrapped)" \
+  || bad "refusal reason" "$(tail -3 /tmp/semaphore-disp-bootstrap2.log | tr '\n' ' ')"
+
+echo
+echo "── 1e. STAGE 2: re-run the role, which now converges ──"
+run_role "$PORT1" /tmp/semaphore-disp-1b.log
+rc1b=$?
+if [ $rc1b -ne 0 ]; then
+  bad "stage 2 converges once an administrator exists" "exit $rc1b"
+  tail -30 /tmp/semaphore-disp-1b.log | sed 's/^/           /'
+  exit 1
+fi
+ok "stage 2 converged (exit 0)"
+DISPOSABLE_PID=$(disposable_pid)
+[ -n "$DISPOSABLE_PID" ] && ok "a disposable Semaphore is running (pid $DISPOSABLE_PID)" \
+  || bad "a disposable Semaphore is running" "no process under $ROOT"
+[ -f "$PLIST" ] && ok "the launchd plist rendered into the prefix" \
+  || bad "plist rendered" "$PLIST missing"
+
+if [ "$WITH_ACCOUNT" = yes ]; then
+  # ⚠️ CHECKED IN STAGE 2, BECAUSE STAGE 1 STARTS NOTHING. The effective uid
+  # of the RUNNING process is the only proof the launchd job actually
+  # adopted the disposable identity rather than merely naming it.
   SVC_PID=$(pgrep -f "$ROOT/sbin/semaphore" | head -1)
   if [ -n "$SVC_PID" ]; then
     SVC_OWNER=$(ps -o user= -p "$SVC_PID" | tr -d ' ')

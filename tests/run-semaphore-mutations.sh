@@ -413,6 +413,18 @@ expect_red semaphore-harness-integrity.yml '_semt account survives|sweeps for st
            "a gate that does not sweep for stray identities is caught"
 
 restore
+# ⚠️ THE DIVERGENCE THAT COST A CONTROLLER RUN: the Linux harness was
+# updated for the two-stage flow and the macOS one was not.
+perl -pi -e 's{stage 1 stopped, as it must without an administrator}{the role converged}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'two-stage|stage 1 stop' \
+           "a macOS harness that has not learned the two-stage flow is caught"
+
+restore
+perl -ni -e 'print unless /bootstrap-driver\.py/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'two-stage|bootstrap' \
+           "a macOS harness that never drives the interactive bootstrap is caught"
+
+restore
 # ⚠️ FOUND BY THE CONTROLLER GATE. $TMPDIR is drwx------ and per-user on
 # macOS, so a service account cannot traverse it to reach the binary.
 perl -pi -e 's{mktemp -d /private/tmp/semaphore-disposable\.XXXXXX}{mktemp -d -t semaphore-disposable.XXXXXX}' "$MACOS_SH"
