@@ -1,0 +1,110 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# SQLITE: MIGRATE, THEN LOCK DOWN.
+#
+# ⚠️ SQLITE RUNS IN WAL MODE — verified against the real binary, which leaves
+# `semaphore.db-wal` and `semaphore.db-shm` beside the database. Two
+# consequences this role has to respect:
+#
+#   1. The database is THREE files, not one. Permissions must be applied to
+#      all of them, or the sidecars stay world-readable and leak content.
+#   2. Copying semaphore.db alone while the service is running yields a
+#      database missing everything still in the WAL. That is why backup.yml
+#      uses `VACUUM INTO` rather than a file copy.
+#
+# SQLite is deliberate for one controller and one operator, and it is meant
+# to remain replaceable: nothing outside this file and the config template
+# knows which engine is in use.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Has the database been initialised?
+  ansible.builtin.stat:
+    path: "{{ semaphore_db_path }}"
+  register: semaphore_db_stat
+  become: true
+
+- name: Run migrations
+  # ⚠️ RUN AS THE SERVICE ACCOUNT, so every file it creates is owned
+  # correctly from the start rather than being chowned afterwards. Running
+  # this as root creates a root-owned database the daemon then cannot write.
+  #
+  # ⚠️ IDEMPOTENT UPSTREAM. `semaphore migrate` applies only outstanding
+  # migrations and is a no-op once current, so this runs every time and
+  # reports changed only on a first initialisation or a version bump.
+  ansible.builtin.command:
+    cmd: "{{ semaphore_bin_link }} migrate --config {{ semaphore_config_path }}"
+  become: true
+  become_user: "{{ semaphore_user }}"
+  register: semaphore_migrate
+  changed_when: >-
+    (not (semaphore_db_stat.stat.exists | default(false)))
+    or ('Executing migration' in (semaphore_migrate.stdout | default('')))
+
+- name: The database now exists
+  ansible.builtin.stat:
+    path: "{{ semaphore_db_path }}"
+  register: semaphore_db_after
+  become: true
+
+- name: Migration must have produced a database
+  ansible.builtin.assert:
+    that:
+      - semaphore_db_after.stat.exists
+      - semaphore_db_after.stat.size > 0
+    fail_msg: >-
+      {{ semaphore_db_path }} does not exist or is empty after running
+      migrations. Nothing will start against it.
+    success_msg: "Database initialised at {{ semaphore_db_path }}."
+
+- name: The database and its WAL sidecars are private to the service account
+  # ⚠️ UPSTREAM CREATES THESE 0644. Verified: a freshly migrated database is
+  # world-readable, and so are -wal and -shm. The database holds the
+  # administrator's password hash and every stored credential's ciphertext;
+  # none of it is any other local account's business.
+  # (enforced: tests/semaphore-service.yml, mutation "world-readable
+  #  database is caught")
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: "{{ semaphore_user }}"
+    group: "{{ semaphore_group }}"
+    mode: "0600"
+    state: file
+  loop:
+    - "{{ semaphore_db_path }}"
+    - "{{ semaphore_db_path }}-wal"
+    - "{{ semaphore_db_path }}-shm"
+  become: true
+  failed_when: false
+  changed_when: false
+
+- name: Install the first-administrator bootstrap helper
+  # ⚠️ INSTALLED, NEVER INVOKED BY THE ROLE. It is interactive by design:
+  # it refuses without a terminal, turns echo off, and hands the password to
+  # `semaphore setup` on stdin. A converging role must not run it — see
+  # tasks/admin.yml for why the role cannot create a user at all.
+  ansible.builtin.template:
+    src: semaphore-bootstrap-admin.sh.j2
+    dest: "{{ semaphore_bin_link | dirname }}/semaphore-bootstrap-admin"
+    owner: root
+    group: "{{ semaphore_group }}"
+    mode: "0750"
+  become: true
+
+- name: Install the backup command
+  # Role-owned, but NOT scheduled. Installing a scheduler is a separate,
+  # separately-authorised milestone; this just makes a correct backup one
+  # command rather than an improvised `cp`.
+  #
+  # ⚠️ GROUP-OWNED BY THE SERVICE ACCOUNT, NOT root:root. The backup has to
+  # run AS the service account — it is the only identity that can read a
+  # 0600 service-owned database — and root:root 0750 denies it:
+  #     sudo: unable to execute .../semaphore-backup: Permission denied
+  # Found by the Linux harness. 0750 with the service group keeps it to root
+  # and the service account, and off limits to every other local user.
+  ansible.builtin.template:
+    src: semaphore-backup.sh.j2
+    dest: "{{ semaphore_bin_link | dirname }}/semaphore-backup"
+    owner: root
+    group: "{{ semaphore_group }}"
+    mode: "0750"
+  become: true

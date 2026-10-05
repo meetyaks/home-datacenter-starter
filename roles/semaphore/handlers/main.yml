@@ -1,0 +1,24 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  become: true
+  listen: Reload systemd
+
+- name: Restart Semaphore
+  # ⚠️ THE HANDLER THAT MUST RUN BEFORE VERIFICATION, NOT AFTER IT. Ansible
+  # defers notified handlers to the end of the play, so without an explicit
+  # `meta: flush_handlers` in tasks/main.yml the verify step interrogates the
+  # process still running the OLD configuration and passes — which is exactly
+  # the defect that cost the CoreDNS rollout its sixth watched deployment.
+  # (enforced: tests/semaphore-task-shape.yml "handlers are flushed before
+  #  anything verifies the service", and the RED/GREEN pair in
+  #  tests/run-semaphore-linux.sh)
+  ansible.builtin.command:
+    cmd: >-
+      {{ ('launchctl kickstart -k system/' ~ semaphore_launchd_label)
+         if semaphore_is_darwin | bool
+         else 'systemctl restart semaphore' }}
+  become: true
+  listen: Restart Semaphore
+  changed_when: true

@@ -1,0 +1,41 @@
+{#
+  Semaphore configuration. Rendered 0600, owned by the service account.
+
+  ⚠️ THE SCHEMA IS UPSTREAM'S, READ FROM util/config.go AT v2.19.12 — not
+  copied from a blog post. Every key below exists there with these exact json
+  tags, and the ones that matter were exercised against the real binary on
+  2026-10-04 before this template was written.
+
+  ⚠️ THREE OF THESE VALUES ARE SECRETS and this file is the only place they
+  land on disk. It is mode 0600 and owned by the service account; the task
+  that renders it sets no_log. Nothing here is printed by any test.
+
+  ⚠️ `interface` + `port` ARE THE ENTIRE EXPOSURE MODEL. Upstream puts
+  interface "in front of the port", so 127.0.0.1 + :3000 binds loopback only.
+  Verified: the running process holds 127.0.0.1:<port> and nothing on
+  0.0.0.0.
+
+  ⚠️ `sqlite.host` IS A FILE PATH, despite the key name. Upstream reuses the
+  DbConfig struct across mysql/postgres/sqlite, so the path goes in `host`.
+#}
+{
+  "dialect": "sqlite",
+  "sqlite": {
+    "host": "{{ semaphore_db_path }}"
+  },
+
+  "interface": "{{ semaphore_interface }}",
+  "port": ":{{ semaphore_port }}",
+
+  {# Ephemeral repository clones and task workspaces. Under the state
+     directory, never /tmp: macOS prunes /tmp and other users can read it. #}
+  "tmp_path": "{{ semaphore_tmp_path }}",
+
+  {# cmd_git uses the system git binary, which is what platform.yml resolved
+     and what the daemon's PATH provides. #}
+  "git_client": "cmd_git",
+
+  "cookie_hash": "{{ semaphore_cookie_hash }}",
+  "cookie_encryption": "{{ semaphore_cookie_encryption }}",
+  "access_key_encryption": "{{ semaphore_access_key_encryption }}"
+}

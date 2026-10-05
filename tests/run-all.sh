@@ -383,4 +383,36 @@ else
 fi
 
 echo
+echo "══ SEMAPHORE — pin, exposure, identity, secrets, authority ════════"
+ansible-playbook tests/semaphore-config.yml
+
+echo
+echo "══ SEMAPHORE — task shape, no_log, flush order ════════════════════"
+ansible-playbook tests/semaphore-task-shape.yml
+
+echo
+echo "══ SEMAPHORE — the harnesses are still harnesses ══════════════════"
+ansible-playbook tests/semaphore-harness-integrity.yml
+
+echo
+echo "══ SEMAPHORE — the role EXECUTED on Linux, end to end ═════════════"
+# ⚠️ THE ONLY SUITE THAT RUNS THE ROLE. Needs Docker and native amd64; on an
+# Apple Silicon workstation it skips loudly and runs for real in CI.
+tests/run-semaphore-linux.sh
+
+echo
+echo "══ SEMAPHORE — RED: the same role WITHOUT the handler flush ═══════"
+tests/run-semaphore-linux.sh --red
+
+echo
+echo "══ SEMAPHORE — the role EXECUTED on macOS launchd, disposably ═════"
+# ⚠️ OPERATOR-RUN, ON THE MANAGEMENT NODE, beside the live resolver. Skips
+# on Linux. It does NOT create a service account — see the script header.
+tests/run-semaphore-launchd.sh
+
+echo
+echo "══ SEMAPHORE mutations — every guard is proved to fail ════════════"
+tests/run-semaphore-mutations.sh
+
+echo
 echo "All regression suites passed."

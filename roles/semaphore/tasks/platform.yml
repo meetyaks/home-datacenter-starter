@@ -1,0 +1,101 @@
+---
+# Platform identification, and a refusal for anything this role has no
+# verified pin for. Runs before every other include.
+
+- name: Identify the platform
+  ansible.builtin.set_fact:
+    semaphore_is_darwin: "{{ ansible_facts['system'] | lower == 'darwin' }}"
+    semaphore_platform: >-
+      {{ (ansible_facts['system'] | lower) ~ '_' ~
+         ({'x86_64': 'amd64', 'amd64': 'amd64', 'arm64': 'arm64',
+           'aarch64': 'arm64'}[ansible_facts['architecture'] | lower]
+          | default(ansible_facts['architecture'] | lower)) }}
+
+- name: Refuse a platform this role has no verified pin for
+  # ⚠️ `.get()`, NOT A SUBSCRIPT. A bare `semaphore_checksums[platform]`
+  # raises a Jinja error instead of printing this message, so the operator
+  # sees "'dict object' has no attribute 'linux_arm64'" rather than being
+  # told which platforms are supported. The CoreDNS role shipped exactly that
+  # bug and its own harness found it on the first real run.
+  ansible.builtin.assert:
+    that:
+      - (semaphore_checksums.get(semaphore_platform, '')) | length == 64
+      - (semaphore_artifacts.get(semaphore_platform, '')) | length > 0
+    fail_msg: >-
+      This role has no verified artifact for "{{ semaphore_platform }}".
+      Pinned platforms: {{ semaphore_checksums.keys() | list | join(', ') }}.
+      Adding one means downloading the artifact, comparing it against the
+      official checksum file for v{{ semaphore_version }}, running it to read
+      the version string back, and recording all three in defaults/main.yml —
+      not guessing a URL.
+    success_msg: >-
+      {{ semaphore_platform }} is pinned at
+      {{ (semaphore_checksums[semaphore_platform])[:12] }}… for Semaphore
+      {{ semaphore_version }} ({{ semaphore_edition }}).
+
+- name: The listener must be loopback, and the port must be a port
+  # ⚠️ THE EXPOSURE MODEL IS ONE LINE OF CONFIG. Semaphore has no
+  # authentication in front of it beyond its own login, no TLS here and no
+  # reverse proxy; binding anything but loopback publishes an operator
+  # console that can run playbooks to the whole LAN. Checked on the host as
+  # well as in tests/semaphore-config.yml, because a host variable could
+  # override the default.
+  ansible.builtin.assert:
+    that:
+      - semaphore_interface == '127.0.0.1'
+      - (semaphore_port | int) > 1024
+      - (semaphore_port | int) < 65536
+    fail_msg: >-
+      interface={{ semaphore_interface }} port={{ semaphore_port }} —
+      this milestone binds 127.0.0.1 only, on an unprivileged port. A LAN
+      listener needs the separate TLS and semaphore.dc1.lan decision first.
+    success_msg: "Listener will be {{ semaphore_interface }}:{{ semaphore_port }}."
+
+- name: No Semaphore path may sit inside a human home directory
+  # State in /Users/<someone> is state that disappears with an account, is
+  # backed up by the wrong tool, and is readable by that person's processes.
+  ansible.builtin.assert:
+    that:
+      - not (semaphore_state_dir is search('^/Users/'))
+      - not (semaphore_conf_dir is search('^/Users/'))
+      - not (semaphore_log_dir is search('^/Users/'))
+      - not (semaphore_libexec_dir is search('^/Users/'))
+      - not (semaphore_tmp_path is search('^/tmp/'))
+    fail_msg: >-
+      A Semaphore path points into a user home or /tmp:
+      state={{ semaphore_state_dir }} conf={{ semaphore_conf_dir }}
+      log={{ semaphore_log_dir }} libexec={{ semaphore_libexec_dir }}
+      tmp={{ semaphore_tmp_path }}. Durable state belongs in
+      /usr/local/var, not in a home directory and not in /tmp, which macOS
+      prunes.
+    success_msg: "All paths are outside user homes and outside /tmp."
+
+# ── THE TOOLS A DAEMON CANNOT FIND FOR ITSELF ───────────────────────────────
+#
+# ⚠️ launchd SOURCES NO SHELL PROFILE. The operator's interactive PATH —
+# Homebrew included — does not exist for this process, so Semaphore would
+# install cleanly and then fail on its first job with "executable not found".
+# Each tool is resolved here, on the real host, and the result is asserted.
+- name: Find the executables Semaphore will shell out to
+  ansible.builtin.command:
+    cmd: "/usr/bin/env PATH={{ semaphore_path_entries | join(':') }} which {{ item }}"
+  loop: "{{ semaphore_required_tools }}"
+  register: semaphore_tool_probe
+  changed_when: false
+  failed_when: false
+
+- name: Every required executable must be on the service PATH
+  ansible.builtin.assert:
+    that:
+      - (semaphore_tool_probe.results | selectattr('rc', 'ne', 0) | list | length) == 0
+    fail_msg: >-
+      Not on the service PATH:
+      {{ semaphore_tool_probe.results | selectattr('rc', 'ne', 0)
+         | map(attribute='item') | list | join(', ') }}.
+      The daemon's PATH is {{ semaphore_path_entries | join(':') }} and it
+      inherits nothing from a login shell. Either install the tool somewhere
+      on that list or add its directory to semaphore_path_entries — do not
+      rely on the interactive PATH, which this process never sees.
+    success_msg: >-
+      All of {{ semaphore_required_tools | join(', ') }} resolve on the
+      service PATH.

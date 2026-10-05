@@ -1,0 +1,155 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# THE PINNED BINARY, VERIFIED BEFORE IT IS INSTALLED.
+#
+# Versioned directory + stable symlink. The daemon always starts
+# /usr/local/sbin/semaphore; that link points at one immutable versioned
+# directory. An upgrade adds a directory and re-points the link; a rollback
+# re-points it back, because the previous version is still on disk.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Create the directories this role installs into
+  # ⚠️ FIRST, AND ALL THREE IN ONE TASK. `copy` and `unarchive` will not
+  # create a missing destination — the CoreDNS rollout lost a deployment to
+  # exactly that ("Destination directory /usr/local/sbin does not exist"),
+  # because nothing creates /usr/local/sbin on a stock macOS. Everything
+  # after this point assumes these exist.
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: "{{ 'wheel' if semaphore_is_darwin | bool else 'root' }}"
+    mode: "0755"
+  loop:
+    - "{{ semaphore_libexec_dir }}"
+    - "{{ semaphore_versioned_dir }}"
+    - "{{ semaphore_bin_link | dirname }}"
+  become: true
+
+- name: Is the pinned version already installed?
+  ansible.builtin.stat:
+    path: "{{ semaphore_versioned_dir }}/semaphore"
+  register: semaphore_installed_binary
+
+- name: Install the pinned release
+  when: not (semaphore_installed_binary.stat.exists | default(false))
+  block:
+    - name: Stage the download
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: semaphore-install
+      register: semaphore_stage
+      changed_when: false
+
+    - name: Download the artifact and verify it against the pinned checksum
+      # ⚠️ THE CHECKSUM IS THE POINT. `get_url` compares before the file is
+      # usable, so a corrupted or substituted artifact never reaches the
+      # install step. The digest comes from the official checksum file
+      # published in the same release and was independently recomputed.
+      ansible.builtin.get_url:
+        url: "{{ semaphore_release_base }}/{{ semaphore_artifacts[semaphore_platform] }}"
+        dest: "{{ semaphore_stage.path }}/semaphore.tgz"
+        checksum: "sha256:{{ semaphore_checksums[semaphore_platform] }}"
+        mode: "0600"
+        timeout: 120
+
+    # ⚠️ PLATFORM-SPLIT EXTRACTION, AND GNU TAR WAS DELIBERATELY NOT
+    # INSTALLED. `ansible.builtin.unarchive` inspects /usr/bin/tar, finds
+    # bsdtar on macOS and refuses — "detected as tar type bsd. GNU tar
+    # required" — even though bsdtar extracts this archive perfectly well.
+    # The CoreDNS rollout hit this on its first real deployment. Installing
+    # GNU tar would make Homebrew a prerequisite of the controller's own
+    # control plane, which was rejected there and is rejected here.
+    - name: Unpack it (macOS, with the tar the platform ships)
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/tar
+          - -xzf
+          - "{{ semaphore_stage.path }}/semaphore.tgz"
+          - -C
+          - "{{ semaphore_stage.path }}"
+      changed_when: true
+      when: semaphore_is_darwin | bool
+
+    - name: Unpack it (Linux)
+      ansible.builtin.unarchive:
+        src: "{{ semaphore_stage.path }}/semaphore.tgz"
+        dest: "{{ semaphore_stage.path }}"
+        remote_src: true
+      when: not (semaphore_is_darwin | bool)
+
+    - name: Extraction must have produced a real binary
+      # Without this, a silent extraction failure reaches `copy` and reports
+      # "Source ... not found" — the symptom, not the cause, diagnosed in
+      # front of a control plane that will not start.
+      ansible.builtin.stat:
+        path: "{{ semaphore_stage.path }}/semaphore"
+      register: semaphore_extracted
+
+    - name: Confirm it before installing it
+      ansible.builtin.assert:
+        that:
+          - semaphore_extracted.stat.exists
+          - semaphore_extracted.stat.isreg
+        fail_msg: >-
+          Extraction did not produce a regular file at
+          {{ semaphore_stage.path }}/semaphore. The archive layout may have
+          changed between releases; check the pinned artifact before
+          adjusting anything else.
+        success_msg: "Extraction produced the expected binary."
+
+    - name: Install it into its versioned directory
+      ansible.builtin.copy:
+        src: "{{ semaphore_stage.path }}/semaphore"
+        dest: "{{ semaphore_versioned_dir }}/semaphore"
+        remote_src: true
+        owner: root
+        group: "{{ 'wheel' if semaphore_is_darwin | bool else 'root' }}"
+        mode: "0755"
+      become: true
+      notify: Restart Semaphore
+
+  always:
+    - name: Remove the staging directory
+      ansible.builtin.file:
+        path: "{{ semaphore_stage.path }}"
+        state: absent
+      when: semaphore_stage.path is defined
+      changed_when: false
+
+- name: Ask the installed binary what it is
+  # ⚠️ A CHECKSUM PROVES WHAT WAS DOWNLOADED, NOT WHAT IS INSTALLED. This is
+  # the only check that catches a binary replaced after installation, or the
+  # wrong edition installed from a correct-looking URL — the standard build
+  # reports ...244 where the community build reports ...239.
+  ansible.builtin.command:
+    cmd: "{{ semaphore_versioned_dir }}/semaphore version"
+  register: semaphore_version_probe
+  changed_when: false
+
+- name: It must be exactly the pinned version and edition
+  ansible.builtin.assert:
+    that:
+      - (semaphore_version_probe.stdout | trim) == semaphore_expected_version
+    fail_msg: >-
+      The installed binary reports
+      "{{ semaphore_version_probe.stdout | trim }}" but
+      "{{ semaphore_expected_version }}" was pinned. That is a different
+      build — possibly the Pro edition, possibly a different release.
+    success_msg: >-
+      Installed binary reports {{ semaphore_version_probe.stdout | trim }}.
+
+- name: Point the stable link at this version
+  # ⚠️ ATOMIC, VIA force. `file: state=link` with force replaces the link in
+  # one operation rather than removing and recreating it, so there is no
+  # instant where /usr/local/sbin/semaphore does not exist — which matters
+  # because launchd's KeepAlive could try to start the daemon in that gap.
+  ansible.builtin.file:
+    src: "{{ semaphore_versioned_dir }}/semaphore"
+    dest: "{{ semaphore_bin_link }}"
+    state: link
+    force: true
+    owner: root
+    group: "{{ 'wheel' if semaphore_is_darwin | bool else 'root' }}"
+  become: true
+  notify: Restart Semaphore
