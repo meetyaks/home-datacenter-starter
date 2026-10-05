@@ -32,10 +32,11 @@ INSTALL=roles/semaphore/tasks/install.yml
 VERIFY=roles/semaphore/tasks/verify.yml
 LINUX_SH=tests/run-semaphore-linux.sh
 MACOS_SH=tests/run-semaphore-launchd.sh
+GATE_SH=tests/run-dc1-semaphore-gate.sh
 
 FILES=("$DEFAULTS" "$CONFIG_TPL" "$PLIST_TPL" "$BACKUP_TPL" "$BOOTSTRAP_TPL" "$MAIN" "$PREFLIGHT"
        "$ACCOUNT" "$CONFIGURE" "$DATABASE" "$ADMIN" "$INSTALL" "$VERIFY"
-       "$LINUX_SH" "$MACOS_SH")
+       "$LINUX_SH" "$MACOS_SH" "$GATE_SH")
 
 WORK=$(mktemp -d -t semaphore-mutations.XXXXXX)
 restore() {
@@ -318,6 +319,98 @@ restore
 perl -ni -e 'print unless /VACUUM INTO/' "$BACKUP_TPL"
 expect_red semaphore-harness-integrity.yml 'VACUUM INTO|live-file copy|WAL' \
            "a backup that blindly copies a live WAL database is caught"
+
+echo
+echo "── the macOS account lifecycle ──"
+restore
+perl -pi -e 's{tests/run-semaphore-launchd\.sh --with-account}{tests/run-semaphore-launchd.sh}' "$GATE_SH"
+expect_red semaphore-harness-integrity.yml 'with-account|account path' \
+           "a gate that skips the account-management path is caught"
+
+restore
+perl -pi -e 's{^  TEST_USER="_semt\$\(openssl rand -hex 4\)"$}{  TEST_USER="_semaphore"}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml '_semt|PRODUCTION' \
+           "a gate that would use the PRODUCTION account name is caught"
+
+restore
+perl -ni -e 'print unless /refusing: generated the PRODUCTION name/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'PRODUCTION name|disposable identity' \
+           "removing the production-name refusal from creation is caught"
+
+restore
+perl -ni -e 'print unless /REFUSING: that is the PRODUCTION account/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'PRODUCTION account|disposable identity' \
+           "removing the production-name refusal from deletion is caught"
+
+restore
+# ⚠️ WITHOUT THE RECORDED SETS THE COLLISION CHECK IS VACUOUS: a uid is
+# "free" only relative to what was in use beforehand.
+perl -ni -e 'print unless /^  UIDS_BEFORE=/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'UIDS_BEFORE|Directory Services' \
+           "dropping the recorded UID set is caught"
+
+restore
+perl -ni -e 'print unless /^  GIDS_BEFORE=/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'GIDS_BEFORE|Directory Services' \
+           "dropping the recorded GID set is caught"
+
+restore
+perl -ni -e 'print unless /dsmemberutil checkmembership -U "\$TEST_USER" -G admin/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'admin|Directory Services' \
+           "not checking admin membership is caught"
+
+restore
+perl -ni -e 'print unless /dsmemberutil checkmembership -U "\$TEST_USER" -G wheel/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'wheel|Directory Services' \
+           "not checking wheel membership is caught"
+
+restore
+perl -pi -e 's{T_SHELL=\$\(dscl \. -read "/Users/\$TEST_USER" UserShell}{T_SHELL=\$(echo skip}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'UserShell|Directory Services' \
+           "not checking the login shell is caught"
+
+restore
+perl -pi -e 's{dscl \. -read "/Users/\$TEST_USER" AuthenticationAuthority}{true}g' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'AuthenticationAuthority|Directory Services' \
+           "not checking for a usable password is caught"
+
+restore
+perl -pi -e 's{IsHidden=\$\{T_HIDDEN:-unset\}}{hidden-unchecked}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'IsHidden|Directory Services' \
+           "dropping the hidden-account proof is caught"
+
+restore
+# ⚠️ ORDER: files must go while the identity still resolves, or they are
+# left owned by a uid that no longer exists.
+# ⚠️ THE BLOCK IS MOVED, NOT DELETED. Deleting it would make the ordering
+# assertion fail with a Jinja index error — a failure for the wrong reason.
+# Swapping the marker comment inverts the documented order while leaving
+# both operations present, which is exactly the defect being modelled.
+perl -pi -e 's{^  \# ── STEP 4: FILES FIRST, WHILE THE IDENTITY STILL RESOLVES ──+$}{  # ── STEP 4: identity first (WRONG ORDER) ──}' "$MACOS_SH"
+perl -0pi -e 's{(  case "\$ROOT" in\n    /\*/semaphore-disposable\.\*\) tsudo rm -rf "\$ROOT" \&\& echo "  removed \$ROOT" ;;\n    \*\) echo "  REFUSING to remove unexpected path: \$ROOT" ;;\n  esac\n)}{}s' "$MACOS_SH"
+perl -0pi -e 's{(      tsudo dscacheutil -flushcache >/dev/null 2>&1\n)}{$1      case "\$ROOT" in\n        /*/semaphore-disposable.*) tsudo rm -rf "\$ROOT" \&\& echo "  removed \$ROOT" ;;\n        *) echo "  REFUSING to remove unexpected path: \$ROOT" ;;\n      esac\n}s' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'FILES BEFORE THE IDENTITY|BEFORE the user record' \
+           "deleting the account before its files is caught"
+
+restore
+perl -ni -e 'print unless /dscacheutil -flushcache/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'flushcache|exact records' \
+           "skipping the directory-service cache flush is caught"
+
+restore
+perl -ni -e 'print unless /id \$TEST_USER no longer resolves/' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'no longer resolves|exact records' \
+           "teardown that does not prove the identity is gone is caught"
+
+restore
+perl -pi -e 's{tsudo dscl \. -delete "/Users/\$TEST_USER"}{tsudo pkill -f "_semt"; tsudo dscl . -delete "/Users/\$TEST_USER"}' "$MACOS_SH"
+expect_red semaphore-harness-integrity.yml 'prefix or pattern|pkill' \
+           "teardown matching an account by broad pattern is caught"
+
+restore
+perl -ni -e 'print unless /no disposable _semt account survives/' "$GATE_SH"
+expect_red semaphore-harness-integrity.yml '_semt account survives|sweeps for strays' \
+           "a gate that does not sweep for stray identities is caught"
 
 echo
 echo "── everything is restored ──"

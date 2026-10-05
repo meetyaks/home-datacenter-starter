@@ -172,6 +172,86 @@
         backup_code: >-
           {{ backup | regex_replace('(?m)^\s*#.*$', '') }}
 
+    # ── THE macOS ACCOUNT LIFECYCLE ────────────────────────────────────────
+    - name: THE ACCOUNT GATE USES A DISPOSABLE IDENTITY, NEVER PRODUCTION'S
+      # ⚠️ THE WORST OUTCOME OF THIS TEST IS AN ORPHANED ACCOUNT, and the
+      # second worst is touching `_semaphore`. The name is generated per
+      # run, validated against an exact pattern, and production's name is
+      # refused explicitly in both creation and deletion.
+      ansible.builtin.assert:
+        that:
+          - macos is search('TEST_USER="_semt\$\(openssl rand -hex 4\)"')
+          # Quoted: an unquoted item containing ": " parses as a mapping.
+          - "macos is search('refusing: generated the PRODUCTION name')"
+          - "macos is search('REFUSING: that is the PRODUCTION account')"
+          - macos is search('_semaphore remains absent')
+        fail_msg: >-
+          The account gate must generate a per-run `_semt<hex>` identity and
+          refuse production's name both when creating and when deleting. An
+          orphaned account, or any change to _semaphore, is the worst
+          residue this test can leave.
+        success_msg: "The disposable identity is generated, validated and never _semaphore."
+
+    - name: THE ACCOUNT IS MEASURED FROM DIRECTORY SERVICES, NOT INFERRED
+      # Greping a task name or a comment would prove the role *says* it
+      # creates a hidden non-admin account. Only dscl and dsmemberutil prove
+      # it did.
+      ansible.builtin.assert:
+        that:
+          - macos is search('dscl \. -read "/Users/\$TEST_USER" UniqueID')
+          - macos is search('dscl \. -read "/Groups/\$TEST_GROUP" PrimaryGroupID')
+          - macos is search('dsmemberutil checkmembership -U "\$TEST_USER" -G admin')
+          - macos is search('dsmemberutil checkmembership -U "\$TEST_USER" -G wheel')
+          - macos is search('T_SHELL=\\$\\(dscl')
+          - macos is search('\"/Users/\\$TEST_USER\" AuthenticationAuthority')
+          # ⚠️ HIDDEN MEANS IsHidden=1 *OR* uid<500. `_www`, a real macOS
+          # service account, has no IsHidden key at all and is still hidden;
+          # asserting the key alone would reject a correct account.
+          - macos is search('IsHidden=\$\{T_HIDDEN:-unset\}')
+          - macos is search('UIDS_BEFORE=\\$\\(dscl')
+          - macos is search('GIDS_BEFORE=\\$\\(dscl')
+        fail_msg: >-
+          The account checks must read UniqueID, PrimaryGroupID, UserShell,
+          AuthenticationAuthority and admin/wheel membership from Directory
+          Services, and must prove the allocated UID and GID were free by
+          comparing against sets captured beforehand.
+        success_msg: "Account properties are measured from Directory Services."
+
+    - name: ACCOUNT TEARDOWN REMOVES FILES BEFORE THE IDENTITY
+      # ⚠️ ORDER IS THE PROPERTY. Deleting the account first leaves files
+      # owned by a uid that no longer resolves — orphaned ownership a later
+      # account could silently inherit.
+      ansible.builtin.assert:
+        that:
+          - macos is search('FILES FIRST, WHILE THE IDENTITY STILL RESOLVES')
+          - (macos.index('tsudo rm -rf "$ROOT"')) < (macos.index('dscl . -delete "/Users/$TEST_USER"'))
+          - (macos.index('dscl . -delete "/Users/$TEST_USER"')) < (macos.index('dscl . -delete "/Groups/$TEST_GROUP"'))
+          - macos is search('dscacheutil -flushcache')
+          - macos is search('id \$TEST_USER no longer resolves')
+          - not (macos is search('pkill[^\\n]*semt'))
+          - not (macos is search('dscl \. -delete "/Users/_sem\*'))
+        fail_msg: >-
+          Teardown must remove the disposable files BEFORE the user record,
+          then the user, then the group, then flush the cache and prove none
+          of them resolves. It must never match an account by prefix or
+          pattern.
+        success_msg: "Teardown removes files first, then the exact records, and proves it."
+
+    - name: THE GATE RUNS THE ACCOUNT MODE, AND CHECKS FOR STRAY IDENTITIES
+      ansible.builtin.assert:
+        that:
+          - gate is search('run-semaphore-launchd\.sh --with-account')
+          - gate is search('no disposable _semt account survives')
+          - gate is search('no disposable _semt group survives')
+          - gate is search('no _semaphore service account was created')
+        fail_msg: >-
+          The controller gate must run the harness with --with-account —
+          otherwise the one thing the controller run exists to prove is
+          skipped — and must check afterwards for stray _semt records.
+        success_msg: "The gate exercises the account path and sweeps for strays."
+      vars:
+        gate: "{{ lookup('file', '../tests/run-dc1-semaphore-gate.sh') }}"
+
     - name: Done
       ansible.builtin.debug:
         msg: >-

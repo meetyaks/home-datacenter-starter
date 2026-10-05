@@ -172,7 +172,11 @@ hdr "PHASE 4  execute tests/run-semaphore-launchd.sh from the worktree"
 echo "  (three role runs; expect three BECOME prompts)"
 echo
 cd "$WT" || die "cannot enter the worktree"
-tests/run-semaphore-launchd.sh 2>&1 | tee "$EVID/harness.log"
+# ⚠️ --with-account: THE GATE EXERCISES THE REAL PRODUCTION ACCOUNT PATH.
+# A disposable `_semt<hex>` identity is created, measured from Directory
+# Services and removed exactly. Running the gate WITHOUT this flag would
+# skip the one thing the controller run exists to prove.
+tests/run-semaphore-launchd.sh --with-account 2>&1 | tee "$EVID/harness.log"
 HARNESS_RC=${PIPESTATUS[0]}
 cd "$CANON" || die "cannot return to $CANON"
 echo
@@ -229,6 +233,13 @@ check_clean "no PRODUCTION semaphore daemon was created" \
 check_clean "no production Semaphore paths were created" \
   "$(ls -d /usr/local/etc/semaphore /usr/local/var/lib/semaphore 2>/dev/null)"
 check_clean "no _semaphore service account was created" "$(id _semaphore 2>/dev/null)"
+# ⚠️ AND NO DISPOSABLE IDENTITY SURVIVED EITHER. The gate runs with
+# --with-account, so a real account existed during the run; an orphaned
+# `_semt*` record is the worst residue this test can leave.
+check_clean "no disposable _semt account survives" \
+  "$(dscl . -list /Users 2>/dev/null | grep '^_semt' | tr '\n' ' ')"
+check_clean "no disposable _semt group survives" \
+  "$(dscl . -list /Groups 2>/dev/null | grep '^_semt' | tr '\n' ' ')"
 
 hdr "PHASE 6  repository integrity"
 git worktree remove --force "$WT" 2>/dev/null && echo "  removed worktree $WT" \
