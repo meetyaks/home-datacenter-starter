@@ -7,10 +7,21 @@ relies on — and nothing else:
   worker   a long-running process
   migrator `node dist/ops/migrate.mjs [--status]` with the real migrator's
            output lines and exit codes (db/migrate.ts), applying real SQL to
-           the real PostgreSQL, one transaction per migration
+           the real PostgreSQL, one transaction per migration. Two kinds
+           (TW_STANDIN_MIGRATOR):
+             plain    batches 1-5: no checksums, no floor, no verdict
+             verdict  batch 7+: checksums (sha256 of the file text), the
+                      rollback floor in public._tw_schema_meta, refusals with
+                      the real codes, `--adopt-legacy-checksums`, and the
+                      `verdict:` last line of --status (db/client.ts
+                      migrationStatus/schemaVerdict/ensureMigrated). Unlike
+                      the application it does not verify the legacy history
+                      before adopting; the role never adopts, so that half
+                      is out of scope here.
 Version v5bad's web prints SYNTHETIC secret-shaped lines and exits, so the
 role's failure diagnostics can be tested for leaks.
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -20,7 +31,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROLE = os.environ.get("TW_STANDIN_ROLE", "")
 VERSION = os.environ.get("TW_STANDIN_VERSION", "")
-MIGRATIONS = "/app/dist/ops/migrations"
+MIGRATOR = os.environ.get("TW_STANDIN_MIGRATOR", "plain")
+FLOOR = os.environ.get("TW_STANDIN_FLOOR", "")
+MIGRATIONS = "/app/db/migrations"
 
 
 def serve(port, routes):
@@ -79,8 +92,145 @@ def migrate(status_only):
     return 0
 
 
+class DbError(Exception):
+    pass
+
+
+def q(sql):
+    """Rows of a query, columns separated by |; DbError on any failure."""
+    r = psql(["-At", "-F", "|", "-c", sql])
+    if r.returncode != 0:
+        lines = r.stderr.strip().splitlines()
+        raise DbError(lines[-1].split("ERROR:", 1)[-1].strip() if lines else "cannot connect")
+    return [line for line in r.stdout.splitlines() if line != ""]
+
+
+def checksum(name):
+    text = open(os.path.join(MIGRATIONS, name), encoding="utf-8").read().replace("\r\n", "\n")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def verdict_state():
+    t, meta, has = (x == "t" for x in q(
+        "SELECT to_regclass('public._tw_migrations') IS NOT NULL, to_regclass('public._tw_schema_meta') IS NOT NULL,"
+        " EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public'"
+        " AND table_name = '_tw_migrations' AND column_name = 'checksum')")[0].split("|"))
+    rows = {}
+    if t and has:
+        for line in q("SELECT name, coalesce(checksum, '') FROM public._tw_migrations"):
+            name, c = line.split("|", 1)
+            rows[name] = c or None
+    elif t:
+        rows = {name: None for name in q("SELECT name FROM public._tw_migrations")}
+    floor = None
+    if meta:
+        r = q("SELECT value FROM public._tw_schema_meta WHERE key = 'rollback_floor'")
+        floor = r[0] if r else None
+    files = sorted(f for f in os.listdir(MIGRATIONS) if f.endswith(".sql"))
+    sums = {f: checksum(f) for f in files}
+    s = {"files": files, "sums": sums, "floor": floor, "head": files[-1] if files else None,
+         "pending": [f for f in files if f not in rows],
+         "unknown": sorted(n for n in rows if n not in sums),
+         "unverified": sorted(n for n, c in rows.items() if n in sums and c is None),
+         "mismatched": sorted(n for n, c in rows.items() if n in sums and c is not None and c != sums[n])}
+    s["below"] = bool(floor) and (not s["head"] or s["head"] < floor)
+    return s
+
+
+def verdict_of(s):
+    if s["below"]:
+        return "below_floor", f"this build ({s['head'] or 'none'}) is older than the rollback floor ({s['floor']}); deploy a build at or above it"
+    if s["mismatched"]:
+        return "mismatch", f"{len(s['mismatched'])} applied migration(s) differ from this build's files"
+    if s["unverified"]:
+        return "unverified", f"{len(s['unverified'])} applied migration(s) have no recorded checksum; run the migrate step with --adopt-legacy-checksums"
+    if s["pending"]:
+        return "pending", f"{len(s['pending'])} migration(s) pending; run the migrate step"
+    return None, None
+
+
+def fail(message, code):
+    print(f"migrate: FAILED — {message} [{code}]", file=sys.stderr)
+    return 1
+
+
+def migrate_verdict(status_only, adopt):
+    try:
+        if status_only:
+            s = verdict_state()
+            n = len(s["files"])
+            print(f"migrations: {n - len(s['pending'])}/{n} applied, {len(s['pending'])} pending")
+            for name in s["pending"]:
+                print(f"  pending {name}")
+            print(f"checksums: {len(s['mismatched'])} mismatched, {len(s['unverified'])} unverified"
+                  + (f"; {len(s['unknown'])} applied migration(s) newer than this build" if s["unknown"] else ""))
+            for name in s["mismatched"]:
+                print(f"  mismatched {name}")
+            for name in s["unverified"]:
+                print(f"  unverified {name}")
+            print(f"rollback floor: {s['floor'] or 'none'}; this build: {s['head'] or 'none'}")
+            reason, detail = verdict_of(s)
+            if reason:
+                print(f"not ready: database schema is not ready: {detail}")
+            print(f"verdict: {reason or 'ready'}")
+            return 1 if reason else 0
+        for ddl in ("CREATE TABLE IF NOT EXISTS public._tw_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)",
+                    "ALTER TABLE public._tw_migrations ADD COLUMN IF NOT EXISTS checksum TEXT",
+                    "ALTER TABLE public._tw_migrations ADD COLUMN IF NOT EXISTS checksum_origin TEXT",
+                    "ALTER TABLE public._tw_migrations ADD COLUMN IF NOT EXISTS checksum_recorded_at TEXT",
+                    "CREATE TABLE IF NOT EXISTS public._tw_schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)"):
+            q(ddl)
+        s = verdict_state()
+        if s["mismatched"]:
+            return fail(f"{len(s['mismatched'])} applied migration(s) differ from the file shipped with this build: "
+                        f"{', '.join(s['mismatched'])}. Nothing was changed.", "migration_checksum_mismatch")
+        if s["below"]:
+            return fail(f"this build's newest migration ({s['head'] or 'none'}) is older than the database's rollback floor "
+                        f"({s['floor']}). Nothing was changed.", "schema_below_rollback_floor")
+        adopted = []
+        if s["unverified"]:
+            if not adopt:
+                return fail(f"{len(s['unverified'])} applied migration(s) have no recorded checksum: {', '.join(s['unverified'])}. "
+                            "Run the migrate step once with --adopt-legacy-checksums. Nothing was changed.",
+                            "migration_checksum_unverified")
+            for name in s["unverified"]:
+                q(f"UPDATE public._tw_migrations SET checksum = '{s['sums'][name]}', checksum_origin = 'adopted',"
+                  f" checksum_recorded_at = now()::text WHERE name = '{name}' AND checksum IS NULL")
+            adopted = s["unverified"]
+        done = []
+        for name in s["pending"]:
+            sql = open(os.path.join(MIGRATIONS, name), encoding="utf-8").read()
+            r = psql(["-1", "-f", "-"], stdin=sql + "\nINSERT INTO public._tw_migrations(name, applied_at, checksum, checksum_origin,"
+                     f" checksum_recorded_at) VALUES ('{name}', now()::text, '{s['sums'][name]}', 'applied', now()::text);\n")
+            if r.returncode != 0:
+                err = next((line for line in r.stderr.splitlines() if "ERROR:" in line), r.stderr.strip())
+                return fail(f"migration {name} failed: {err.split('ERROR:', 1)[-1].strip()}", "migration_failed")
+            done.append(name)
+        floor = s["floor"]
+        if FLOOR and FLOOR in set(q("SELECT name FROM public._tw_migrations")) and (not floor or floor < FLOOR):
+            q("INSERT INTO public._tw_schema_meta(key, value, updated_at) VALUES ('rollback_floor', "
+              f"'{FLOOR}', now()::text) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at"
+              " WHERE public._tw_schema_meta.value < EXCLUDED.value")
+            floor = FLOOR
+    except DbError as e:
+        print(f"migrate: FAILED — {e}", file=sys.stderr)
+        return 1
+    if adopted:
+        print(f"checksums adopted for {len(adopted)} migration(s) applied before checksum tracking")
+        for name in adopted:
+            print(f"  adopted {name}")
+    print(f"migrations applied: {len(done)} new, {len(s['files']) - len(s['pending'])} already applied")
+    for name in done:
+        print(f"  applied {name}")
+    if floor:
+        print(f"rollback floor: {floor}")
+    return 0
+
+
 def main():
     if sys.argv[1] == "migrate":
+        if MIGRATOR == "verdict":
+            sys.exit(migrate_verdict("--status" in sys.argv, "--adopt-legacy-checksums" in sys.argv))
         sys.exit(migrate("--status" in sys.argv))
     if ROLE == "web":
         if VERSION == "v5bad":
