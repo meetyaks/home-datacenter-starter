@@ -1,10 +1,10 @@
 ---
-# Once the run is accepted, and before anything changes the deployment: the
-# staged target configuration becomes the live one (truewealth_env_file,
+# Only after the rollback-floor gate PROCEEDED: the staged target
+# configuration becomes the live one (truewealth_env_file,
 # truewealth_compose_file), which everything from here on — the recovery
 # point, migrate, `up`, the backup timer, an operator's `compose up`, a
-# restart after a reboot — uses. A run that stops earlier never gets here,
-# so the live files keep naming what is running.
+# restart after a reboot — uses. A refused run never gets here, so the live
+# files keep naming what is running.
 #
 # Unchanged content is not rewritten (an UNCHANGED re-run reports
 # changed=0).

@@ -41,6 +41,10 @@ truewealth_run_attempt: ""
 # production inventory must never.
 truewealth_accept_evidence_classes: [ci]
 truewealth_image_roles: [web, worker, compute, migrator]
+# Where the migrator image keeps its migrations (TrueWealth Dockerfile,
+# migrator stage: /app/db/migrations). The rollback-floor gate lists it to
+# find the target build's newest migration (tasks/gate.yml).
+truewealth_migrator_migrations_dir: /app/db/migrations
 
 # ── Layout under /srv/data/services/truewealth ─────────────────────────────
 truewealth_root: /srv/data/services/truewealth
@@ -67,10 +71,11 @@ truewealth_compose_cmd: >-
   docker compose --project-name {{ truewealth_project }}
   --env-file {{ truewealth_env_file }} -f {{ truewealth_compose_file }}
 # The TARGET's environment and compose file are rendered here first
-# (secrets.yml, compose.yml), and the target's migrator is asked through
-# them (tasks/state.yml); the LIVE files above are replaced from here only
-# by tasks/promote.yml, before anything changes the deployment, so a run
-# that stops earlier leaves the live configuration exactly as it was.
+# (secrets.yml, compose.yml). The rollback-floor gate asks the target's
+# migrator through them (tasks/state.yml, gate.yml); the LIVE files above
+# are replaced from here only after the gate proceeds (tasks/promote.yml),
+# so a refusal leaves the live configuration exactly as it was and a reboot,
+# a restart or an operator's `compose up` cannot start a refused build.
 truewealth_staging_dir: "{{ truewealth_root }}/staging"
 truewealth_staged_env_file: "{{ truewealth_staging_dir }}/truewealth.env"
 truewealth_staged_compose_file: "{{ truewealth_staging_dir }}/compose.dc1.yml"

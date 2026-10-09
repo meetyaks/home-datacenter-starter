@@ -36,13 +36,17 @@
     truewealth_running: "{{ dict(truewealth_running_raw.stdout_lines | map('split', '=', 1)) }}"
 
 - name: Migration status of the database against THIS release's migrator
-  # Exit 0: nothing pending; exit 1: something pending (db/migrate.ts).
+  # Exit 0: ready; exit 1: not ready, and from batch 7 the last line says why
+  # (`verdict: ready|pending|unverified|mismatch|below_floor`, db/migrate.ts).
+  # It never fails here: the rollback-floor gate (gate.yml), which runs next
+  # and before anything changes, decides on this output and fails closed on
+  # anything it cannot read.
   #
   # Through the STAGED target configuration (the live files are untouched
-  # until promote.yml). And it must not touch a running postgres:
+  # until the gate proceeds). And it must not touch a running postgres:
   # `compose run` brings up the service's dependencies, and if the target's
   # compose file defines postgres differently from the running container,
-  # that would RECREATE postgres before anything was decided. So when
+  # that would RECREATE postgres before the gate has decided. So when
   # postgres is running, `--no-deps`: the one-off migrator joins the
   # project network and talks to the postgres that is running. Only when no
   # postgres container is running (a first deployment, or one already
@@ -55,9 +59,7 @@
     chdir: "{{ truewealth_root }}"
   register: truewealth_mstatus
   changed_when: false
-  failed_when: >-
-    truewealth_mstatus.rc not in [0, 1]
-    or truewealth_mstatus.stdout is not search('migrations: [0-9]+/[0-9]+ applied, [0-9]+ pending')
+  failed_when: false
   when: not ansible_check_mode
 
 - name: Does the staged configuration differ from the live one?

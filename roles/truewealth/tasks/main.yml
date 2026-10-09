@@ -11,7 +11,14 @@
 #   directories, secrets, images (accept ONLY the recorded identities),
 #   compose (render and validate before anything starts), scripts
 #   state        last VERIFIED deployment vs this one: UNCHANGED or CHANGE
-#   promote      the target's env and compose, staged until now, become live
+#   gate         the rollback floor and the TARGET migrator's verdict against
+#                the live database (TrueWealth rollback-floor contract
+#                C1-C4); proceeds only on ready/pending at or above the
+#                floor. A refusal: attempt failed@gate, NOTHING else touched
+#                (containers, worker, schema, recovery points, success and
+#                rollback records). Applies to code rollbacks as well.
+#   promote      only after the gate proceeded: the target's env and compose,
+#                staged until now, become live
 #
 #   CHANGE:      attempt record (started) → pre-migration recovery point and
 #                worker stop (only when migrations are pending on existing
@@ -95,7 +102,14 @@
 - name: State — what is deployed, and does this run change it?
   ansible.builtin.include_tasks: state.yml
 
-- name: Promote — the staged target configuration becomes live
+- name: Gate — rollback floor and the target's migration verdict, before ANYTHING changes
+  # TrueWealth docs/rollback-floor-contract.md C1-C4. Every non-check run,
+  # CHANGE or UNCHANGED, deployment or code rollback. A refusal stops here:
+  # attempt failed@gate, and nothing else is touched.
+  ansible.builtin.include_tasks: gate.yml
+  when: not ansible_check_mode
+
+- name: Promote — the staged target configuration becomes live (only after the gate proceeded)
   ansible.builtin.include_tasks: promote.yml
   when: not ansible_check_mode
 
@@ -121,6 +135,7 @@
           previousSuccess: "{{ {'commit': truewealth_prev.commit, 'loadedIds': truewealth_prev.loadedIds, 'verifiedAt': truewealth_prev.verifiedAt | default(truewealth_prev.deployedAt | default(none))} if truewealth_prev else {} }}"
           pendingMigrations: "{{ truewealth_pending }}"
           existingDeployment: "{{ truewealth_existing }}"
+          gate: "{{ truewealth_gate }}"
 
     - name: Stage — pre-migration recovery point and worker stop
       ansible.builtin.set_fact:
@@ -209,7 +224,8 @@
   ansible.builtin.debug:
     msg:
       - "CHECK MODE: controller-side verification of the transfer bundle and compose file ran for real."
-      - "Not run (they need the live host and change it): image load and identity, the migration status,"
+      - "Not run (they need the live host and change it): image load and identity, the migration status"
+      - "  and the rollback-floor gate,"
       - "  the recovery point, migrations, `up --wait`, the running-image identity check, the Caddy reload,"
       - "  readiness and HTTPS through https://{{ truewealth_hostname }}, the records, and the backup timer's first run."
   when: ansible_check_mode

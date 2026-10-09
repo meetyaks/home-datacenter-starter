@@ -1,0 +1,129 @@
+---
+# THE ROLLBACK-FLOOR GATE (TrueWealth docs/rollback-floor-contract.md, C1-C4).
+#
+# Runs after state.yml asked the TARGET migrator for `--status`, and BEFORE
+# anything that changes the running deployment: no attempt record, no
+# recovery point, no worker stop, no migrate, no `up`. It runs on every
+# non-check run, CHANGE or UNCHANGED, and a code rollback (a deployment of
+# the commit in ROLLBACK_PREVIOUS.json, README: Rollback) is checked exactly
+# the same way (C4): there is no path around it.
+#
+# Proceeds only when the target says `ready` or `pending` (or, for a build
+# without the `verdict:` line, its exit code agrees with what is pending) AND
+# the target's newest migration is not below the database's rollback floor.
+# Anything else is a refusal (gate-decide.yml), which (C3):
+#   - leaves the running containers, the worker, the schema, the recovery
+#     points, DEPLOYMENT_MANIFEST.json and ROLLBACK_PREVIOUS.json untouched;
+#   - leaves the LIVE environment and compose files untouched: the target's
+#     are only staged (truewealth_staging_dir) and promote.yml, after this
+#     file, is the only thing that makes them live;
+#   - records the attempt as failed at stage 'gate' in DEPLOYMENT_ATTEMPT.json.
+# A decision to proceed is recorded in the attempt and, after verification,
+# in DEPLOYMENT_MANIFEST.json (an UNCHANGED run writes no record by design;
+# its decision is in the play output).
+#
+# Every read here is read-only: one SELECT in the postgres service, and `ls`
+# in a throwaway container of the target migrator image with no network.
+
+- name: Gate — read the rollback target (is this run a code rollback?)
+  ansible.builtin.slurp:
+    src: "{{ truewealth_rollback_file }}"
+  register: truewealth_gate_rollback_raw
+  failed_when: false
+  check_mode: false
+
+- name: Gate — the database's rollback floor (read-only; a missing table or row is no floor)
+  # Inside the postgres service, with its own POSTGRES_USER/POSTGRES_DB over
+  # the local socket: no credential on this command line. Prints exactly one
+  # line: `floor=<name>` or `floor-absent`; any error exits non-zero.
+  vars:
+    truewealth_gate_floor_script: |
+      set -e
+      q() { psql -X -q -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"; }
+      t=$(q "SELECT to_regclass('public._tw_schema_meta') IS NOT NULL")
+      v=
+      if [ "$t" = t ]; then v=$(q "SELECT value FROM public._tw_schema_meta WHERE key = 'rollback_floor'"); fi
+      if [ -n "$v" ]; then printf 'floor=%s\n' "$v"; else echo floor-absent; fi
+  ansible.builtin.command:
+    # `exec` runs in the existing container and never creates or recreates
+    # one; the staged files only supply the project definition.
+    argv: "{{ (truewealth_staged_compose_cmd | split) + ['exec', '-T', 'postgres', 'sh', '-c', truewealth_gate_floor_script] }}"
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_gate_floor_raw
+  changed_when: false
+  failed_when: false
+
+- name: Gate — the target migrator image's migrations (its newest is the build's head)
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --rm
+      - --pull=never
+      - --network=none
+      - --read-only
+      - --cap-drop=ALL
+      - --security-opt=no-new-privileges
+      - --entrypoint=ls
+      - "{{ truewealth_loaded_ids.migrator }}"
+      - "-1"
+      - "{{ truewealth_migrator_migrations_dir }}"
+  register: truewealth_gate_head_raw
+  changed_when: false
+  failed_when: false
+
+- name: Gate — decide
+  ansible.builtin.include_tasks: gate-decide.yml
+  vars:
+    truewealth_gate_rollback_target: >-
+      {{ truewealth_gate_rollback_raw.content is defined
+         and ((truewealth_gate_rollback_raw.content | b64decode | from_json).commit | default('')) == truewealth_commit }}
+
+- name: Gate — the decision
+  vars:
+    g: "{{ truewealth_gate }}"
+  ansible.builtin.debug:
+    msg:
+      - "Rollback-floor gate: {{ g.decision | upper }}{{ (' (' ~ g.reasons | join(', ') ~ ')') if g.reasons else '' }}"
+      - >-
+        Target {{ truewealth_commit }}{{ ' — the rollback target in ROLLBACK_PREVIOUS.json' if g.rollbackTarget | bool else '' }}:
+        verdict {{ g.verdict | default('none', true) }} ({{ g.path }}), exit {{ g.exit }}, {{ g.pending | length }} pending
+      - "Database rollback floor: {{ g.floor | default('none', true) }}; target's newest migration: {{ g.head | default('unknown', true) }}"
+
+- name: Gate — record the refusal (attempt failed at stage 'gate'; nothing else is written)
+  ansible.builtin.include_tasks: attempt.yml
+  vars:
+    truewealth_attempt_update:
+      schema: truewealth-attempt/1
+      id: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+      status: failed
+      startedAt: "{{ truewealth_gate.decidedAt }}"
+      finishedAt: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+      failedStage: gate
+      failedTask: Rollback-floor gate
+      commit: "{{ truewealth_commit }}"
+      run: "{{ truewealth_transfer.run }}"
+      evidenceSha256: "{{ truewealth_transfer.evidenceSha256 }}"
+      loadedIds: "{{ truewealth_loaded_ids }}"
+      previousSuccess: >-
+        {{ {'commit': truewealth_prev.commit, 'loadedIds': truewealth_prev.loadedIds,
+            'verifiedAt': truewealth_prev.verifiedAt | default(truewealth_prev.deployedAt | default(none))} if truewealth_prev else {} }}
+      gate: "{{ truewealth_gate }}"
+  when: truewealth_gate.decision != 'proceed'
+
+- name: Gate — REFUSED
+  vars:
+    last_verified: "{{ truewealth_prev.commit if truewealth_prev else 'none (first deployment)' }}"
+    unchanged_lines:
+      - >-
+        Nothing was changed: no recovery point, no worker stop, no migrate, no container replaced.
+        DEPLOYMENT_MANIFEST.json and ROLLBACK_PREVIOUS.json are untouched; the last VERIFIED deployment
+        is still {{ last_verified }}. DEPLOYMENT_ATTEMPT.json records the refusal (failed at stage gate).
+      - >-
+        The live environment and compose files still name the running release; the refused target's
+        configuration is only in {{ truewealth_staging_dir }}, which nothing starts from.
+  ansible.builtin.fail:
+    msg: >-
+      {{ ['Deployment of ' ~ truewealth_commit ~ ' REFUSED by the rollback-floor gate (' ~ (truewealth_gate.reasons | join(', ')) ~ '):']
+         + truewealth_gate.message + unchanged_lines }}
+  when: truewealth_gate.decision != 'proceed'

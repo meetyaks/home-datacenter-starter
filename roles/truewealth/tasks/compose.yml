@@ -3,7 +3,8 @@
 # it with `git show <sha>:path`). It is rendered and validated in full, and
 # the RENDERED configuration is inspected, before anything is started.
 # Everything here is the STAGED target configuration (defaults:
-# truewealth_staging_dir); the live files change only in promote.yml.
+# truewealth_staging_dir); the live files change only after the
+# rollback-floor gate proceeds (promote.yml).
 
 - name: Stage the compose file from the approved commit
   ansible.builtin.copy:

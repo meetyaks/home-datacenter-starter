@@ -33,6 +33,7 @@
           'loadedIds': truewealth_loaded_ids,
           'workerHeld': truewealth_hold_worker | bool,
           'preMigrationRecoveryPoint': truewealth_recovery_point | default(none),
+          'gate': truewealth_gate,
           'verification': ['compose up --wait: every health check', 'running containers are the loaded image identities',
                            'readyz: every check ok', 'web bound to loopback only', truewealth_hostname ~ ' resolves on the host',
                            'HTTPS through the ingress with a trusted certificate', 'running revision label is the commit']}
