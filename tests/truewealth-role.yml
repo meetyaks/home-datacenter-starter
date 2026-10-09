@@ -170,7 +170,8 @@
         truewealth_root: "{{ work_dir }}/ok"
         truewealth_owner: "{{ lookup('env', 'USER') }}"
         truewealth_group: "{{ omit }}"
-        truewealth_env_file: "{{ render_dir }}/truewealth.env.local"
+        truewealth_staged_env_file: "{{ render_dir }}/truewealth.env.local"
+        truewealth_staged_compose_file: "{{ truewealth_root }}/compose.dc1.yml"
         truewealth_redis_password_file: "{{ work_dir }}/redis_password"
         truewealth_compose_source: { stdout: "{{ lookup('file', fixture_compose_file) }}" }
 
@@ -184,7 +185,8 @@
             truewealth_root: "{{ work_dir }}/lan"
             truewealth_owner: "{{ lookup('env', 'USER') }}"
             truewealth_group: "{{ omit }}"
-            truewealth_env_file: "{{ render_dir }}/truewealth.env.local"
+            truewealth_staged_env_file: "{{ render_dir }}/truewealth.env.local"
+            truewealth_staged_compose_file: "{{ truewealth_root }}/compose.dc1.yml"
             truewealth_redis_password_file: "{{ work_dir }}/redis_password"
             truewealth_compose_source: { stdout: "{{ lookup('file', compose_lan_file) }}" }
         - name: It should not get here

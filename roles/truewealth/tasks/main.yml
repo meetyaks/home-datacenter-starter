@@ -11,6 +11,7 @@
 #   directories, secrets, images (accept ONLY the recorded identities),
 #   compose (render and validate before anything starts), scripts
 #   state        last VERIFIED deployment vs this one: UNCHANGED or CHANGE
+#   promote      the target's env and compose, staged until now, become live
 #
 #   CHANGE:      attempt record (started) → pre-migration recovery point and
 #                worker stop (only when migrations are pending on existing
@@ -93,6 +94,10 @@
 
 - name: State — what is deployed, and does this run change it?
   ansible.builtin.include_tasks: state.yml
+
+- name: Promote — the staged target configuration becomes live
+  ansible.builtin.include_tasks: promote.yml
+  when: not ansible_check_mode
 
 - name: A CHANGED deployment — attempt, recovery point, migrate, start, verify, then record
   when:

@@ -36,16 +36,43 @@
     truewealth_running: "{{ dict(truewealth_running_raw.stdout_lines | map('split', '=', 1)) }}"
 
 - name: Migration status of the database against THIS release's migrator
-  # Exit 0: nothing pending; exit 1: something pending (db/migrate.ts). On a
-  # first deployment this starts postgres (the migrator depends on it).
+  # Exit 0: nothing pending; exit 1: something pending (db/migrate.ts).
+  #
+  # Through the STAGED target configuration (the live files are untouched
+  # until promote.yml). And it must not touch a running postgres:
+  # `compose run` brings up the service's dependencies, and if the target's
+  # compose file defines postgres differently from the running container,
+  # that would RECREATE postgres before anything was decided. So when
+  # postgres is running, `--no-deps`: the one-off migrator joins the
+  # project network and talks to the postgres that is running. Only when no
+  # postgres container is running (a first deployment, or one already
+  # stopped) may compose start it — there is no running database to disturb.
   ansible.builtin.command:
-    argv: "{{ (truewealth_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T', 'migrate', 'node', 'dist/ops/migrate.mjs', '--status'] }}"
+    argv: >-
+      {{ (truewealth_staged_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T']
+         + (['--no-deps'] if 'postgres' in truewealth_running else [])
+         + ['migrate', 'node', 'dist/ops/migrate.mjs', '--status'] }}
     chdir: "{{ truewealth_root }}"
   register: truewealth_mstatus
   changed_when: false
   failed_when: >-
     truewealth_mstatus.rc not in [0, 1]
     or truewealth_mstatus.stdout is not search('migrations: [0-9]+/[0-9]+ applied, [0-9]+ pending')
+  when: not ansible_check_mode
+
+- name: Does the staged configuration differ from the live one?
+  # Checksums only; the env file's content never leaves the host.
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  loop:
+    - "{{ truewealth_env_file }}"
+    - "{{ truewealth_staged_env_file }}"
+    - "{{ truewealth_compose_file }}"
+    - "{{ truewealth_staged_compose_file }}"
+  register: truewealth_config_stat
+  no_log: true
+  check_mode: false
   when: not ansible_check_mode
 
 - name: What is pending
@@ -63,9 +90,12 @@
     running_matches: >-
       {{ (truewealth_running | dict2items | selectattr('key', 'in', ['web', 'worker', 'compute']) | items2dict) == expected_running
          and 'postgres' in truewealth_running and 'redis' in truewealth_running }}
+    # live env, staged env, live compose, staged compose (stat above)
+    cs: "{{ truewealth_config_stat.results | map(attribute='stat') | map(attribute='checksum', default='') | list }}"
+    config_differs: "{{ cs[0] == '' or cs[0] != cs[1] or cs[2] == '' or cs[2] != cs[3] }}"
     inputs_changed: >-
-      {{ (truewealth_env_written is changed) or (truewealth_redis_secret is changed)
-         or (truewealth_compose_written is changed) or ((truewealth_need | default([])) | length > 0) }}
+      {{ (config_differs | bool) or (truewealth_redis_secret is changed)
+         or ((truewealth_need | default([])) | length > 0) }}
   ansible.builtin.set_fact:
     truewealth_existing: "{{ (truewealth_prev | length > 0) or truewealth_running | length > 0 }}"
     truewealth_unchanged: >-

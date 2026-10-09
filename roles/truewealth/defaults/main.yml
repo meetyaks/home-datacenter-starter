@@ -66,6 +66,17 @@ truewealth_group: root
 truewealth_compose_cmd: >-
   docker compose --project-name {{ truewealth_project }}
   --env-file {{ truewealth_env_file }} -f {{ truewealth_compose_file }}
+# The TARGET's environment and compose file are rendered here first
+# (secrets.yml, compose.yml), and the target's migrator is asked through
+# them (tasks/state.yml); the LIVE files above are replaced from here only
+# by tasks/promote.yml, before anything changes the deployment, so a run
+# that stops earlier leaves the live configuration exactly as it was.
+truewealth_staging_dir: "{{ truewealth_root }}/staging"
+truewealth_staged_env_file: "{{ truewealth_staging_dir }}/truewealth.env"
+truewealth_staged_compose_file: "{{ truewealth_staging_dir }}/compose.dc1.yml"
+truewealth_staged_compose_cmd: >-
+  docker compose --project-name {{ truewealth_project }}
+  --env-file {{ truewealth_staged_env_file }} -f {{ truewealth_staged_compose_file }}
 
 # The compose file's data paths (hard-coded there) and the users that own them.
 truewealth_data_dirs:

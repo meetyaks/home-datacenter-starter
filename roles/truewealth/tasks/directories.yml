@@ -14,6 +14,7 @@
     - { path: "{{ truewealth_root }}", mode: "0755" }
     - { path: "{{ truewealth_data_root }}", mode: "0755" }
     - { path: "{{ truewealth_env_dir }}", mode: "0700" }
+    - { path: "{{ truewealth_staging_dir }}", mode: "0700" }
     - { path: "{{ truewealth_images_dir }}", mode: "0700" }
     - { path: "{{ truewealth_backup_dir }}", mode: "0700" }
   loop_control:

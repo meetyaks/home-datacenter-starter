@@ -2,20 +2,23 @@
 # The compose file is the one from the approved commit (controller.yml read
 # it with `git show <sha>:path`). It is rendered and validated in full, and
 # the RENDERED configuration is inspected, before anything is started.
+# Everything here is the STAGED target configuration (defaults:
+# truewealth_staging_dir); the live files change only in promote.yml.
 
-- name: Install the compose file from the approved commit
+- name: Stage the compose file from the approved commit
   ansible.builtin.copy:
-    dest: "{{ truewealth_compose_file }}"
+    dest: "{{ truewealth_staged_compose_file }}"
     content: "{{ truewealth_compose_source.stdout }}\n"
     owner: "{{ truewealth_owner }}"
     group: "{{ truewealth_group }}"
     mode: "0644"
-  register: truewealth_compose_written
+  register: truewealth_compose_staged
 
 - name: Observe whether the rendered inputs are real (not only predicted)
   ansible.builtin.stat:
     path: "{{ item }}"
-  loop: ["{{ truewealth_compose_file }}", "{{ truewealth_env_file }}", "{{ truewealth_redis_password_file }}"]
+    get_checksum: false
+  loop: ["{{ truewealth_staged_compose_file }}", "{{ truewealth_staged_env_file }}", "{{ truewealth_redis_password_file }}"]
   register: truewealth_compose_inputs
   check_mode: false
 
@@ -25,7 +28,7 @@
   # no_log because the rendered environment contains the database password.
   ansible.builtin.command:
     argv: >-
-      {{ (truewealth_compose_cmd | split) + ['--profile', 'ops', 'config', '--format', 'json'] }}
+      {{ (truewealth_staged_compose_cmd | split) + ['--profile', 'ops', 'config', '--format', 'json'] }}
     chdir: "{{ truewealth_root }}"
   register: truewealth_rendered
   changed_when: false
