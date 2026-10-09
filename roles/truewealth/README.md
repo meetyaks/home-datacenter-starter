@@ -64,12 +64,13 @@ What a run does, in order (`tasks/main.yml`):
    refused (`truewealth_accept_evidence_classes: [ci]`).
 2. **Preflight**: `roles/caddy` ran in this play; x86-64; `/srv/data` is a
    mount; Compose ≥ 2.24; port 3100 free or ours; GID 1001 free or ours.
-3. Directories, the runtime group, secrets as files (`env` 0600 root,
-   `redis_password` 0440 root:1001), `no_log` **and** `diff: false`.
+3. Directories, the runtime group, secrets as files (`env` 0600 root, staged
+   in `staging/` until the gate proceeds; `redis_password` 0440 root:1001),
+   `no_log` **and** `diff: false`.
 4. **Images**: copy only what is missing, re-hash on the host, `docker load`,
    and accept only the identities `transfer.json` lists (config digest, or
    manifest digest with the containerd store) with this commit's labels.
-5. **Compose**: `config` renders the whole configuration first; it must be
+5. **Compose** (staged, like the env file): `config` renders the whole configuration first; it must be
    exactly the six services, no builds, only web published and only on
    127.0.0.1, no Docker socket, no Redis password in the rendered text.
 6. **Scripts**: backup, restore-verify and diagnostics are installed before
@@ -79,9 +80,11 @@ What a run does, in order (`tasks/main.yml`):
    **Unchanged** (same commit and image identities, nothing pending, no input
    changed, every service running the verified image): converge (a no-op),
    Caddy, verify — and **write nothing**. A re-run reports `changed=0`.
+   **Rollback-floor gate** (next section) — before anything below; then the
+   staged target configuration becomes live.
 8. **Changed** deployment:
    1. `DEPLOYMENT_ATTEMPT.json` opens (`started`; commit, run, images, the
-      previous success, pending migrations).
+      previous success, pending migrations, the gate decision).
    2. If migrations are pending **and the database already holds data**: a
       **pre-migration recovery point** (`truewealth-backup --reason
       pre-migration`, kept outside retention) and the **worker stopped**.
@@ -112,6 +115,60 @@ What a run does, in order (`tasks/main.yml`):
    redacted excerpt: `truewealth_diagnostics_log_excerpt`). Read full logs
    on the host deliberately.
 9. The backup timer (below).
+
+### The rollback-floor gate
+
+TrueWealth `docs/rollback-floor-contract.md` (C1-C4) — `tasks/gate.yml`,
+decided by `tasks/gate-decide.yml`. The application refuses an incompatible
+schema only at startup, after `up` has replaced the running containers; the
+gate refuses **before** that. On every run that is not `--check` (CHANGE or
+UNCHANGED, deployment or code rollback), right after the **target**
+migrator's `migrate --status`, and before the attempt record, the recovery
+point, the worker stop, `migrate` and `up`:
+
+| The target says | The gate |
+|---|---|
+| `verdict: ready` (exit 0) or `verdict: pending` (exit 1, names pending) | proceeds |
+| `verdict: below_floor` | refuses |
+| `verdict: mismatch` (applied text differs) | refuses: deploy the matching build or reconcile by hand |
+| `verdict: unverified` (pre-checksum rows) | refuses and names the operator's `--adopt-legacy-checksums` command; the role never adds it (C2) |
+| no `verdict:` line (batches 1-6) | decides by the exit code and pending count, plus a batch-6 `checksums:` line |
+| anything else: did not complete (database unreachable, migrator error), unparseable, unknown verdict, verdict/exit/pending disagreeing | refuses (fails closed) |
+
+And for every target, verdict or not, a **direct comparison**: the floor
+(`SELECT value FROM public._tw_schema_meta WHERE key = 'rollback_floor'`
+in the postgres service; no table or row = no floor) against the greatest
+`*.sql` name in the target migrator image's `/app/db/migrations` (byte-wise
+order, the application's). `head < floor` refuses — the only check that
+covers a build from before batch 6, which knows no floor. If the floor or
+the list cannot be read, it refuses.
+
+A refusal (C3) leaves the running containers, the worker, the schema, the
+recovery points, `DEPLOYMENT_MANIFEST.json` and `ROLLBACK_PREVIOUS.json` as
+they were, and records `DEPLOYMENT_ATTEMPT.json` as `failed` at stage `gate`
+with the decision (`gate`: reason, verdict, floor, head, exit, pending,
+whether the target is the rollback target). A pass is recorded in the attempt
+and, once verified, in `DEPLOYMENT_MANIFEST.json` (`gate`).
+
+**The target's configuration is staged, not live, until the gate proceeds.**
+`secrets.yml` and `compose.yml` render the target's `truewealth.env` and
+`compose.dc1.yml` into `staging/` (0700 root); `compose config` validates
+them there, and the gate asks the target's migrator through them. Only
+`promote.yml`, after the gate, copies them over the live files. A refusal
+therefore leaves the live files byte-for-byte as they were: a reboot, a
+restart or an operator's `compose up` starts what was running, never the
+refused build. The `unverified` message gives the adoption command with the
+staged files spelled out (`--env-file …/staging/truewealth.env -f
+…/staging/compose.dc1.yml`), so it uses the target build.
+
+**The gate never touches the running postgres.** `compose run` starts a
+service's dependencies, and if the target's compose file defined postgres
+differently, it would recreate postgres before the gate decided. So the
+`--status` run uses `--no-deps` whenever postgres is running (the one-off
+migrator joins the project network and uses the running database); only
+when no postgres container is running — a first deployment — may compose
+start it. The floor is read with `compose exec`, which never creates or
+recreates a container.
 
 ### Migrations and the running release
 
@@ -283,7 +340,12 @@ last attempt, succeeded or failed; it is never a rollback target.
   code must work with the schema as it now is. That is true when the
   release being rolled back only EXPANDED the schema (the contract in
   "Migrations and the running release"); check its migrations before doing it.
-  The role will report nothing pending (the database is ahead) and deploy.
+  It goes through the rollback-floor gate like any deployment (C4): a target
+  whose newest migration is below the database's floor is refused, whether
+  or not it knows about the floor itself; at or above it, an older build on a
+  newer schema reports nothing pending (the database is ahead) and deploys.
+  Below the floor the only way back is a database restore with matching
+  images.
 - **Database restore** (corruption, a destructive or wrong migration): the
   Restore procedure above, from the pre-migration recovery point or another
   verified backup, as a separate approved act. Never restore an older backup
