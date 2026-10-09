@@ -9,7 +9,9 @@
 #      socket, loopback-only publication; secrets file-based, no_log AND
 #      diff: false, never a process argument (no docker -e secrets; the admin
 #      password via hidden prompt + pipelined stdin); a changed deployment
-#      runs recovery point → migrate → start → verify → record
+#      runs recovery point → migrate → start → verify → record; the
+#      rollback-floor gate (C1-C3 placement, never adopts, read-only) and its
+#      decisions on stubbed --status outputs (tests/truewealth-gate.yml)
 #   2. templates render; the real controller.yml accepts a correct bundle
 #      and refuses 15 wrong ones (incl. dev-local evidence, another run or
 #      attempt, not API-verified, another workflow/head, failed run, changed
@@ -21,7 +23,9 @@
 #   5. (optional, TW_TRANSFER_BUNDLE) images.yml with a real verified bundle
 #   6. the real role end to end with stand-in images: unchanged re-runs,
 #      a migration behind a recovery point, a failing migration, a failed
-#      post-start verification, a stray container, a crashing web
+#      post-start verification, a stray container, a crashing web; and the
+#      rollback-floor gate's acceptance tests A1-A6 and C4 with a real
+#      PostgreSQL and batch-5/batch-7 style stand-in migrators
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -75,6 +79,45 @@ order=$(grep -nE "include_tasks: (migrate|deploy).yml" "$tasks/main.yml" | cut -
 set -- $order
 [ "${1:-0}" -lt "${2:-0}" ] && grep -q "Stop when migrations failed" "$tasks/migrate.yml" \
   && ok "migrations run before up, and a failure stops the deploy" || bad "migration ordering" "$order"
+# The rollback-floor gate (TrueWealth docs/rollback-floor-contract.md C1-C4).
+line_of() { grep -n "$1" "$tasks/main.yml" | head -1 | cut -d: -f1; }
+l_state=$(line_of 'include_tasks: state.yml'); l_gate=$(line_of 'include_tasks: gate.yml'); l_attempt=$(line_of 'include_tasks: attempt.yml')
+l_pre=$(line_of 'include_tasks: premigrate.yml'); l_mig=$(line_of 'include_tasks: migrate.yml'); l_dep=$(line_of 'include_tasks: deploy.yml')
+[ -n "$l_gate" ] && [ "$l_state" -lt "$l_gate" ] && [ "$l_gate" -lt "$l_attempt" ] && [ "$l_gate" -lt "$l_pre" ] \
+  && [ "$l_gate" -lt "$l_mig" ] && [ "$l_gate" -lt "$l_dep" ] \
+  && ok "C1: the gate runs after the target's --status and before the attempt, recovery point, worker stop, migrate and up" \
+  || bad "C1: gate ordering" "state=$l_state gate=$l_gate attempt=$l_attempt premigrate=$l_pre migrate=$l_mig deploy=$l_dep"
+gate_when=$(awk '/include_tasks: gate.yml/{f=1; next} f && /^- name:/{exit} f' "$tasks/main.yml" | grep -E '^\s+when:|^\s+- ' | tr -s ' ')
+[ "$gate_when" = " when: not ansible_check_mode" ] && grep -q '^- name: Gate — rollback floor' "$tasks/main.yml" \
+  && ok "C1/C4: the gate is a top-level task, unconditional outside check mode (CHANGE, UNCHANGED and code rollbacks alike)" || bad "gate conditions" "$gate_when"
+l_promote=$(line_of 'include_tasks: promote.yml')
+[ -n "$l_promote" ] && [ "$l_gate" -lt "$l_promote" ] && [ "$l_promote" -lt "$l_attempt" ] \
+  && grep -q 'dest: "{{ truewealth_staged_env_file }}"' "$tasks/secrets.yml" && grep -q 'dest: "{{ truewealth_staged_compose_file }}"' "$tasks/compose.yml" \
+  && [ "$(grep -rlE 'dest: "\{\{ truewealth_(env|compose)_file \}\}"' "$tasks" | xargs -n1 basename | tr '\n' ' ')" = "promote.yml " ] \
+  && ok "C3: the target's env and compose are only STAGED before the gate; promote.yml, after it, is the only writer of the live files" \
+  || bad "staged configuration" "gate=$l_gate promote=$l_promote attempt=$l_attempt; live writers: $(grep -rlE 'dest: "\{\{ truewealth_(env|compose)_file \}\}"' "$tasks" | tr '\n' ' ')"
+grep -q "\['--no-deps'\] if 'postgres' in truewealth_running" "$tasks/state.yml" && grep -q "'exec', '-T', 'postgres'" "$tasks/gate.yml" \
+  && grep -q 'truewealth_staged_compose_cmd | split' "$tasks/state.yml" \
+  && ok "the gate's --status never brings up dependencies while postgres runs (--no-deps); the floor read is compose exec" \
+  || bad "postgres untouched by the gate" "check state.yml / gate.yml"
+[ "$(grep -rl -- '--adopt-legacy-checksums' "$tasks" | xargs -n1 basename | tr '\n' ' ')" = "gate-decide.yml " ] \
+  && ! grep -qE 'ansible\.builtin\.(command|shell)' "$tasks/gate-decide.yml" \
+  && ok "C2: --adopt-legacy-checksums appears only in the operator message; no task ever runs it" \
+  || bad "C2: never adopt" "$(grep -rn -- '--adopt-legacy-checksums' "$tasks" | head -3)"
+gate_writes=$(grep -E 'ansible\.builtin\.(copy|template|file|lineinfile|shell)|include_tasks:' "$tasks/gate.yml" | grep -vE 'include_tasks: (attempt|gate-decide)\.yml' | tr -s ' ')
+gate_cmds=$(grep -c 'ansible.builtin.command' "$tasks/gate.yml")
+[ -z "$gate_writes" ] && [ "$gate_cmds" = 2 ] && ! grep -qE "truewealth-backup|'stop'|'up'|'migrate'" "$tasks/gate.yml" \
+  && ok "C3: the gate only reads (floor SELECT, migration list) and, on refusal, writes only the attempt record" \
+  || bad "C3: gate side effects" "writes: $gate_writes; commands: $gate_cmds"
+grep -q "'gate': truewealth_gate" "$tasks/record.yml" && grep -q 'gate: "{{ truewealth_gate }}"' "$tasks/main.yml" \
+  && ok "every gate decision is recorded: refusals in the attempt, a pass in the attempt and the success manifest" || bad "gate recorded" "missing"
+ansible-playbook tests/truewealth-gate.yml > "$R/gate.log" 2>&1 </dev/null
+if grep -q 'failed=0' "$R/gate.log" && ! grep -q 'MISSED' "$R/gate.log"; then
+  ok "the REAL gate-decide.yml decides $(grep -c '"msg": "GATE CASE ' "$R/gate.log") stubbed --status cases as the contract says (A1-A6, batch 6/5 builds, unreachable, unparseable, unknown, inconsistent, byte order)"
+else
+  bad "gate decisions (tests/truewealth-gate.yml)" "$(grep -oE 'MISSED: [^"]*|ERROR.*' "$R/gate.log" | head -3)"
+fi
+
 grep -qE 'truewealth' playbooks/site.yml && bad "not in site.yml" "site.yml mentions truewealth" || ok "not part of site.yml"
 grep -qE "name: (docker|common|storage)$" playbooks/truewealth.yml && bad "no host bootstrap roles" "found one" || ok "runs no host-bootstrap role (docker, common, storage)"
 grep -qE "trusted_proxies|header_up|X-Real-IP" <(grep -vE '^\s*#' "$ROLE/templates/truewealth.caddy.j2") \
@@ -310,7 +353,8 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && git -C 
     if [ "$hrc" -eq 0 ]; then
       ok "unchanged re-runs change nothing; a changed release migrates behind a recovery point and a stopped worker; rollback target = last distinct success"
       ok "a failing migration, a failed post-start verification and a crashing web each leave the success record and rollback target untouched"
-      ok "stray containers are reported, not removed; failure diagnostics are bounded and leak no synthetic secret ($n checks, tests/truewealth-deploy-harness.sh)"
+      ok "stray containers are reported, not removed; failure diagnostics are bounded and leak no synthetic secret"
+      ok "rollback-floor gate A1-A6 and C4 end to end: refusals leave containers, worker, schema, recovery points and records untouched (C3) ($n checks, tests/truewealth-deploy-harness.sh)"
     else
       bad "end-to-end deploy scenarios" "$(grep -A1 FAIL "$R/deploy-harness.log" | head -10)"
     fi

@@ -1,0 +1,27 @@
+---
+# One case of tests/truewealth-gate.yml.
+- name: "Decide — {{ case.name }}"
+  ansible.builtin.include_tasks: ../roles/truewealth/tasks/gate-decide.yml
+  vars:
+    truewealth_mstatus: "{{ case.status }}"
+    truewealth_gate_floor_raw: "{{ lookup('vars', case.floor) if case.floor is string else case.floor }}"
+    truewealth_gate_head_raw: "{{ lookup('vars', case.head) if case.head is string else case.head }}"
+    truewealth_gate_rollback_target: "{{ case.rollback | default(false) }}"
+
+- name: "GATE CASE {{ case.name }}"
+  ansible.builtin.debug:
+    msg: "GATE CASE {{ case.name }}: {{ truewealth_gate.decision }} {{ truewealth_gate.reasons }}"
+
+- name: "Check — {{ case.name }}"
+  ansible.builtin.assert:
+    that:
+      - truewealth_gate.decision == case.expect
+      - truewealth_gate.reasons == case.reasons
+      - (truewealth_gate.message | join(' ')) is search(case.says | default('') | regex_escape)
+      - case.never_says is not defined or (truewealth_gate | to_json) is not search(case.never_says | regex_escape)
+      - truewealth_gate.rollbackTarget == (case.rollback | default(false))
+      - truewealth_gate.decision == 'proceed' or truewealth_gate.message | length > 0
+    fail_msg: >-
+      MISSED: {{ case.name }} — expected {{ case.expect }} {{ case.reasons }}, got
+      {{ truewealth_gate.decision }} {{ truewealth_gate.reasons }}: {{ truewealth_gate.message }}
+    quiet: true
