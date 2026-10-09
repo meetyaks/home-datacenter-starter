@@ -1,0 +1,37 @@
+---
+# Before a task sends a secret as a module argument (stdin to a command),
+# prove that modules reach this host STREAMED (pipelining), not as a file in
+# its temporary directory — where the argument would sit on disk. The probe
+# runs with the same settings as the secret-carrying task: its parent process
+# on the host is the Python running the module, started from a file
+# (…/AnsiballZ_command.py) or from stdin. An extra var
+# (-e ansible_pipelining=false) outranks task vars, so this is checked, not
+# assumed. Parameter: truewealth_probe_purpose (wording only).
+
+- name: Refuse a controller configured to keep remote module files
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'ANSIBLE_KEEP_REMOTE_FILES', default='') | string | lower in ['', '0', 'false', 'no']
+    fail_msg: >-
+      ANSIBLE_KEEP_REMOTE_FILES is set; it would leave {{ truewealth_probe_purpose }}
+      in a module file on the host. Unset it for this run.
+    quiet: true
+
+- name: Probe how modules reach the host
+  ansible.builtin.command:
+    argv: [/bin/sh, -c, 'tr "\000" " " < /proc/$PPID/cmdline']
+  vars:
+    ansible_pipelining: true
+  register: truewealth_pipelining_probe
+  changed_when: false
+  check_mode: false
+
+- name: Refuse a run whose modules would be written to disk on the host
+  ansible.builtin.assert:
+    that:
+      - truewealth_pipelining_probe.stdout is not search('AnsiballZ_')
+    fail_msg: >-
+      Modules are not being pipelined on {{ inventory_hostname }}; {{ truewealth_probe_purpose }}
+      would be written to its temporary directory. Remove any ansible_pipelining=false
+      override; check that sudo does not require a TTY.
+    quiet: true

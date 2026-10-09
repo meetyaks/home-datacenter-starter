@@ -1,0 +1,82 @@
+---
+# The compose file is the one from the approved commit (controller.yml read
+# it with `git show <sha>:path`). It is rendered and validated in full, and
+# the RENDERED configuration is inspected, before anything is started.
+# Everything here is the STAGED target configuration (defaults:
+# truewealth_staging_dir); the live files change only after the
+# rollback-floor gate proceeds (promote.yml).
+
+- name: Stage the compose file from the approved commit
+  ansible.builtin.copy:
+    dest: "{{ truewealth_staged_compose_file }}"
+    content: "{{ truewealth_compose_source.stdout }}\n"
+    owner: "{{ truewealth_owner }}"
+    group: "{{ truewealth_group }}"
+    mode: "0644"
+  register: truewealth_compose_staged
+
+- name: Observe whether the rendered inputs are real (not only predicted)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: ["{{ truewealth_staged_compose_file }}", "{{ truewealth_staged_env_file }}", "{{ truewealth_redis_password_file }}"]
+  register: truewealth_compose_inputs
+  check_mode: false
+
+- name: Render the full configuration
+  # `config` resolves every variable and fails on any missing required one
+  # (the compose file uses ${VAR:?…}). --format json so it can be inspected;
+  # no_log because the rendered environment contains the database password.
+  ansible.builtin.command:
+    argv: >-
+      {{ (truewealth_staged_compose_cmd | split) + ['--profile', 'ops', 'config', '--format', 'json'] }}
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_rendered
+  changed_when: false
+  check_mode: false
+  no_log: true
+  when: truewealth_compose_inputs.results | map(attribute='stat.exists') | min
+
+- name: Inspect the rendered configuration
+  # Only derived facts leave this task; the rendered text itself never
+  # appears in output.
+  ansible.builtin.set_fact:
+    truewealth_cfg_facts:
+      services: "{{ (truewealth_rendered.stdout | from_json).services.keys() | list | sort }}"
+      builds: "{{ (truewealth_rendered.stdout | from_json).services | dict2items | selectattr('value.build', 'defined') | map(attribute='key') | list }}"
+      published: >-
+        {{ (truewealth_rendered.stdout | from_json).services | dict2items
+           | map(attribute='value.ports') | select('defined') | flatten
+           | map(attribute='host_ip') | list }}
+      published_services: >-
+        {{ (truewealth_rendered.stdout | from_json).services | dict2items
+           | selectattr('value.ports', 'defined') | map(attribute='key') | list }}
+      socket_mounts: "{{ (truewealth_rendered.stdout | regex_findall('docker\\.sock')) | length }}"
+      redis_password_in_config: "{{ truewealth_vault_redis_password in truewealth_rendered.stdout }}"
+  no_log: true
+  when: truewealth_rendered is not skipped
+
+- name: The rendered configuration must be safe to start
+  ansible.builtin.assert:
+    that:
+      - truewealth_cfg_facts.services == ['compute', 'migrate', 'postgres', 'redis', 'web', 'worker']
+      - truewealth_cfg_facts.builds == []
+      - truewealth_cfg_facts.published_services == ['web']
+      - truewealth_cfg_facts.published | unique == ['127.0.0.1']
+      - truewealth_cfg_facts.socket_mounts | int == 0
+      - not (truewealth_cfg_facts.redis_password_in_config | bool)
+    fail_msg: >-
+      The rendered TrueWealth configuration is not the expected runtime shape:
+      services {{ truewealth_cfg_facts.services }}, builds {{ truewealth_cfg_facts.builds }},
+      published {{ truewealth_cfg_facts.published_services }} on {{ truewealth_cfg_facts.published }},
+      Docker socket mounts {{ truewealth_cfg_facts.socket_mounts }}. Nothing was started.
+    success_msg: "Compose renders: 6 services, no builds, only web published and only on 127.0.0.1."
+    quiet: true
+  when: truewealth_rendered is not skipped
+
+- name: Say what check mode could not render
+  ansible.builtin.debug:
+    msg: >-
+      CHECK MODE: the environment or compose file is only predicted on this
+      host, so the rendered-configuration checks did not run.
+  when: truewealth_rendered is skipped

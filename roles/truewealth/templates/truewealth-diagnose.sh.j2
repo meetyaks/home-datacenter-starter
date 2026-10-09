@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+#
+# Bounded, reviewed failure diagnostics for the TrueWealth compose project.
+#
+#   truewealth-diagnose [--log-excerpt]
+#
+# By default it prints ONLY metadata, never log content: per container its
+# service, state, health, exit code, OOM flag, restart count and image; the
+# exit codes of its recent health checks (not their output); and counts of
+# log lines and of error-looking lines among the last 200. Application logs
+# can carry arbitrary financial data and credentials a library chose to
+# print, and this output lands in Ansible logs on the admin plane.
+#
+# --log-excerpt adds the last 15 lines per service through a redactor
+# (credential-like key=value pairs, bearer tokens, URL userinfo, long
+# token-like strings, e-mail addresses and multi-digit numbers are replaced).
+# A redactor reduces exposure; it cannot guarantee it. Read full logs on the
+# host, deliberately: docker compose -p {{ truewealth_project }} logs <service>.
+set -uo pipefail
+PROJECT='{{ truewealth_project }}'
+EXCERPT=0
+[ "${1:-}" = --log-excerpt ] && EXCERPT=1
+
+redact() {
+  sed -E \
+    -e 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]+@#\1[REDACTED]@#g' \
+    -e 's/([Bb]earer|[Bb]asic|[Tt]oken)[[:space:]]+[A-Za-z0-9._~+\/=-]+/\1 [REDACTED]/g' \
+    -e 's/([A-Za-z0-9_.-]*([Pp][Aa][Ss][Ss]([Ww][Oo][Rr][Dd])?|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh][A-Za-z]*|[Cc][Oo][Oo][Kk][Ii][Ee]|[Ss][Ee][Ss][Ss][Ii][Oo][Nn]|[Cc][Rr][Ee][Dd][A-Za-z]*|[Dd][Ss][Nn])[A-Za-z0-9_.-]*)["'"'"']?[[:space:]]*[=:][[:space:]]*["'"'"']?[^[:space:],;&"'"'"'}]+/\1=[REDACTED]/g' \
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[EMAIL]/g' \
+    -e 's/[A-Za-z0-9+\/_-]{24,}={0,2}/[REDACTED]/g' \
+    -e 's/[0-9][0-9,._]{3,}[0-9]/[NUM]/g' \
+    | cut -c1-240
+}
+
+ids="$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{ '{{' }}.ID{{ '}}' }}')"
+if [ -z "$ids" ]; then
+  echo "diagnose: no containers for project $PROJECT"
+  exit 0
+fi
+printf '%-10s %-10s %-10s %-5s %-5s %-4s %s\n' SERVICE STATE HEALTH EXIT OOM RST IMAGE
+for id in $ids; do
+  docker inspect --format '{{ '{{' }}index .Config.Labels "com.docker.compose.service"{{ '}}' }} {{ '{{' }}.State.Status{{ '}}' }} {{ '{{' }}if .State.Health{{ '}}' }}{{ '{{' }}.State.Health.Status{{ '}}' }}{{ '{{' }}else{{ '}}' }}none{{ '{{' }}end{{ '}}' }} {{ '{{' }}.State.ExitCode{{ '}}' }} {{ '{{' }}.State.OOMKilled{{ '}}' }} {{ '{{' }}.RestartCount{{ '}}' }} {{ '{{' }}.Image{{ '}}' }}' "$id" \
+    | awk '{ printf "%-10s %-10s %-10s %-5s %-5s %-4s %s\n", $1, $2, $3, $4, $5, $6, substr($7, 1, 19) }'
+done
+echo
+echo "health-check exit codes (most recent last; output withheld):"
+for id in $ids; do
+  svc="$(docker inspect --format '{{ '{{' }}index .Config.Labels "com.docker.compose.service"{{ '}}' }}' "$id")"
+  codes="$(docker inspect --format '{{ '{{' }}if .State.Health{{ '}}' }}{{ '{{' }}range .State.Health.Log{{ '}}' }}{{ '{{' }}.ExitCode{{ '}}' }} {{ '{{' }}end{{ '}}' }}{{ '{{' }}end{{ '}}' }}' "$id")"
+  [ -n "$codes" ] && printf '  %-10s %s\n' "$svc" "$codes"
+done
+echo
+echo "log volume among the last 200 lines (content withheld):"
+for id in $ids; do
+  svc="$(docker inspect --format '{{ '{{' }}index .Config.Labels "com.docker.compose.service"{{ '}}' }}' "$id")"
+  logs="$(docker logs --tail 200 "$id" 2>&1)"
+  total="$(printf '%s\n' "$logs" | grep -c . || true)"
+  errs="$(printf '%s\n' "$logs" | grep -ciE 'error|fatal|exception|panic|refused|denied' || true)"
+  printf '  %-10s %4s lines, %4s error-like\n' "$svc" "$total" "$errs"
+  if [ "$EXCERPT" -eq 1 ]; then
+    printf '%s\n' "$logs" | tail -15 | redact | sed 's/^/      | /'
+  fi
+done

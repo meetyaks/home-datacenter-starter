@@ -1,0 +1,160 @@
+---
+# The rollback-floor gate's DECISION, from three observations only (no host
+# access here, so tests/truewealth-gate.yml can feed it stubbed outputs):
+#
+#   truewealth_mstatus          `migrate node dist/ops/migrate.mjs --status`
+#                               run with the TARGET migrator (state.yml)
+#   truewealth_gate_floor_raw   the database's rollback floor, read in the
+#                               postgres service: `floor=<name>` or
+#                               `floor-absent` (gate.yml)
+#   truewealth_gate_head_raw    the *.sql names in the target migrator
+#                               image's migrations directory (gate.yml)
+#
+# TrueWealth docs/rollback-floor-contract.md, C1-C2:
+#   - a target WITH the `verdict:` line (batch 7+) proceeds only on
+#     `verdict: ready` or `verdict: pending`;
+#   - a target WITHOUT it (batches 1-6) is checked by direct comparison:
+#     refuse when head < floor (byte-wise name order, the application's);
+#   - the direct comparison is ALSO made for verdict targets (it must agree);
+#   - `unverified` is an operator step: the message names
+#     --adopt-legacy-checksums, and the role never adds that flag itself.
+# Everything else fails closed: a --status that did not complete (database
+# unreachable, migrator error), output that cannot be parsed, an unknown
+# verdict, a verdict that disagrees with the exit code or the pending count,
+# an unreadable floor or an unreadable migration list.
+#
+# Sets truewealth_gate: {decision: proceed|refused, reason, reasons, path,
+# verdict, exit, pending, floor, head, rollbackTarget, migratorImage, message}.
+# Every value is a migration name, a count or a fixed phrase: no secret, no
+# data from the database beyond migration names.
+
+- name: Gate — decide from the target's --status, the floor and the target's head
+  vars:
+    st_rc: "{{ truewealth_mstatus.rc | default(-1) | int }}"
+    st_lines: "{{ truewealth_mstatus.stdout_lines | default([]) }}"
+    st_nonempty: "{{ st_lines | reject('match', '^\\s*$') | list }}"
+    st_failure: >-
+      {{ ((truewealth_mstatus.stderr_lines | default([])) + st_lines)
+         | select('match', '^migrate: FAILED') | list | first | default('')
+         | regex_replace('\x27[^\x27]*\x27', "'…'")
+         | regex_replace('[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+', '[email]')
+         | regex_replace('postgres(ql)?://\S+', 'postgres://[elided]')
+         | truncate(300) }}
+    st_summary: "{{ st_lines | select('match', '^migrations: [0-9]+/[0-9]+ applied, [0-9]+ pending$') | list }}"
+    st_summary_pending: >-
+      {{ (st_summary | first | regex_search('([0-9]+) pending$', '\1') | first | int) if st_summary | length == 1 else -1 }}
+    st_pending: "{{ st_lines | select('match', '^\\s+pending \\S+$') | map('regex_replace', '^\\s+pending ', '') | list }}"
+    st_mismatched: "{{ st_lines | select('match', '^\\s+mismatched \\S+$') | map('regex_replace', '^\\s+mismatched ', '') | list }}"
+    st_unverified: "{{ st_lines | select('match', '^\\s+unverified \\S+$') | map('regex_replace', '^\\s+unverified ', '') | list }}"
+    st_checksums: "{{ st_lines | select('match', '^checksums: [0-9]+ mismatched, [0-9]+ unverified') | list }}"
+    st_checksums_mismatched: "{{ (st_checksums | first | regex_search('^checksums: ([0-9]+) mismatched', '\\1') | first | int) if st_checksums else 0 }}"
+    st_checksums_unverified: "{{ (st_checksums | first | regex_search(', ([0-9]+) unverified', '\\1') | first | int) if st_checksums else 0 }}"
+    st_verdict_lines: "{{ st_lines | select('match', '^verdict: ') | list }}"
+    has_verdict: "{{ st_verdict_lines | length > 0 }}"
+    verdict: "{{ (st_verdict_lines | first | regex_replace('^verdict: ', '') | trim) if st_verdict_lines | length == 1 else '' }}"
+    # The verdict is the single, LAST line of --status (db/migrate.ts).
+    verdict_well_formed: "{{ st_verdict_lines | length == 1 and (st_nonempty | last | default('')) == (st_verdict_lines | first) }}"
+    completed: "{{ (st_rc | int) in [0, 1] and st_failure == '' }}"
+    parseable: >-
+      {{ st_summary | length == 1 and (st_pending | length) == (st_summary_pending | int)
+         and ((not (has_verdict | bool)) or (verdict_well_formed | bool)) }}
+
+    floor_lines: "{{ truewealth_gate_floor_raw.stdout_lines | default([]) | reject('match', '^\\s*$') | list }}"
+    floor_ok: >-
+      {{ (truewealth_gate_floor_raw.rc | default(-1) | int) == 0 and floor_lines | length == 1
+         and (floor_lines[0] == 'floor-absent' or floor_lines[0] is match('^floor=\S+$')) }}
+    floor: "{{ (floor_lines[0] | regex_replace('^floor=', '')) if ((floor_ok | bool) and floor_lines[0] != 'floor-absent') else '' }}"
+    # Byte-wise name order (the application's): Python string order is
+    # code-point order, which is UTF-8 byte order; and case-SENSITIVE (the
+    # Jinja default for sort is case-insensitive).
+    head_names: >-
+      {{ truewealth_gate_head_raw.stdout_lines | default([]) | map('trim')
+         | select('match', '^[^/\s]+\.sql$') | sort(case_sensitive=true) | list }}
+    head_ok: "{{ (truewealth_gate_head_raw.rc | default(-1) | int) == 0 and head_names | length > 0 }}"
+    head: "{{ (head_names | last) if (head_ok | bool) else '' }}"
+    below_floor_direct: "{{ (floor_ok | bool) and (head_ok | bool) and floor != '' and head < floor }}"
+
+    # Every boolean above is re-coerced with `| bool` where it is used:
+    # ansible-core 2.18 can hand a nested var back as the string 'False'.
+    v: "{{ has_verdict | bool }}"
+    # Specific refusals, in order of what the operator should act on first.
+    specific: >-
+      {{ ([] if (completed | bool) else ['status_error'])
+         + (['below_floor'] if ((completed | bool) and (v | bool) and verdict == 'below_floor') or (below_floor_direct | bool) else [])
+         + (['mismatch'] if (completed | bool) and (((v | bool) and verdict == 'mismatch')
+            or ((not (v | bool)) and st_checksums_mismatched | int > 0)) else [])
+         + (['unverified'] if (completed | bool) and (((v | bool) and verdict == 'unverified')
+            or ((not (v | bool)) and st_checksums_unverified | int > 0)) else [])
+         + (['unparseable'] if (completed | bool) and not (parseable | bool) else [])
+         + (['unknown_verdict'] if (completed | bool) and (parseable | bool) and (v | bool)
+            and verdict not in ['ready', 'pending', 'below_floor', 'mismatch', 'unverified'] else [])
+         + ([] if (floor_ok | bool) else ['floor_unreadable'])
+         + ([] if (head_ok | bool) else ['head_unreadable']) }}
+    # Only when nothing above explains it: verdict, exit code and pending
+    # count must agree (ready = exit 0, nothing pending; pending = exit 1,
+    # something pending; a pre-verdict build exits 1 exactly when pending).
+    inconsistent: >-
+      {{ (completed | bool) and (parseable | bool) and (
+           ((v | bool) and verdict == 'ready' and ((st_rc | int) != 0 or (st_summary_pending | int) != 0))
+           or ((v | bool) and verdict == 'pending' and ((st_rc | int) != 1 or (st_summary_pending | int) == 0))
+           or ((not (v | bool)) and (((st_rc | int) == 0) != ((st_summary_pending | int) == 0)))) }}
+    reasons: "{{ specific + (['inconsistent'] if (specific | length == 0 and inconsistent | bool) else []) }}"
+    # The STAGED target files, explicitly: the live ones still name the
+    # running release, whose migrator is not the one to adopt with.
+    # --no-deps: postgres is running (it holds the legacy data); never
+    # recreate it for this.
+    adopt_cmd: >-
+      {{ truewealth_staged_compose_cmd | default('docker compose') }} --profile ops run --rm -T --no-deps migrate
+      node dist/ops/migrate.mjs --adopt-legacy-checksums
+    why:
+      status_error: >-
+        the target migrator's `migrate --status` did not complete (exit {{ st_rc }}){{ (': ' ~ st_failure) if st_failure else '' }}.
+        The database may be unreachable or the migrator broken; nothing could be verified, so nothing proceeds.
+      below_floor: >-
+        the target build's newest migration ({{ head or 'unknown' }}) is older than the database's rollback floor
+        ({{ floor or 'see --status' }}){{ ' [verdict: below_floor]' if verdict == 'below_floor' else '' }}{{
+        ' — by direct comparison: this build has no `verdict:` line, so it cannot check the floor itself' if not (v | bool) else '' }}.
+        Running it would reopen the fixes the floor protects. Deploy a build at or above the floor; going below it
+        needs a database restore with matching images (README: Restore), never this playbook.
+      mismatch: >-
+        applied migration text differs from the target build's file{{ (' (' ~ (st_mismatched | join(', ')) ~ ')') if st_mismatched else '' }}
+        [{{ 'verdict: mismatch' if (v | bool) else 'checksums line' }}]. Do not continue: deploy the matching build,
+        or reconcile the schema by hand as a separate decision.
+      unverified: >-
+        {{ st_unverified | length or st_checksums_unverified }} applied migration(s) have no recorded checksum (a
+        database migrated before checksum tracking){{ ' [verdict: unverified]' if (v | bool) else '' }}. Adopting them
+        is an OPERATOR step and never automatic (this role never adds the flag): confirm the database was migrated
+        only from this release line, then run on the host, from {{ truewealth_root | default('the TrueWealth root') }}:
+        `{{ adopt_cmd | trim }}` (TrueWealth docs/operations.md, Migrations; the application verifies the history
+        before adopting and refuses any other), and re-run this playbook.
+      unparseable: >-
+        the output of `migrate --status` could not be parsed: it needs exactly one `migrations: N/M applied, K pending`
+        summary with K `pending` lines, and at most one `verdict:` line, as the last line.
+      unknown_verdict: >-
+        unknown verdict '{{ verdict | truncate(40) }}'; only `ready` and `pending` proceed.
+      inconsistent: >-
+        verdict, exit code and pending count disagree (verdict {{ verdict or 'none' }}, exit {{ st_rc }},
+        {{ st_summary_pending }} pending).
+      floor_unreadable: >-
+        the rollback floor could not be read from the database (public._tw_schema_meta, postgres service; exit
+        {{ truewealth_gate_floor_raw.rc | default('none') }}). It is compared with the target's head before anything changes.
+      head_unreadable: >-
+        the target migrator image's migrations ({{ truewealth_migrator_migrations_dir | default('/app/db/migrations') }})
+        could not be listed (exit {{ truewealth_gate_head_raw.rc | default('none') }}, {{ head_names | length }} .sql names).
+  ansible.builtin.set_fact:
+    # ONE expression, so null stays null and numbers stay numbers on every
+    # supported ansible-core (2.18 templates each scalar to a string).
+    truewealth_gate: >-
+      {{ {'decision': 'refused' if reasons | length > 0 else 'proceed',
+          'reason': reasons | first | default('none'),
+          'reasons': reasons,
+          'path': 'verdict' if (v | bool) else 'direct comparison (no verdict line: a batch 1-6 build)',
+          'verdict': verdict if (v | bool) else none,
+          'exit': st_rc | int,
+          'pending': st_pending,
+          'floor': floor if floor else none,
+          'head': head if head else none,
+          'rollbackTarget': truewealth_gate_rollback_target | default(false) | bool,
+          'migratorImage': (truewealth_loaded_ids | default({})).migrator | default(none),
+          'decidedAt': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+          'message': reasons | map('extract', why) | map('trim') | list} }}

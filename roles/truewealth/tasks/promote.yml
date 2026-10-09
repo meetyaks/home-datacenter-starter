@@ -1,0 +1,34 @@
+---
+# Only after the rollback-floor gate PROCEEDED: the staged target
+# configuration becomes the live one (truewealth_env_file,
+# truewealth_compose_file), which everything from here on — the recovery
+# point, migrate, `up`, the backup timer, an operator's `compose up`, a
+# restart after a reboot — uses. A refused run never gets here, so the live
+# files keep naming what is running.
+#
+# Unchanged content is not rewritten (an UNCHANGED re-run reports
+# changed=0).
+
+- name: Make the staged environment file live
+  ansible.builtin.copy:
+    src: "{{ truewealth_staged_env_file }}"
+    dest: "{{ truewealth_env_file }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  # no_log hides the value from output and callbacks; diff: false keeps it out
+  # of --diff (which renders file contents) as well.
+  diff: false
+  no_log: true
+  register: truewealth_env_written
+
+- name: Make the staged compose file live
+  ansible.builtin.copy:
+    src: "{{ truewealth_staged_compose_file }}"
+    dest: "{{ truewealth_compose_file }}"
+    remote_src: true
+    owner: "{{ truewealth_owner }}"
+    group: "{{ truewealth_group }}"
+    mode: "0644"
+  register: truewealth_compose_written

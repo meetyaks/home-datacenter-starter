@@ -1,0 +1,50 @@
+---
+# Only reached when EVERY verification passed (health and readiness, running
+# image identity, loopback-only binding, name resolution, trusted HTTPS
+# through the ingress, running revision): only now is the deployment
+# recorded as successful.
+
+- name: Keep the last DISTINCT successful deployment as the rollback target
+  # A redeploy of the same commit and images (for example after a secret
+  # rotation) must not overwrite the rollback target with itself.
+  ansible.builtin.copy:
+    dest: "{{ truewealth_rollback_file }}"
+    content: "{{ truewealth_prev | to_nice_json }}\n"
+    owner: "{{ truewealth_owner }}"
+    group: "{{ truewealth_group }}"
+    mode: "0644"
+  when:
+    - (truewealth_prev | length > 0)
+    - truewealth_prev.commit != truewealth_commit or truewealth_prev.loadedIds != truewealth_loaded_ids
+
+- name: Record the verified deployment
+  ansible.builtin.copy:
+    dest: "{{ truewealth_deployment_manifest }}"
+    content: >-
+      {{ {'schema': 'truewealth-deploy/2',
+          'commit': truewealth_commit,
+          'verifiedAt': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+          'attempt': truewealth_attempt.id,
+          'run': truewealth_transfer.run,
+          'evidenceClass': truewealth_transfer.evidenceClass,
+          'evidenceSha256': truewealth_transfer.evidenceSha256,
+          'platform': truewealth_transfer.platform,
+          'images': truewealth_transfer.images,
+          'loadedIds': truewealth_loaded_ids,
+          'workerHeld': truewealth_hold_worker | bool,
+          'preMigrationRecoveryPoint': truewealth_recovery_point | default(none),
+          'gate': truewealth_gate,
+          'verification': ['compose up --wait: every health check', 'running containers are the loaded image identities',
+                           'readyz: every check ok', 'web bound to loopback only', truewealth_hostname ~ ' resolves on the host',
+                           'HTTPS through the ingress with a trusted certificate', 'running revision label is the commit']}
+         | to_nice_json }}
+    owner: "{{ truewealth_owner }}"
+    group: "{{ truewealth_group }}"
+    mode: "0644"
+
+- name: Close the attempt as succeeded
+  ansible.builtin.include_tasks: attempt.yml
+  vars:
+    truewealth_attempt_update:
+      status: succeeded
+      finishedAt: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"

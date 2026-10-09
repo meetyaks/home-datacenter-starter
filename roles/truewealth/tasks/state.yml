@@ -1,0 +1,120 @@
+---
+# What is deployed now, and would this run change it?
+#
+# UNCHANGED means: the last VERIFIED deployment (DEPLOYMENT_MANIFEST.json) is
+# this commit with these image identities, nothing is pending in the
+# database, no configuration input changed in this run, the worker hold is
+# the same, and every service is running the verified image. An unchanged
+# run converges and verifies, and writes no record: a record is evidence of a
+# deployment, not of the time a playbook last ran.
+
+- name: Read the last successful deployment record
+  ansible.builtin.slurp:
+    src: "{{ truewealth_deployment_manifest }}"
+  register: truewealth_prev_raw
+  failed_when: false
+  check_mode: false
+
+- name: Parse it
+  ansible.builtin.set_fact:
+    # {} when there is no verified deployment yet (a template cannot yield a
+    # real None; it would come back as the string "None").
+    truewealth_prev: "{{ (truewealth_prev_raw.content | b64decode | from_json) if truewealth_prev_raw.content is defined else {} }}"
+
+- name: The image each running service uses (identity, not tag)
+  ansible.builtin.shell:
+    cmd: >-
+      docker ps -q --filter "label=com.docker.compose.project={{ truewealth_project }}"
+      | xargs -r docker inspect --format
+      '{{ '{{' }}index .Config.Labels "com.docker.compose.service"{{ '}}' }}={{ '{{' }}.Image{{ '}}' }}'
+  register: truewealth_running_raw
+  changed_when: false
+  check_mode: false
+
+- name: Index them
+  ansible.builtin.set_fact:
+    truewealth_running: "{{ dict(truewealth_running_raw.stdout_lines | map('split', '=', 1)) }}"
+
+- name: Migration status of the database against THIS release's migrator
+  # Exit 0: ready; exit 1: not ready, and from batch 7 the last line says why
+  # (`verdict: ready|pending|unverified|mismatch|below_floor`, db/migrate.ts).
+  # It never fails here: the rollback-floor gate (gate.yml), which runs next
+  # and before anything changes, decides on this output and fails closed on
+  # anything it cannot read.
+  #
+  # Through the STAGED target configuration (the live files are untouched
+  # until the gate proceeds). And it must not touch a running postgres:
+  # `compose run` brings up the service's dependencies, and if the target's
+  # compose file defines postgres differently from the running container,
+  # that would RECREATE postgres before the gate has decided. So when
+  # postgres is running, `--no-deps`: the one-off migrator joins the
+  # project network and talks to the postgres that is running. Only when no
+  # postgres container is running (a first deployment, or one already
+  # stopped) may compose start it — there is no running database to disturb.
+  ansible.builtin.command:
+    argv: >-
+      {{ (truewealth_staged_compose_cmd | split) + ['--profile', 'ops', 'run', '--rm', '-T']
+         + (['--no-deps'] if 'postgres' in truewealth_running else [])
+         + ['migrate', 'node', 'dist/ops/migrate.mjs', '--status'] }}
+    chdir: "{{ truewealth_root }}"
+  register: truewealth_mstatus
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Does the staged configuration differ from the live one?
+  # Checksums only; the env file's content never leaves the host.
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  loop:
+    - "{{ truewealth_env_file }}"
+    - "{{ truewealth_staged_env_file }}"
+    - "{{ truewealth_compose_file }}"
+    - "{{ truewealth_staged_compose_file }}"
+  register: truewealth_config_stat
+  no_log: true
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: What is pending
+  ansible.builtin.set_fact:
+    truewealth_pending: "{{ truewealth_mstatus.stdout_lines | select('match', '^\\s+pending \\S+$') | map('regex_replace', '^\\s+pending ', '') | list }}"
+  when: not ansible_check_mode
+
+- name: Is this run a change?
+  vars:
+    expected_running: >-
+      {{ {'web': truewealth_loaded_ids.web, 'compute': truewealth_loaded_ids.compute}
+         | combine({} if truewealth_hold_worker | bool else {'worker': truewealth_loaded_ids.worker}) }}
+    # web/worker/compute exactly as expected (a held worker must NOT run),
+    # and the data services up.
+    running_matches: >-
+      {{ (truewealth_running | dict2items | selectattr('key', 'in', ['web', 'worker', 'compute']) | items2dict) == expected_running
+         and 'postgres' in truewealth_running and 'redis' in truewealth_running }}
+    # live env, staged env, live compose, staged compose (stat above)
+    cs: "{{ truewealth_config_stat.results | map(attribute='stat') | map(attribute='checksum', default='') | list }}"
+    config_differs: "{{ cs[0] == '' or cs[0] != cs[1] or cs[2] == '' or cs[2] != cs[3] }}"
+    inputs_changed: >-
+      {{ (config_differs | bool) or (truewealth_redis_secret is changed)
+         or ((truewealth_need | default([])) | length > 0) }}
+  ansible.builtin.set_fact:
+    truewealth_existing: "{{ (truewealth_prev | length > 0) or truewealth_running | length > 0 }}"
+    truewealth_unchanged: >-
+      {{ (truewealth_prev | length > 0)
+         and truewealth_prev.commit == truewealth_commit
+         and truewealth_prev.loadedIds == truewealth_loaded_ids
+         and (truewealth_prev.workerHeld | default(false)) == (truewealth_hold_worker | bool)
+         and truewealth_pending | length == 0
+         and not (inputs_changed | bool)
+         and (running_matches | bool) }}
+  when: not ansible_check_mode
+
+- name: The plan for this run
+  ansible.builtin.debug:
+    msg:
+      - "Last verified deployment: {{ truewealth_prev.commit if truewealth_prev else 'none' }}"
+      - "This run: {{ truewealth_commit }} — {{ 'UNCHANGED (converge and verify only; no records written)' if truewealth_unchanged else 'CHANGE' }}"
+      - "Pending migrations: {{ truewealth_pending | length }}{{ (' ' ~ truewealth_pending) if truewealth_pending else '' }}"
+      - "{{ 'Existing data: a recovery point is taken and the worker stopped before migrating.' if (truewealth_existing and truewealth_pending) else '' }}"
+  when: not ansible_check_mode

@@ -1,0 +1,24 @@
+---
+# One negative case for roles/truewealth/tasks/controller.yml: it must FAIL.
+- name: "Case — {{ case.name }}"
+  block:
+    - name: "Run controller.yml ({{ case.name }})"
+      ansible.builtin.include_role:
+        name: truewealth
+        tasks_from: controller
+      vars:
+        truewealth_commit: "{{ case.commit }}"
+        truewealth_transfer_dir: "{{ case.dir }}"
+        truewealth_source_repo: "{{ fixture_repo }}"
+        truewealth_run_id: "4242"
+        truewealth_run_attempt: "1"
+    - name: It should not get here
+      ansible.builtin.fail:
+        msg: "MISSED: {{ case.name }} was accepted"
+  rescue:
+    - name: "Refused: {{ case.name }}"
+      ansible.builtin.assert:
+        that:
+          - ansible_failed_result.msg is not search('^MISSED')
+        fail_msg: "{{ ansible_failed_result.msg }}"
+        quiet: true

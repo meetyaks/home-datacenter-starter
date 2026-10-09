@@ -1,0 +1,10 @@
+#!/bin/sh
+# STAND-IN `node` (tests only): maps the commands the compose file and the
+# deployment role run onto standin.py.
+case "$1" in
+  dist/ops/migrate.mjs) shift; exec python3 /app/standin.py migrate "$@" ;;
+  scripts/worker-healthcheck.mjs) exit 0 ;;
+  -e) exec python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:3000/api/readyz', timeout=3).status == 200 else 1)" ;;
+  standin) exec python3 /app/standin.py serve ;;
+  *) echo "stand-in node: unsupported: $*" >&2; exit 2 ;;
+esac

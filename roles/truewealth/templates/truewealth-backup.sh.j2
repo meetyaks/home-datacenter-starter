@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+#
+# TrueWealth disaster-recovery backup (infrastructure-owned).
+#
+#   truewealth-backup [--reason scheduled|manual|pre-migration]
+#
+# Runs as root (truewealth-backup.timer, or the deployment role before it
+# migrates an existing database). Exits non-zero on ANY failure; a partial
+# directory is removed and LAST_STATUS.json says what failed — a backup that
+# did not happen must never look like one that did.
+#
+#   <backups>/<stamp>/                 scheduled and manual backups
+#   <backups>/pre-migration/<stamp>/   recovery points taken before a migration
+#                                      (never touched by retention)
+#     db.dump         pg_dump -Fc of ONE exported snapshot
+#     manifest.json   secret-free; its schema state and counts were read in the
+#                     SAME snapshot as the dump (pg_export_snapshot +
+#                     pg_dump --snapshot), so they describe exactly its content
+#     db.dump.age     only when age recipients are configured (what may leave
+#                     the host; plaintext never does)
+#   <backups>/LAST_STATUS.json         result of the last run (for monitoring)
+#
+# PostgreSQL is the only authoritative store. Redis is NOT backed up (queues
+# and schedules; see the redis policy in the manifest and the role README).
+set -euo pipefail
+umask 077
+
+ROOT='{{ truewealth_root }}'
+BACKUPS='{{ truewealth_backup_dir }}'
+KEEP='{{ truewealth_backup_keep | int }}'
+RETENTION_APPROVED='{{ truewealth_backup_retention_approved | bool | lower }}'
+LOCK_WAIT='{{ truewealth_backup_lock_wait_seconds | int }}'
+ENV_FILE='{{ truewealth_env_file }}'
+DEPLOYMENT='{{ truewealth_deployment_manifest }}'
+# The same invocation the role uses (truewealth_compose_cmd); paths contain no spaces.
+COMPOSE=({{ truewealth_compose_cmd }})
+AGE_RECIPIENTS=({% for r in truewealth_backup_age_recipients %}'{{ r }}' {% endfor %})
+OFFHOST='{{ truewealth_backup_offhost_target }}'
+OFFHOST_KEY='{{ truewealth_backup_offhost_ssh_key }}'
+
+REASON=scheduled
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --reason) REASON="${2:-}"; shift 2 ;;
+    *) echo "usage: truewealth-backup [--reason scheduled|manual|pre-migration]" >&2; exit 2 ;;
+  esac
+done
+case "$REASON" in
+  scheduled|manual) DEST="$BACKUPS" ;;
+  pre-migration)    DEST="$BACKUPS/pre-migration" ;;
+  *) echo "truewealth-backup: unknown reason '$REASON'" >&2; exit 2 ;;
+esac
+
+mkdir -p "$BACKUPS" "$DEST"
+chmod 0700 "$BACKUPS" "$DEST"
+STATUS_FILE="$BACKUPS/LAST_STATUS.json"
+stage=init
+final=""
+write_status() { # result
+  local tmp
+  tmp="$(mktemp "$BACKUPS/.status.XXXXXX")"
+  printf '{"schema":"truewealth-backup-status/1","result":"%s","reason":"%s","stage":"%s","at":"%s","dir":"%s"}\n' \
+    "$1" "$REASON" "$stage" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$final" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$STATUS_FILE"
+}
+
+# ── One backup at a time ─────────────────────────────────────────────────────
+# The timer and a pre-migration backup must never interleave. Wait, bounded,
+# for the other run; then fail rather than skip silently.
+exec 9>"$BACKUPS/.lock"
+if ! flock -w "$LOCK_WAIT" 9; then
+  stage=lock
+  write_status failed
+  echo "truewealth-backup: another backup still holds the lock after ${LOCK_WAIT}s" >&2
+  exit 75
+fi
+
+# Under the lock, a stamp is never reused: a backup that waited for another
+# can start in the same second it finished.
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+while [ -e "$DEST/$stamp" ] || [ -e "$DEST/.${stamp}.partial" ]; do
+  sleep 1
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+done
+work="$DEST/.${stamp}.partial"
+ctmp="/tmp/tw-backup-$stamp-$$"
+on_exit() {
+  local rc=$?
+  rm -rf "$work"
+  "${COMPOSE[@]}" exec -T postgres rm -rf "$ctmp" >/dev/null 2>&1 || true
+  if [ "$rc" -ne 0 ]; then
+    final=""
+    write_status failed
+    echo "truewealth-backup: FAILED at stage '$stage' (exit $rc); no backup was recorded" >&2
+  fi
+}
+trap on_exit EXIT
+mkdir -p "$work"
+cd "$ROOT"
+
+# ── 1. Dump and metadata from ONE snapshot ─────────────────────────────────
+# A read-only repeatable-read transaction exports its snapshot; pg_dump runs
+# while that transaction is open, with --snapshot, and the counts are read in
+# the same transaction. Writes that land during the backup are in neither.
+# Runs inside the postgres container over its local socket; the credentials
+# never leave the container's own environment. The script arrives on stdin.
+stage=snapshot
+"${COMPOSE[@]}" exec -T postgres sh -s -- "$ctmp" <<'INNER'
+set -eu
+out="$1"
+mkdir -m 700 "$out"
+psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v outdir="$out" <<'SQL'
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_export_snapshot() AS snap \gset
+\setenv TW_SNAPSHOT :snap
+\setenv TW_OUT :outdir
+\! pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc --no-owner --no-privileges --snapshot="$TW_SNAPSHOT" -f "$TW_OUT/db.dump" || touch "$TW_OUT/dump.failed"
+\pset tuples_only on
+\pset format unaligned
+\o :outdir/meta.json
+SELECT json_build_object(
+  'snapshot', :'snap',
+  'readAt', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  'postgresVersion', current_setting('server_version'),
+  'appliedMigrations', (SELECT count(*) FROM public._tw_migrations),
+  'lastMigration', (SELECT max(name) FROM public._tw_migrations),
+  'users', (SELECT count(*) FROM core.users),
+  'households', (SELECT count(*) FROM core.households),
+  'representative', (SELECT json_object_agg(t, n) FROM (
+      SELECT format('%s.%s', table_schema, table_name) AS t,
+             (xpath('/row/n/text()', query_to_xml(format('SELECT count(*) AS n FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS n
+      FROM information_schema.tables
+      WHERE table_type = 'BASE TABLE' AND (table_schema, table_name) IN (
+        ('core', 'household_members'), ('wealth', 'accounts'), ('wealth', 'account_balances'), ('wealth', 'assets'),
+        ('wealth', 'asset_valuations'), ('wealth', 'positions'), ('wealth', 'snapshots'), ('wealth', 'snapshot_items'))) c)
+)::text;
+\o
+COMMIT;
+SQL
+[ ! -e "$out/dump.failed" ] || { echo "pg_dump failed inside the snapshot" >&2; exit 1; }
+[ -s "$out/db.dump" ] && [ -s "$out/meta.json" ]
+INNER
+"${COMPOSE[@]}" cp "postgres:$ctmp/db.dump" "$work/db.dump" >/dev/null
+"${COMPOSE[@]}" cp "postgres:$ctmp/meta.json" "$work/.meta.json" >/dev/null
+"${COMPOSE[@]}" exec -T postgres rm -rf "$ctmp"
+chmod 0600 "$work/db.dump" "$work/.meta.json"
+[ -s "$work/db.dump" ] || { echo "truewealth-backup: the dump is empty" >&2; exit 1; }
+meta="$(tr -d '\n' < "$work/.meta.json")"
+rm -f "$work/.meta.json"
+case "$meta" in '{"snapshot"'*) ;; *) echo "truewealth-backup: unreadable snapshot metadata" >&2; exit 1 ;; esac
+
+# ── 2. The dump must parse as an archive (catches truncation) ──────────────
+stage=verify-archive
+"${COMPOSE[@]}" exec -T postgres pg_restore --list < "$work/db.dump" > "$work/.toc"
+entries="$(grep -cvE '^\s*(;|$)' "$work/.toc" || true)"
+rm -f "$work/.toc"
+[ "${entries:-0}" -gt 0 ] || { echo "truewealth-backup: the dump has no restorable entries" >&2; exit 1; }
+
+# ── 3. Key references WITHOUT the keys ─────────────────────────────────────
+# A fingerprint lets a restore confirm it holds the right secret before
+# relying on it. Every at-rest key the application uses is listed; one that
+# is not configured is recorded as null. printf is a shell builtin: the value
+# never becomes a process argument.
+stage=key-fingerprints
+fp_of() { # env var name, domain prefix → fingerprint JSON or null
+  local v
+  v="$(sed -n "s/^$1=//p" "$ENV_FILE" | head -1)"
+  if [ -z "$v" ]; then printf 'null'; return; fi
+  printf '{"fingerprint":"%s","algorithm":"sha256(%s+secret)[0:16]"}' \
+    "$(printf '%s' "$2$v" | sha256sum | cut -c1-16)" "'$2'"
+}
+key_fp="$(fp_of TW_KEY_SECRET 'tw-key:')"
+[ "$key_fp" != null ] || { echo "truewealth-backup: TW_KEY_SECRET is not in $ENV_FILE" >&2; exit 1; }
+llm_fp="$(fp_of TW_SECRET_KEY 'tw-llm-key:')"
+audit_fp="$(fp_of TW_AUDIT_SIGNING_SECRET 'tw-audit:')"
+
+dump_sha="$(sha256sum "$work/db.dump" | cut -d' ' -f1)"
+dump_size="$(wc -c < "$work/db.dump" | tr -d ' ')"
+deployment='null'
+[ -r "$DEPLOYMENT" ] && deployment="$(cat "$DEPLOYMENT")"
+
+# ── 4. Encrypted copy for off-host transfer (public keys only here) ────────
+stage=encrypt
+encrypted='null'
+if [ -n "${AGE_RECIPIENTS[*]:-}" ]; then
+  args=()
+  for r in "${AGE_RECIPIENTS[@]}"; do args+=(-r "$r"); done
+  age "${args[@]}" -o "$work/db.dump.age" "$work/db.dump"
+  chmod 0600 "$work/db.dump.age"
+  enc_sha="$(sha256sum "$work/db.dump.age" | cut -d' ' -f1)"
+  rjson="$(printf '"%s",' "${AGE_RECIPIENTS[@]}")"
+  encrypted="{\"file\":\"db.dump.age\",\"sha256\":\"$enc_sha\",\"tool\":\"age\",\"recipients\":[${rjson%,}]}"
+fi
+
+stage=manifest
+cat > "$work/manifest.json" <<JSON
+{
+  "schema": "truewealth-backup/2",
+  "reason": "$REASON",
+  "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "host": "$(hostname -s)",
+  "database": {
+    "file": "db.dump",
+    "format": "pg_dump custom (-Fc) of one exported snapshot",
+    "sha256": "$dump_sha",
+    "sizeBytes": $dump_size,
+    "restorableEntries": $entries
+  },
+  "snapshot": $meta,
+  "metadataSource": "schema state and counts read in the same exported snapshot as the dump",
+  "encryptedCopy": $encrypted,
+  "deployment": $deployment,
+  "keys": {
+    "TW_KEY_SECRET": $key_fp,
+    "TW_SECRET_KEY": $llm_fp,
+    "TW_AUDIT_SIGNING_SECRET": $audit_fp,
+    "note": "Fingerprints only. MFA secrets and provider credentials need TW_KEY_SECRET; stored LLM provider API keys need TW_SECRET_KEY; audit signatures need TW_AUDIT_SIGNING_SECRET. They are in the Ansible Vault; this backup is not self-sufficient without them."
+  },
+  "redis": { "policy": "{{ truewealth_backup_redis_policy }}",
+    "note": "Queues and schedules only; not restored. After a restore the worker stays stopped until jobs and broker state are reconciled (role README: Redis loss and job reconciliation)." },
+  "restore": "Restore into an ISOLATED database first (truewealth-restore-verify). Never over newer production data without an approved, exact replacement target."
+}
+JSON
+chmod 0600 "$work/manifest.json"
+
+stage=finalize
+final="$DEST/$stamp"
+mv "$work" "$final"
+echo "truewealth-backup: $final ($REASON; $dump_size bytes, sha256 $dump_sha)"
+
+# ── 5. Off-host: the ENCRYPTED file and the manifest, then a COMPLETE marker
+# ── written last, so an interrupted transfer never looks like a backup ─────
+if [ -n "$OFFHOST" ]; then
+  stage=offhost
+  [ -f "$final/db.dump.age" ] || { echo "truewealth-backup: off-host target set but no age recipients; refusing to send plaintext" >&2; exit 1; }
+  [ -r "$OFFHOST_KEY" ] || { echo "truewealth-backup: off-host SSH key $OFFHOST_KEY is not readable" >&2; exit 1; }
+  perm="$(stat -c '%U %a' "$OFFHOST_KEY")"
+  case "$perm" in "root 600"|"root 400") ;; *) echo "truewealth-backup: $OFFHOST_KEY must be root-owned, mode 0600/0400 (is: $perm)" >&2; exit 1 ;; esac
+  ssh_cmd="ssh -i $OFFHOST_KEY -o BatchMode=yes -o StrictHostKeyChecking=yes"
+  rsync -a --mkpath --chmod=F600 --partial-dir=.rsync-partial --delay-updates -e "$ssh_cmd" \
+    "$final/db.dump.age" "$final/manifest.json" "$OFFHOST/$stamp/"
+  printf '{"schema":"truewealth-offhost-complete/1","db.dump.age":"%s","manifest.json":"%s"}\n' \
+    "$(sha256sum "$final/db.dump.age" | cut -d' ' -f1)" "$(sha256sum "$final/manifest.json" | cut -d' ' -f1)" > "$final/COMPLETE"
+  rsync -a --chmod=F600 -e "$ssh_cmd" "$final/COMPLETE" "$OFFHOST/$stamp/COMPLETE"
+  echo "truewealth-backup: sent the encrypted copy to $OFFHOST/$stamp/ (COMPLETE written last)"
+fi
+
+# ── 6. Local retention: DISABLED unless explicitly approved ────────────────
+# Deleting backups is a policy decision (scope and period). Until
+# truewealth_backup_retention_approved is true, nothing is ever deleted.
+# Pre-migration recovery points and off-host copies are never deleted here.
+if [ "$RETENTION_APPROVED" = true ] && [ "$KEEP" -gt 0 ] && [ "$REASON" = scheduled ]; then
+  stage=retention
+  ls -1dt "$BACKUPS"/[0-9]*Z 2>/dev/null | tail -n +"$((KEEP + 1))" | xargs -r rm -rf
+fi
+
+stage=done
+write_status succeeded

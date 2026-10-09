@@ -1,0 +1,341 @@
+---
+# roles/truewealth/tasks/gate-decide.yml, the REAL decision file, fed with
+# STUBBED observations (no host, no Docker, no database):
+#   - `migrate --status` output, line for line as TrueWealth db/migrate.ts
+#     prints it (batch 7+: with the `verdict:` last line; batch 6: the floor
+#     line without it; batches 1-5: the summary and pending lines only);
+#   - the floor read (`floor=<name>` | `floor-absent`) and the migrator
+#     image's migration list.
+# Covers the contract's A1-A6 decisions (TrueWealth
+# docs/rollback-floor-contract.md) and every fail-closed path. The
+# end-to-end A1-A6 with the real role, stand-in images and a real
+# PostgreSQL are in tests/truewealth-deploy-harness.sh (section "gate").
+#
+# Prints `GATE CASE <name>: <decision> <reasons>`; any wrong decision fails
+# the play with `MISSED`.
+- name: The rollback-floor gate decides from stubbed --status outputs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    truewealth_staged_compose_cmd: docker compose --project-name truewealth --env-file /srv/data/services/truewealth/staging/truewealth.env -f /srv/data/services/truewealth/staging/compose.dc1.yml
+    truewealth_root: /srv/data/services/truewealth
+    truewealth_loaded_ids: { migrator: "sha256:0000000000000000000000000000000000000000000000000000000000000001" }
+    floor0116: { rc: 0, stdout_lines: ["floor=0116_platform_admins.sql"] }
+    floor0125: { rc: 0, stdout_lines: ["floor=0125_synthetic_future.sql"] }
+    nofloor: { rc: 0, stdout_lines: ["floor-absent"] }
+    head0128: { rc: 0, stdout_lines: ["0001_core.sql", "0001_initial.sql", "0020_cash_flow.sql", "0115_server_sessions.sql", "0116_platform_admins.sql", "0127_x.sql", "0128_auth_throttle.sql", "README.md"] }
+    head0115: { rc: 0, stdout_lines: ["0001_initial.sql", "0114_y.sql", "0115_server_sessions.sql"] }
+    head0110: { rc: 0, stdout_lines: ["0001_initial.sql", "0110_batch5.sql"] }
+    head0124: { rc: 0, stdout_lines: ["0001_initial.sql", "0116_platform_admins.sql", "0124_batch5.sql"] }
+    cases:
+      # ── A1: floor 0116, ready; a batch-6+ target whose newest migration is 0115
+      - name: "A1 batch-7 target below the floor"
+        status:
+          rc: 1
+          stdout_lines:
+            - "migrations: 115/115 applied, 0 pending"
+            - "checksums: 0 mismatched, 0 unverified; 13 applied migration(s) newer than this build"
+            - "rollback floor: 0116_platform_admins.sql; this build: 0115_server_sessions.sql"
+            - "not ready: database schema is not ready: this build (0115_server_sessions.sql) is older than the rollback floor (0116_platform_admins.sql); deploy a build at or above it"
+            - "verdict: below_floor"
+        floor: floor0116
+        head: head0115
+        expect: refused
+        reasons: [below_floor]
+        says: "verdict: below_floor"
+      # ── A2: floor raised to a synthetic 0125; a batch-5 build (no floor knowledge)
+      - name: "A2 batch-5 target, floor raised to 0125 (direct comparison)"
+        status: { rc: 0, stdout_lines: ["migrations: 124/124 applied, 0 pending"] }
+        floor: floor0125
+        head: head0124
+        expect: refused
+        reasons: [below_floor]
+        says: "by direct comparison"
+      - name: "A2 variant: batch-5 rollback target below the REAL floor"
+        status: { rc: 0, stdout_lines: ["migrations: 110/110 applied, 0 pending"] }
+        floor: floor0116
+        head: head0110
+        rollback: true
+        expect: refused
+        reasons: [below_floor]
+        says: "0110_batch5.sql"
+      # ── A3: legacy pre-checksum rows; a batch-7 build
+      - name: "A3 legacy rows, batch-7 target: the operator must adopt"
+        status:
+          rc: 1
+          stdout_lines:
+            - "migrations: 114/128 applied, 14 pending"
+            - "  pending 0115_server_sessions.sql"
+            - "  pending 0116_platform_admins.sql"
+            - "  pending 0117_a.sql"
+            - "  pending 0118_a.sql"
+            - "  pending 0119_a.sql"
+            - "  pending 0120_a.sql"
+            - "  pending 0121_a.sql"
+            - "  pending 0122_a.sql"
+            - "  pending 0123_a.sql"
+            - "  pending 0124_a.sql"
+            - "  pending 0125_a.sql"
+            - "  pending 0126_a.sql"
+            - "  pending 0127_x.sql"
+            - "  pending 0128_auth_throttle.sql"
+            - "checksums: 0 mismatched, 2 unverified"
+            - "  unverified 0001_initial.sql"
+            - "  unverified 0114_y.sql"
+            - "rollback floor: none; this build: 0128_auth_throttle.sql"
+            - "not ready: database schema is not ready: 2 applied migration(s) have no recorded checksum; run the migrate step with --adopt-legacy-checksums"
+            - "verdict: unverified"
+        floor: nofloor
+        head: head0128
+        expect: refused
+        reasons: [unverified]
+        says: "--env-file /srv/data/services/truewealth/staging/truewealth.env -f /srv/data/services/truewealth/staging/compose.dc1.yml --profile ops run --rm -T --no-deps migrate node dist/ops/migrate.mjs --adopt-legacy-checksums"
+      - name: "A3 after the operator adopted: the re-run proceeds"
+        status:
+          rc: 0
+          stdout_lines:
+            - "migrations: 128/128 applied, 0 pending"
+            - "checksums: 0 mismatched, 0 unverified"
+            - "rollback floor: 0116_platform_admins.sql; this build: 0128_auth_throttle.sql"
+            - "verdict: ready"
+        floor: floor0116
+        head: head0128
+        expect: proceed
+        reasons: []
+      # ── A4: an applied migration's text differs
+      - name: "A4 applied text differs"
+        status:
+          rc: 1
+          stdout_lines:
+            - "migrations: 128/128 applied, 0 pending"
+            - "checksums: 1 mismatched, 0 unverified"
+            - "  mismatched 0127_x.sql"
+            - "rollback floor: 0116_platform_admins.sql; this build: 0128_auth_throttle.sql"
+            - "not ready: database schema is not ready: 1 applied migration(s) differ from this build's files"
+            - "verdict: mismatch"
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [mismatch]
+        says: "0127_x.sql"
+      # ── A5 (negative control): at the floor, nothing pending
+      - name: "A5 at the floor, nothing pending, same or newer build"
+        status:
+          rc: 0
+          stdout_lines:
+            - "migrations: 128/128 applied, 0 pending"
+            - "checksums: 0 mismatched, 0 unverified; 2 applied migration(s) newer than this build"
+            - "rollback floor: 0116_platform_admins.sql; this build: 0128_auth_throttle.sql"
+            - "verdict: ready"
+        floor: floor0116
+        head: head0128
+        expect: proceed
+        reasons: []
+      - name: "A5 a rollback above the floor to a build OLDER than the applied set"
+        status:
+          rc: 0
+          stdout_lines:
+            - "migrations: 116/116 applied, 0 pending"
+            - "checksums: 0 mismatched, 0 unverified; 12 applied migration(s) newer than this build"
+            - "rollback floor: 0116_platform_admins.sql; this build: 0116_platform_admins.sql"
+            - "verdict: ready"
+        floor: floor0116
+        head: { rc: 0, stdout_lines: ["0001_initial.sql", "0116_platform_admins.sql"] }
+        rollback: true
+        expect: proceed
+        reasons: []
+      # ── A6 (negative control): at the floor, migrations pending
+      - name: "A6 at the floor, migrations pending, newer build"
+        status:
+          rc: 1
+          stdout_lines:
+            - "migrations: 126/128 applied, 2 pending"
+            - "  pending 0127_x.sql"
+            - "  pending 0128_auth_throttle.sql"
+            - "checksums: 0 mismatched, 0 unverified"
+            - "rollback floor: 0116_platform_admins.sql; this build: 0128_auth_throttle.sql"
+            - "not ready: database schema is not ready: 2 migration(s) pending; run the migrate step"
+            - "verdict: pending"
+        floor: floor0116
+        head: head0128
+        expect: proceed
+        reasons: []
+      - name: "A6 a batch-5 build with pending migrations, no floor yet"
+        status: { rc: 1, stdout_lines: ["migrations: 108/110 applied, 2 pending", "  pending 0109_a.sql", "  pending 0110_batch5.sql"] }
+        floor: nofloor
+        head: head0110
+        expect: proceed
+        reasons: []
+      - name: "a first deployment on an empty database"
+        status:
+          rc: 1
+          stdout_lines:
+            - "migrations: 0/2 applied, 2 pending"
+            - "  pending 0001_initial.sql"
+            - "  pending 0128_auth_throttle.sql"
+            - "checksums: 0 mismatched, 0 unverified"
+            - "rollback floor: none; this build: 0128_auth_throttle.sql"
+            - "not ready: database schema is not ready: 2 migration(s) pending; run the migrate step"
+            - "verdict: pending"
+        floor: nofloor
+        head: head0128
+        expect: proceed
+        reasons: []
+      # ── batch 6: the floor line, no verdict line
+      - name: "batch-6 target below the floor (no verdict line)"
+        status:
+          rc: 1
+          stdout_lines:
+            - "migrations: 115/115 applied, 0 pending"
+            - "checksums: 0 mismatched, 0 unverified; 13 applied migration(s) newer than this build"
+            - "rollback floor: 0116_platform_admins.sql; this build: 0115_server_sessions.sql"
+            - "not ready: database schema is not ready: this build (0115_server_sessions.sql) is older than the rollback floor (0116_platform_admins.sql); deploy a build at or above it"
+        floor: floor0116
+        head: head0115
+        expect: refused
+        reasons: [below_floor]
+      - name: "batch-6 target on legacy rows (no verdict line)"
+        status:
+          rc: 1
+          stdout_lines:
+            - "migrations: 114/115 applied, 1 pending"
+            - "  pending 0115_server_sessions.sql"
+            - "checksums: 0 mismatched, 114 unverified"
+            - "rollback floor: none; this build: 0115_server_sessions.sql"
+        floor: nofloor
+        head: head0115
+        expect: refused
+        reasons: [unverified]
+        says: "--adopt-legacy-checksums"
+      # ── fail closed
+      - name: "unreachable database"
+        status: { rc: 1, stdout_lines: [], stderr_lines: ["migrate: FAILED — connect ECONNREFUSED 172.18.0.2:5432"] }
+        floor: { rc: 1, stdout_lines: [], stderr_lines: ["service \"postgres\" is not running"] }
+        head: head0128
+        expect: refused
+        reasons: [status_error, floor_unreadable]
+        says: "ECONNREFUSED"
+      - name: "compose could not run the migrator at all"
+        status: { rc: 125, stdout_lines: [], stderr_lines: ["Error response from daemon: No such image"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [status_error]
+      - name: "the task did not even register a result"
+        status: {}
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [status_error]
+      - name: "a quoted value in the failure line is elided"
+        status: { rc: 1, stdout_lines: [], stderr_lines: ["migrate: FAILED — password authentication failed for user 'synthetic-user-xyz'"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [status_error]
+        never_says: "synthetic-user-xyz"
+      - name: "unparseable output"
+        status: { rc: 0, stdout_lines: ["everything is fine"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [unparseable]
+      - name: "the verdict is not the last line"
+        status: { rc: 0, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: ready", "trailing line"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [unparseable]
+      - name: "two verdict lines"
+        status: { rc: 0, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: below_floor", "verdict: ready"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [unparseable]
+      - name: "pending lines do not match the count"
+        status: { rc: 1, stdout_lines: ["migrations: 126/128 applied, 2 pending", "  pending 0128_auth_throttle.sql", "verdict: pending"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [unparseable]
+      - name: "an unknown verdict"
+        status: { rc: 1, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: incompatible"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [unknown_verdict]
+      - name: "an empty verdict"
+        status: { rc: 0, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: "] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [unknown_verdict]
+      - name: "verdict ready with exit 1"
+        status: { rc: 1, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: ready"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [inconsistent]
+      - name: "verdict pending with nothing pending"
+        status: { rc: 1, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: pending"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [inconsistent]
+      - name: "a pre-verdict build exiting 1 with nothing pending and nothing to explain it"
+        status: { rc: 1, stdout_lines: ["migrations: 128/128 applied, 0 pending"] }
+        floor: floor0116
+        head: head0128
+        expect: refused
+        reasons: [inconsistent]
+      - name: "verdict ready, but the direct comparison says below the floor"
+        status: { rc: 0, stdout_lines: ["migrations: 115/115 applied, 0 pending", "verdict: ready"] }
+        floor: floor0116
+        head: head0115
+        expect: refused
+        reasons: [below_floor]
+      - name: "the floor cannot be read"
+        status: { rc: 0, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: ready"] }
+        floor: { rc: 3, stdout_lines: [] }
+        head: head0128
+        expect: refused
+        reasons: [floor_unreadable]
+      - name: "the floor read prints something else"
+        status: { rc: 0, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: ready"] }
+        floor: { rc: 0, stdout_lines: ["floor="] }
+        head: head0128
+        expect: refused
+        reasons: [floor_unreadable]
+      - name: "the migrator image cannot be listed"
+        status: { rc: 0, stdout_lines: ["migrations: 128/128 applied, 0 pending", "verdict: ready"] }
+        floor: floor0116
+        head: { rc: 2, stdout_lines: [] }
+        expect: refused
+        reasons: [head_unreadable]
+      - name: "the migrator image has no migrations"
+        status: { rc: 0, stdout_lines: ["migrations: 0/0 applied, 0 pending", "verdict: ready"] }
+        floor: nofloor
+        head: { rc: 0, stdout_lines: ["README.md"] }
+        expect: refused
+        reasons: [head_unreadable]
+      - name: "byte-wise order: a lowercase name sorts after an uppercase one"
+        # Case-insensitively 0117_B > 0117_a and the head would be below this
+        # floor; byte-wise (the application's order) 0117_a is the head.
+        status: { rc: 0, stdout_lines: ["migrations: 3/3 applied, 0 pending", "verdict: ready"] }
+        floor: { rc: 0, stdout_lines: ["floor=0117_a.sql"] }
+        head: { rc: 0, stdout_lines: ["0001_initial.sql", "0117_B.sql", "0117_a.sql"] }
+        expect: proceed
+        reasons: []
+  tasks:
+    - name: Decide each case with the real gate-decide.yml
+      ansible.builtin.include_tasks: truewealth-gate-case.yml
+      loop: "{{ cases }}"
+      loop_control:
+        loop_var: case
+        label: "{{ case.name }}"
+
+    - name: Every case was decided
+      ansible.builtin.debug:
+        msg: "GATE CASES: {{ cases | length }} decided as expected"
